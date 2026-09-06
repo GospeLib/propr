@@ -24,6 +24,8 @@ export interface JobContext {
   AI_WAITING_TAG: string;
   AI_PRIMARY_TAG: string;
   PR_LABEL: string;
+  /** True only after the signed, single-use Ezer worker receipt was consumed successfully. */
+  ezerAdmissionVerified?: boolean;
 }
 
 export interface CurrentIssueData {

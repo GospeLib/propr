@@ -1,13 +1,19 @@
 import { Redis } from 'ioredis';
 import {
   createRedisAdmissionStore,
+  requiresEzerExecutionAdmission,
   verifyWorkerAdmissionReceipt,
   type IssueJobData,
 } from '@propr/core';
 
 export async function verifyConfiguredEzerAdmission(issueRef: IssueJobData): Promise<void> {
-  const admissionRequiredLabel = process.env.EZER_ADMISSION_REQUIRED_LABEL?.trim();
-  if (!admissionRequiredLabel || issueRef.triggeringLabel !== admissionRequiredLabel) return;
+  const repository = `${issueRef.repoOwner}/${issueRef.repoName}`;
+  if (!requiresEzerExecutionAdmission({
+    repository,
+    triggeringLabel: issueRef.triggeringLabel,
+    requiredLabel: process.env.EZER_ADMISSION_REQUIRED_LABEL,
+    protectedRepositories: process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES,
+  })) return;
   if (!issueRef.executionAdmissionReceipt) {
     throw new Error('ezer-execution-admission-refused:missing-worker-receipt');
   }
@@ -20,7 +26,7 @@ export async function verifyConfiguredEzerAdmission(issueRef: IssueJobData): Pro
   try {
     await verifyWorkerAdmissionReceipt({
       receipt: issueRef.executionAdmissionReceipt,
-      expected: { repository: `${issueRef.repoOwner}/${issueRef.repoName}`, issueNumber: issueRef.number },
+      expected: { repository, issueNumber: issueRef.number },
       store: createRedisAdmissionStore(admissionRedis),
     });
   } finally {

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 
 import {
   consumeExecutionAdmission,
+  requiresEzerExecutionAdmission,
   verifyWorkerAdmissionReceipt,
   type AdmissionStore,
   type ExecutionAdmissionClaims,
@@ -54,6 +55,23 @@ function store(): AdmissionStore {
 }
 
 describe('Ezer execution admission', () => {
+  test('requires admission for a protected repository even when a direct job lies about its label', () => {
+    assert.equal(requiresEzerExecutionAdmission({
+      repository: 'GospeLib/main',
+      triggeringLabel: 'AI',
+      requiredLabel: 'propr-admitted',
+      protectedRepositories: 'GospeLib/main,GospeLib/product-hub',
+    }), true);
+  });
+
+  test('preserves unrelated repositories and processing labels', () => {
+    assert.equal(requiresEzerExecutionAdmission({
+      repository: 'integry/propr',
+      triggeringLabel: 'AI',
+      requiredLabel: 'propr-admitted',
+      protectedRepositories: 'GospeLib/main,GospeLib/product-hub',
+    }), false);
+  });
   test('consumes a current signed admission and issues a worker-bound receipt', async () => {
     const sharedStore = store();
     const result = await consumeExecutionAdmission({

@@ -11,7 +11,7 @@ import { getGithubUserWhitelist } from '../utils/userWhitelist.js';
 import { isAuthorizedIssueTriggerActor } from './issueTriggerAuthorization.js';
 import type { DetectedIssue } from '../webhook/webhookHandler.js';
 import type { DeliveryDisposition } from '../intake/routingWebSocketProtocol.js';
-import { consumeExecutionAdmission, createRedisAdmissionStore, pendingExecutionAdmissionKey } from '../admission/ezerExecutionAdmission.js';
+import { consumeExecutionAdmission, createRedisAdmissionStore, pendingExecutionAdmissionKey, requiresEzerExecutionAdmission } from '../admission/ezerExecutionAdmission.js';
 
 export type { DetectedIssue };
 
@@ -256,8 +256,12 @@ export async function processDetectedIssue(issue: DetectedIssue, correlationId: 
     }, 'Detected eligible issue');
 
     let executionAdmissionReceipt;
-    const admissionRequiredLabel = process.env.EZER_ADMISSION_REQUIRED_LABEL?.trim();
-    if (admissionRequiredLabel && triggeringLabel === admissionRequiredLabel) {
+    if (requiresEzerExecutionAdmission({
+        repository: repoFullName,
+        triggeringLabel,
+        requiredLabel: process.env.EZER_ADMISSION_REQUIRED_LABEL,
+        protectedRepositories: process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES,
+    })) {
         const signingSecret = process.env.EZER_ADMISSION_HMAC_SECRET;
         if (!signingSecret) {
             correlatedLogger.error({ repository: repoFullName, issueNumber: issue.number }, 'Ezer admission signing secret is not configured; refusing execution');

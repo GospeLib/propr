@@ -9,6 +9,7 @@ const MILLISECONDS_PER_SECOND = 1_000;
 const CONSUMED_KEY_PREFIX = 'ezer:execution-admission:consumed:';
 const RECEIPT_KEY_PREFIX = 'ezer:execution-admission:receipt:';
 const PENDING_KEY_PREFIX = 'ezer:execution-admission:pending:';
+const REPOSITORY_LIST_SEPARATOR = ',';
 const REDIS_CONSUME_AND_ISSUE_SCRIPT = `
 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
 redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
@@ -41,6 +42,20 @@ export interface WorkerAdmissionReceipt {
 
 export function pendingExecutionAdmissionKey(repository: string, issueNumber: number): string {
     return `${PENDING_KEY_PREFIX}${repository}:${issueNumber}`;
+}
+
+export function requiresEzerExecutionAdmission(input: {
+    repository: string;
+    triggeringLabel?: string;
+    requiredLabel?: string;
+    protectedRepositories?: string;
+}): boolean {
+    const protectedRepositories = (input.protectedRepositories ?? '')
+        .split(REPOSITORY_LIST_SEPARATOR)
+        .map(repository => repository.trim())
+        .filter(Boolean);
+    const requiredLabel = input.requiredLabel?.trim();
+    return protectedRepositories.includes(input.repository) || Boolean(requiredLabel && input.triggeringLabel === requiredLabel);
 }
 
 export function createRedisAdmissionStore(redis: Redis): AdmissionStore {

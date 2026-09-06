@@ -8,6 +8,8 @@ import { wrapDockerRunArgsWithRepoSetup } from './docker/repoSetupWrapper.js';
 import { parseResetTimeFromMessage, calculateNextRoundHourPlus2Minutes } from '../utils/scheduling.js';
 import { createContainerExecutionId } from '../agents/impl/utils/containerExecutionId.js';
 
+const CLAUDE_RUNTIME_HOME = '/home/node/runtime-home';
+
 export class UsageLimitError extends Error {
     resetTimestamp: number;
     retryable: boolean;
@@ -259,7 +261,10 @@ export function buildDockerArgs(params: DockerArgsParams): string[] {
         '-v', '/tmp/claude-logs:/tmp/claude-logs:rw',
         '-v', `${CLAUDE_CONFIG_PATH}:/home/node/.claude:rw`,
         ...(fs.existsSync(path.join(CLAUDE_CONFIG_PATH, 'home', '.claude.json'))
-            ? ['-v', `${path.join(CLAUDE_CONFIG_PATH, 'home')}:/home/node:rw`]
+            ? [
+                '-v', `${path.join(CLAUDE_CONFIG_PATH, 'home')}:${CLAUDE_RUNTIME_HOME}:rw`,
+                '-e', `HOME=${CLAUDE_RUNTIME_HOME}`,
+            ]
             : []),
         '-e', `GH_TOKEN=${githubToken}`,
         '-w', '/home/node/workspace',

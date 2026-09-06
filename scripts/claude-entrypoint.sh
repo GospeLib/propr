@@ -4,6 +4,28 @@
 
 set -e
 
+PROPR_EZER_MARKER_DIR='/run/propr'
+PROPR_EZER_MARKER_PATH="$PROPR_EZER_MARKER_DIR/ezer-admission.json"
+
+# The app supplies this payload only after consuming a signed, single-use admission receipt. Create
+# the capability marker while still root, make both it and its directory non-writable, then remove
+# the transport environment variable before the unprivileged model starts. The model can forge an
+# environment variable; it cannot replace this root-owned file under Docker's no-new-privileges
+# boundary.
+if [ -n "${PROPR_EZER_ADMISSION_MARKER_B64:-}" ]; then
+    if [ "$(id -u)" != '0' ]; then
+        echo 'Refusing Ezer admission marker creation outside the root entrypoint' >&2
+        exit 1
+    fi
+    mkdir -p "$PROPR_EZER_MARKER_DIR"
+    chmod 0700 "$PROPR_EZER_MARKER_DIR"
+    printf '%s' "$PROPR_EZER_ADMISSION_MARKER_B64" | base64 -d > "$PROPR_EZER_MARKER_PATH"
+    chown root:root "$PROPR_EZER_MARKER_DIR" "$PROPR_EZER_MARKER_PATH"
+    chmod 0444 "$PROPR_EZER_MARKER_PATH"
+    chmod 0555 "$PROPR_EZER_MARKER_DIR"
+    unset PROPR_EZER_ADMISSION_MARKER_B64
+fi
+
 # Skip firewall initialization for now (requires privileged container)
 echo "Skipping firewall setup (would require --privileged Docker flag)"
 

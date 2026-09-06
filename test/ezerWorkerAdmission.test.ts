@@ -23,7 +23,7 @@ after(async () => {
 describe('worker-start Ezer admission boundary', () => {
   test('preserves existing non-Ezer ProPR processing labels', async () => {
     process.env.EZER_ADMISSION_REQUIRED_LABEL = REQUIRED_LABEL;
-    await assert.doesNotReject(() => verifyConfiguredEzerAdmission(issue('AI')));
+    assert.equal(await verifyConfiguredEzerAdmission(issue('AI')), false);
   });
 
   test('refuses a direct Ezer child-worker job with no server receipt', async () => {

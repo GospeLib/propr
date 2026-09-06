@@ -28,9 +28,10 @@ export async function processGitHubIssueJob(job: Job<IssueJobData>): Promise<Job
     return await handleDispatch(job);
   }
 
-  await verifyConfiguredEzerAdmission(job.data);
+  const ezerAdmissionVerified = await verifyConfiguredEzerAdmission(job.data);
 
   const context = await initializeJobContext(job);
+  context.ezerAdmissionVerified = ezerAdmissionVerified;
   const { jobId, issueRef, correlationId, correlatedLogger, stateManager, modelName, taskId, AI_PROCESSING_TAG, AI_DONE_TAG, AI_WAITING_TAG } = context;
 
   await addModelSpecificDelay(modelName);

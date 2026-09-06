@@ -11,6 +11,7 @@ import type { ExecutionParams, JobContext } from './types.js';
 import { localizeContentImages } from '../issueJobHelpers.js';
 import { createSessionIdCallback, createContainerIdCallback } from '../issueJobCallbacks.js';
 import { redisClient } from './config.js';
+import { buildAdmittedWorkerEnvironment } from '../ezerAdmittedWorkerEnvironment.js';
 
 export function toClaudeResult(response: AgentExecutionResult): ClaudeResult {
   return {
@@ -82,6 +83,11 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
     repoOwner: issueRef.repoOwner,
     repoName: issueRef.repoName
   };
+  const admittedWorkerEnvironment = buildAdmittedWorkerEnvironment(
+    issueRef,
+    taskId,
+    context.ezerAdmissionVerified,
+  );
 
   // Localize remote images in issue body and comments
   const issueBodyHtml = (currentIssueData.data as { body_html?: string }).body_html;
@@ -132,6 +138,7 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
       model: modelName,
       githubToken: githubToken.token,
       branchName: worktreeInfo.branchName,
+      environment: admittedWorkerEnvironment,
       reasoningLevel: issueRef.reasoningLevel,
       onSessionId: createSessionIdCallback(taskId, issueRef, { modelName, stateManager, correlatedLogger, redisClient }),
       onContainerId: createContainerIdCallback(taskId, stateManager, correlatedLogger, worktreeInfo.worktreePath),

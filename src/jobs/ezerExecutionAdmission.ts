@@ -6,14 +6,14 @@ import {
   type IssueJobData,
 } from '@propr/core';
 
-export async function verifyConfiguredEzerAdmission(issueRef: IssueJobData): Promise<void> {
+export async function verifyConfiguredEzerAdmission(issueRef: IssueJobData): Promise<boolean> {
   const repository = `${issueRef.repoOwner}/${issueRef.repoName}`;
   if (!requiresEzerExecutionAdmission({
     repository,
     triggeringLabel: issueRef.triggeringLabel,
     requiredLabel: process.env.EZER_ADMISSION_REQUIRED_LABEL,
     protectedRepositories: process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES,
-  })) return;
+  })) return false;
   if (!issueRef.executionAdmissionReceipt) {
     throw new Error('ezer-execution-admission-refused:missing-worker-receipt');
   }
@@ -29,6 +29,7 @@ export async function verifyConfiguredEzerAdmission(issueRef: IssueJobData): Pro
       expected: { repository, issueNumber: issueRef.number, target: issueRef.baseBranch ?? '' },
       store: createRedisAdmissionStore(admissionRedis),
     });
+    return true;
   } finally {
     admissionRedis.disconnect();
   }

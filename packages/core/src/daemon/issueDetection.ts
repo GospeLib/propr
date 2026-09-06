@@ -11,6 +11,7 @@ import { getGithubUserWhitelist } from '../utils/userWhitelist.js';
 import { isAuthorizedIssueTriggerActor } from './issueTriggerAuthorization.js';
 import type { DetectedIssue } from '../webhook/webhookHandler.js';
 import type { DeliveryDisposition } from '../intake/routingWebSocketProtocol.js';
+import { consumeExecutionAdmission, createRedisAdmissionStore, pendingExecutionAdmissionKey, requiresEzerExecutionAdmission } from '../admission/ezerExecutionAdmission.js';
 
 export type { DetectedIssue };
 
@@ -254,6 +255,37 @@ export async function processDetectedIssue(issue: DetectedIssue, correlationId: 
         triggeringLabel: triggeringLabel
     }, 'Detected eligible issue');
 
+    let executionAdmissionReceipt;
+    if (requiresEzerExecutionAdmission({
+        repository: repoFullName,
+        triggeringLabel,
+        requiredLabel: process.env.EZER_ADMISSION_REQUIRED_LABEL,
+        protectedRepositories: process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES,
+    })) {
+        const signingSecret = process.env.EZER_ADMISSION_HMAC_SECRET;
+        if (!signingSecret) {
+            correlatedLogger.error({ repository: repoFullName, issueNumber: issue.number }, 'Ezer admission signing secret is not configured; refusing execution');
+            return { status: 'blocked', reason: 'ezer_admission_unavailable' };
+        }
+        const admissionStore = createRedisAdmissionStore(redisClient);
+        const pendingToken = await admissionStore.get(pendingExecutionAdmissionKey(repoFullName, issue.number));
+        if (!pendingToken) {
+            correlatedLogger.warn({ repository: repoFullName, issueNumber: issue.number }, 'No pending signed Ezer admission; refusing execution');
+            return { status: 'blocked', reason: 'ezer_admission_missing' };
+        }
+        try {
+            ({ receipt: executionAdmissionReceipt } = await consumeExecutionAdmission({
+                token: pendingToken,
+                signingSecret,
+                expected: { repository: repoFullName, issueNumber: issue.number },
+                store: admissionStore,
+            }));
+        } catch (error) {
+            correlatedLogger.warn({ repository: repoFullName, issueNumber: issue.number, error: (error as Error).message }, 'Signed Ezer admission refused');
+            return { status: 'blocked', reason: 'ezer_admission_refused' };
+        }
+    }
+
     const queue = await getIssueQueue();
     const activeJobs = await queue.getActive();
     const waitingJobs = await queue.getWaiting();
@@ -295,7 +327,8 @@ export async function processDetectedIssue(issue: DetectedIssue, correlationId: 
             repoName: issue.repoName,
             number: issue.number,
             triggeringLabel: triggeringLabel,
-            correlationId: generateCorrelationId()
+            correlationId: generateCorrelationId(),
+            executionAdmissionReceipt,
         };
 
         const addToQueueWithRetry = (): Promise<unknown> => withRetry(

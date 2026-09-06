@@ -1,5 +1,4 @@
 import path from 'path';
-import os from 'os';
 import fs from 'fs';
 import { Redis } from 'ioredis';
 import logger from '../utils/logger.js';
@@ -259,7 +258,9 @@ export function buildDockerArgs(params: DockerArgsParams): string[] {
         '-v', '/tmp/git-processor:/tmp/git-processor:rw',
         '-v', '/tmp/claude-logs:/tmp/claude-logs:rw',
         '-v', `${CLAUDE_CONFIG_PATH}:/home/node/.claude:rw`,
-        ...(fs.existsSync(path.join(os.homedir(), '.claude.json')) ? ['-v', `${path.join(os.homedir(), '.claude.json')}:/home/node/.claude.json:rw`] : []),
+        ...(fs.existsSync(path.join(CLAUDE_CONFIG_PATH, 'home', '.claude.json'))
+            ? ['-v', `${path.join(CLAUDE_CONFIG_PATH, 'home')}:/home/node:rw`]
+            : []),
         '-e', `GH_TOKEN=${githubToken}`,
         '-w', '/home/node/workspace',
         CLAUDE_DOCKER_IMAGE,

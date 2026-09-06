@@ -6,7 +6,6 @@
  */
 
 import path from 'path';
-import os from 'os';
 import fs from 'fs';
 import logger from '../../../utils/logger.js';
 import { AgentConfig } from '../../types.js';
@@ -84,10 +83,11 @@ function repositoryInspectionArgs(enabled: boolean): string[] {
     ];
 }
 
-function optionalClaudeJsonMount(): string[] {
-    const claudeJsonPath = path.join(os.homedir(), '.claude.json');
+function optionalClaudeHomeMount(configPath: string): string[] {
+    const claudeHomePath = path.join(configPath, 'home');
+    const claudeJsonPath = path.join(claudeHomePath, '.claude.json');
     return fs.existsSync(claudeJsonPath)
-        ? ['-v', `${claudeJsonPath}:/home/node/.claude.json:rw`]
+        ? ['-v', `${claudeHomePath}:/home/node:rw`]
         : [];
 }
 
@@ -191,7 +191,7 @@ export function buildDockerArgs(
         containerName: buildClaudeContainerName(config, issueNumber, taskId, executionType),
         githubToken,
         envVars,
-        claudeJsonMount: optionalClaudeJsonMount(),
+        claudeJsonMount: optionalClaudeHomeMount(configPath),
         inspectionArgs,
         reasoningLevel,
         readOnlyWorkspace,

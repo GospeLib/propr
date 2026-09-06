@@ -263,6 +263,7 @@ export function buildDockerArgs(params: DockerArgsParams): string[] {
         ...(fs.existsSync(path.join(CLAUDE_CONFIG_PATH, 'home', '.claude.json'))
             ? [
                 '-v', `${path.join(CLAUDE_CONFIG_PATH, 'home')}:${CLAUDE_RUNTIME_HOME}:rw`,
+                '-v', `${CLAUDE_CONFIG_PATH}:${CLAUDE_RUNTIME_HOME}/.claude:rw`,
                 '-e', `PROPR_CLAUDE_HOME=${CLAUDE_RUNTIME_HOME}`,
             ]
             : []),

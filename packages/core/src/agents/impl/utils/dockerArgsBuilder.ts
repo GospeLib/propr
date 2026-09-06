@@ -88,7 +88,11 @@ function optionalClaudeHomeMount(configPath: string): string[] {
     const claudeHomePath = path.join(configPath, 'home');
     const claudeJsonPath = path.join(claudeHomePath, '.claude.json');
     return fs.existsSync(claudeJsonPath)
-        ? ['-v', `${claudeHomePath}:${CLAUDE_RUNTIME_HOME}:rw`, '-e', `PROPR_CLAUDE_HOME=${CLAUDE_RUNTIME_HOME}`]
+        ? [
+            '-v', `${claudeHomePath}:${CLAUDE_RUNTIME_HOME}:rw`,
+            '-v', `${configPath}:${CLAUDE_RUNTIME_HOME}/.claude:rw`,
+            '-e', `PROPR_CLAUDE_HOME=${CLAUDE_RUNTIME_HOME}`,
+        ]
         : [];
 }
 

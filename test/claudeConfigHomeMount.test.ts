@@ -33,6 +33,7 @@ test('mounts the Claude config directory as the writable worker home', () => {
   });
 
   assert.ok(args.includes(`${configHome}:/home/node/runtime-home:rw`));
+  assert.ok(args.includes(`${testRoot}:/home/node/runtime-home/.claude:rw`));
   assert.ok(args.includes('PROPR_CLAUDE_HOME=/home/node/runtime-home'));
   assert.ok(args.includes(`${testRoot}:/home/node/.claude:rw`));
   assert.ok(!args.some(argument => argument.endsWith(':/home/node/.claude.json:rw')));

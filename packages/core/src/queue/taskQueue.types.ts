@@ -4,6 +4,7 @@ import type { ConversationStep, TokenUsage } from '../utils/llmMetrics.types.js'
 import type { SubscriptionUsageMetrics } from '../utils/github/formatSubscriptionUsage.js';
 import type { CommandMeta, UltrafixCommandMeta } from '../webhook/slashCommandParser.js';
 import type { ReasoningLevel } from '@propr/shared';
+import type { WorkerAdmissionReceipt } from '../admission/ezerExecutionAdmission.js';
 
 export interface IssueJobData {
     repoOwner: string;
@@ -26,6 +27,8 @@ export interface IssueJobData {
     subtitle?: string;
     issueNumber?: number;
     isRetryFromRateLimit?: boolean;  // Set when job is retried after rate limit
+    /** Server-issued proof that Ezer's signed, single-use admission was consumed. */
+    executionAdmissionReceipt?: WorkerAdmissionReceipt;
 }
 
 export type SystemAction = 'auto_resolve_merge_conflicts';

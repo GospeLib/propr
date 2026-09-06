@@ -8,6 +8,7 @@ import {
   logger, TaskStates, ensureRepoCloned, getRepoUrl, safeAddLabel, safeRemoveLabel, ensureGitRepository,
   UsageLimitError, validateRepositoryInfo, addModelSpecificDelay, withRetry, retryConfigs, updatePlanIssueTaskId
 } from '@propr/core';
+import { verifyConfiguredEzerAdmission } from './ezerExecutionAdmission.js';
 import type { IssueJobData, JobResult, WorktreeInfo, ClaudeCodeResponse, CommitResult, RepoValidationResult } from '@propr/core';
 import { handleDispatch } from './issueJobDispatcher.js';
 import { handleUsageLimitError, handleGenericError, updateTaskTitleInStorage, buildFinalResult } from './issueJobHelpers.js';
@@ -26,6 +27,8 @@ export async function processGitHubIssueJob(job: Job<IssueJobData>): Promise<Job
     logger.info({ jobId: job.id }, 'Running as matrix dispatcher');
     return await handleDispatch(job);
   }
+
+  await verifyConfiguredEzerAdmission(job.data);
 
   const context = await initializeJobContext(job);
   const { jobId, issueRef, correlationId, correlatedLogger, stateManager, modelName, taskId, AI_PROCESSING_TAG, AI_DONE_TAG, AI_WAITING_TAG } = context;

@@ -20,6 +20,7 @@ import {
 
 const GITHUB_CREDENTIAL_ENV_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_ACCESS_TOKEN']);
 const GITHUB_CREDENTIAL_ENV_PATTERN = /^(?:GH|GITHUB)_.*(?:TOKEN|KEY|SECRET|PASSWORD|PAT|PRIVATE_KEY)$/;
+const CLAUDE_RUNTIME_HOME = '/home/node/runtime-home';
 
 function isGitHubCredentialEnvironmentVariable(name: string): boolean {
     const normalizedName = name.toUpperCase();
@@ -87,7 +88,7 @@ function optionalClaudeHomeMount(configPath: string): string[] {
     const claudeHomePath = path.join(configPath, 'home');
     const claudeJsonPath = path.join(claudeHomePath, '.claude.json');
     return fs.existsSync(claudeJsonPath)
-        ? ['-v', `${claudeHomePath}:/home/node:rw`]
+        ? ['-v', `${claudeHomePath}:${CLAUDE_RUNTIME_HOME}:rw`, '-e', `HOME=${CLAUDE_RUNTIME_HOME}`]
         : [];
 }
 

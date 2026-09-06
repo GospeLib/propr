@@ -51,6 +51,11 @@ function store(): AdmissionStore {
     async get(key) {
       return values.get(key) ?? null;
     },
+    async take(key) {
+      const value = values.get(key) ?? null;
+      values.delete(key);
+      return value;
+    },
   };
 }
 
@@ -86,9 +91,14 @@ describe('Ezer execution admission', () => {
     assert.equal(result.receipt.admissionId, 'adm-2260-1');
     await assert.doesNotReject(() => verifyWorkerAdmissionReceipt({
       receipt: result.receipt,
-      expected: { repository: 'GospeLib/main', issueNumber: 2260 },
+      expected: { repository: 'GospeLib/main', issueNumber: 2260, target: 'stage' },
       store: sharedStore,
     }));
+    await assert.rejects(() => verifyWorkerAdmissionReceipt({
+      receipt: result.receipt,
+      expected: { repository: 'GospeLib/main', issueNumber: 2260, target: 'stage' },
+      store: sharedStore,
+    }), /missing-worker-receipt/);
   });
 
   test('refuses a replay of the same single-use admission', async () => {
@@ -121,8 +131,22 @@ describe('Ezer execution admission', () => {
   test('refuses a fabricated worker receipt', async () => {
     await assert.rejects(() => verifyWorkerAdmissionReceipt({
       receipt: { admissionId: 'adm-2260-1', operationId: 'op-2260-1', receiptKey: 'fabricated' },
-      expected: { repository: 'GospeLib/main', issueNumber: 2260 },
+      expected: { repository: 'GospeLib/main', issueNumber: 2260, target: 'stage' },
       store: store(),
     }), /missing-worker-receipt/);
+  });
+
+  test('refuses a worker targeting a branch other than the signed target', async () => {
+    const sharedStore = store();
+    const result = await consumeExecutionAdmission({
+      token: sign(claims()), signingSecret: SIGNING_SECRET,
+      expected: { repository: 'GospeLib/main', issueNumber: 2260 },
+      store: sharedStore, nowMs: NOW_MS,
+    });
+    await assert.rejects(() => verifyWorkerAdmissionReceipt({
+      receipt: result.receipt,
+      expected: { repository: 'GospeLib/main', issueNumber: 2260, target: 'master' },
+      store: sharedStore,
+    }), /wrong-target/);
   });
 });

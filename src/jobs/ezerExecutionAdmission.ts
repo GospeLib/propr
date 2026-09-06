@@ -26,7 +26,7 @@ export async function verifyConfiguredEzerAdmission(issueRef: IssueJobData): Pro
   try {
     await verifyWorkerAdmissionReceipt({
       receipt: issueRef.executionAdmissionReceipt,
-      expected: { repository, issueNumber: issueRef.number },
+      expected: { repository, issueNumber: issueRef.number, target: issueRef.baseBranch ?? '' },
       store: createRedisAdmissionStore(admissionRedis),
     });
   } finally {

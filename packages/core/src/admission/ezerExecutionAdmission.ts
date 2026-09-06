@@ -67,12 +67,16 @@ export function createRedisAdmissionStore(redis: Redis): AdmissionStore {
         async get(key) {
             return redis.get(key);
         },
+        async take(key) {
+            return redis.getdel(key);
+        },
     };
 }
 
 export interface AdmissionStore {
     consumeAndIssue(consumedKey: string, receiptKey: string, value: string, ttlSeconds: number): Promise<boolean>;
     get(key: string): Promise<string | null>;
+    take(key: string): Promise<string | null>;
 }
 
 interface ExpectedExecution {
@@ -165,6 +169,7 @@ export async function consumeExecutionAdmission(input: {
         operationId: claims.operationId,
         repository: claims.repository,
         issueNumber: claims.issueNumber,
+        target: claims.target,
     });
     if (!await input.store.consumeAndIssue(consumedKey, receiptKey, receiptValue, ttlSeconds)) refuse('replayed-admission');
     return { claims, receipt: { admissionId: claims.admissionId, operationId: claims.operationId, receiptKey } };
@@ -172,10 +177,10 @@ export async function consumeExecutionAdmission(input: {
 
 export async function verifyWorkerAdmissionReceipt(input: {
     receipt: WorkerAdmissionReceipt;
-    expected: ExpectedExecution;
-    store: Pick<AdmissionStore, 'get'>;
+    expected: ExpectedExecution & { target: string };
+    store: Pick<AdmissionStore, 'take'>;
 }): Promise<void> {
-    const stored = await input.store.get(input.receipt.receiptKey);
+    const stored = await input.store.take(input.receipt.receiptKey);
     if (!stored) refuse('missing-worker-receipt');
     let value: Record<string, unknown>;
     try {
@@ -186,4 +191,5 @@ export async function verifyWorkerAdmissionReceipt(input: {
     if (value.admissionId !== input.receipt.admissionId || value.operationId !== input.receipt.operationId) refuse('mismatched-worker-receipt');
     if (value.repository !== input.expected.repository) refuse('wrong-repository');
     if (value.issueNumber !== input.expected.issueNumber) refuse('wrong-issue');
+    if (value.target !== input.expected.target) refuse('wrong-target');
 }

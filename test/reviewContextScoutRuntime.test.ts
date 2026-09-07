@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { buildDockerArgs } from '../packages/core/src/agents/impl/utils/dockerArgsBuilder.js';
 import { buildOpenCodeDockerArgs } from '../packages/core/src/agents/impl/openCodeUtils.js';
+import { buildCodexDockerArgs } from '../packages/core/src/agents/impl/utils/codexDockerArgsBuilder.js';
 import { CodexAgent } from '../packages/core/src/agents/impl/CodexAgent.js';
 import { VibeAgent } from '../packages/core/src/agents/impl/VibeAgent.js';
 import { AntigravityAgent } from '../packages/core/src/agents/impl/AntigravityAgent.js';
@@ -443,4 +444,90 @@ test('repository scout MCP tools are read-only and reject traversal and escaping
     assert.match(resultFor(5).content?.[0].text || '', /resolves outside the repository/);
     assert.match(resultFor(6).content?.[0].text || '', /src\/consumer\.ts/);
     assert.match(resultFor(7).content?.[0].text || '', /needle call/);
+});
+
+test('a mutating Claude worker keeps the confined capsule that scout runs already get', () => {
+    const config: AgentConfig = {
+        id: 'claude-worker',
+        type: 'claude',
+        alias: 'claude-worker',
+        enabled: true,
+        dockerImage: 'propr/agent:latest',
+        configPath: '/tmp/claude-worker-config',
+        supportedModels: ['claude-sonnet'],
+        envVars: {},
+    };
+    const worktreePath = '/tmp/git-processor/worktrees/claude-unit-7';
+    const args = buildDockerArgs(config, 1000, {
+        worktreePath,
+        githubToken: 'direct-secret',
+        issueNumber: 7,
+        branchName: '7/claude-s16-t01',
+        mutating: true,
+    });
+
+    assert.ok(args.includes('--read-only'));
+    assert.deepEqual(args.slice(args.indexOf('--cap-drop'), args.indexOf('--cap-drop') + 2), ['--cap-drop', 'ALL']);
+    assert.ok(args.includes(`${worktreePath}:/home/node/workspace:rw`));
+    assert.ok(args.includes('/tmp/git-processor/propr-cache/claude:/tmp/git-processor/propr-cache/claude:rw'));
+    assert.ok(!args.some(arg => arg.startsWith('/tmp/git-processor:/tmp/git-processor:')));
+    assert.ok(args.includes('PROPR_ASSIGNED_BRANCH=7/claude-s16-t01'));
+    // Confinement is a prerequisite for mutating execution, not an ordering hint.
+    assert.throws(() => buildDockerArgs(config, 1000, {
+        worktreePath, githubToken: 'direct-secret', issueNumber: 7, mutating: true,
+    }), /propr-worker-confinement-refused:missing-assigned-branch/);
+});
+
+test('a mutating Codex worker no longer disables seccomp and AppArmor', () => {
+    const config: AgentConfig = {
+        id: 'codex-worker',
+        type: 'codex',
+        alias: 'codex-worker',
+        enabled: true,
+        dockerImage: 'propr/agent:latest',
+        configPath: '/tmp/codex-worker-config',
+        supportedModels: ['gpt-5.6'],
+        envVars: {},
+    };
+    const args = buildCodexDockerArgs(config, {
+        worktreePath: '/tmp/git-processor/worktrees/codex-unit-7',
+        githubToken: 'direct-secret',
+        issueNumber: 7,
+        branchName: '7/codex-s16-t01',
+        mutating: true,
+    });
+
+    assert.ok(!args.includes('seccomp=unconfined'));
+    assert.ok(!args.includes('apparmor=unconfined'));
+    assert.ok(args.includes('--read-only'));
+    assert.ok(!args.some(arg => arg.startsWith('/tmp/git-processor:/tmp/git-processor:')));
+    assert.ok(args.includes('PROPR_ASSIGNED_BRANCH=7/codex-s16-t01'));
+});
+
+test('a mutating OpenCode worker carries its assigned branch and explicit mounts', () => {
+    const config: AgentConfig = {
+        id: 'opencode-worker',
+        type: 'opencode',
+        alias: 'opencode-worker',
+        enabled: true,
+        dockerImage: 'propr/agent:latest',
+        configPath: '/tmp/opencode-worker-config',
+        supportedModels: ['opencode/model'],
+        envVars: {},
+    };
+    const args = buildOpenCodeDockerArgs({
+        config,
+        worktreePath: '/tmp/git-processor/worktrees/opencode-unit-7',
+        githubToken: 'direct-secret',
+        issueNumber: 7,
+        configPath: '/tmp/opencode-worker-config',
+        ensureConfigPath: () => {},
+        branchName: '7/opencode-s16-t01',
+        mutating: true,
+    });
+
+    assert.ok(args.includes('PROPR_ASSIGNED_BRANCH=7/opencode-s16-t01'));
+    assert.ok(args.includes('/tmp/git-processor/propr-cache/opencode:/tmp/git-processor/propr-cache/opencode:rw'));
+    assert.ok(!args.some(arg => arg.startsWith('/tmp/git-processor:/tmp/git-processor:')));
+    assert.ok(args.includes('--read-only'));
 });

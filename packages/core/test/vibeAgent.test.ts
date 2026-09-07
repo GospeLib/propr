@@ -15,6 +15,8 @@ type VibeAgentPrivate = {
         githubToken: string;
         issueNumber: number;
         mode?: 'execute' | 'analysis';
+        branchName?: string;
+        mutating?: boolean;
     }): string[];
 };
 
@@ -145,4 +147,50 @@ test('Vibe prompt files are readable by spawned agent container user', () => {
         fs.rmSync(promptCacheDir, { recursive: true, force: true });
         delete process.env.VIBE_PROMPT_CACHE_DIR;
     }
+});
+
+test('Vibe execute runs a confined worker with explicit mounts and its assigned branch', () => {
+    delete process.env.VIBE_CLI_ARGS;
+    process.env.MISTRAL_API_KEY = 'test-key';
+    const worktreePath = '/tmp/git-processor/worktrees/vibe-unit-7';
+    const args = createAgent().buildDockerArgs({
+        worktreePath,
+        githubToken: 'token',
+        issueNumber: 7,
+        branchName: '7/vibe-s16-t01',
+        mutating: true,
+    });
+
+    assert.ok(args.includes('--read-only'), 'Vibe must run in a read-only capsule');
+    assert.deepEqual(args.slice(args.indexOf('--cap-drop'), args.indexOf('--cap-drop') + 2), ['--cap-drop', 'ALL']);
+    assert.ok(args.includes('PROPR_ASSIGNED_BRANCH=7/vibe-s16-t01'));
+    assert.ok(args.includes(`${worktreePath}:/home/node/workspace:rw`));
+    assert.ok(args.includes('/tmp/git-processor/propr-cache/vibe:/tmp/git-processor/propr-cache/vibe:rw'));
+    assert.ok(
+        !args.includes('/tmp/git-processor:/tmp/git-processor:rw'),
+        'the blanket git-processor mount must be gone',
+    );
+});
+
+test('Vibe refuses mutating execution without an assigned unit branch', () => {
+    delete process.env.VIBE_CLI_ARGS;
+    process.env.MISTRAL_API_KEY = 'test-key';
+    assert.throws(() => createAgent().buildDockerArgs({
+        worktreePath: '/tmp/git-processor/worktrees/vibe-unit-7',
+        githubToken: 'token',
+        issueNumber: 7,
+        mutating: true,
+    }), /propr-worker-confinement-refused:missing-assigned-branch vibe mutating execution/);
+});
+
+test('Vibe refuses a stage credential in its forwarded environment', () => {
+    delete process.env.VIBE_CLI_ARGS;
+    process.env.MISTRAL_API_KEY = 'test-key';
+    assert.throws(() => createAgent({ NPM_TOKEN: 'npm_secret' }).buildDockerArgs({
+        worktreePath: '/tmp/git-processor/worktrees/vibe-unit-7',
+        githubToken: 'token',
+        issueNumber: 7,
+        branchName: '7/vibe-s16-t01',
+        mutating: true,
+    }), /propr-worker-confinement-refused:stage-credential NPM_TOKEN/);
 });

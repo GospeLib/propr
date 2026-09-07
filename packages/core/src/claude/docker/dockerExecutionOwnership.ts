@@ -59,6 +59,62 @@ function waitForChildTermination(child: ChildProcess): Promise<void> {
     });
 }
 
+/**
+ * Spawn options that make the worker its own process-group leader.
+ *
+ * Without this, signalling the `docker` CLI leaves anything it forked — and
+ * anything the agent forked through it — reparented to init and still running.
+ * Owning the group is what lets {@link killWorkerProcessGroup} take the whole
+ * tree down and lets the caller observe a left-behind child die.
+ */
+export const WORKER_PROCESS_GROUP_SPAWN_OPTIONS = { detached: true } as const;
+
+/**
+ * Signal the worker's whole process group, falling back to the single process
+ * when the group is already gone or was never created.
+ *
+ * Returns true when the group signal landed, so callers can tell group
+ * ownership from a bare child kill.
+ */
+export function killWorkerProcessGroup(
+    child: ChildProcess,
+    signal: NodeJS.Signals,
+    killProcess: (pid: number, signal: NodeJS.Signals) => void = process.kill,
+): boolean {
+    const pid = child.pid;
+    if (typeof pid === 'number' && pid > 0) {
+        try {
+            // Negative PID addresses the process group led by `pid`.
+            killProcess(-pid, signal);
+            return true;
+        } catch {
+            // ESRCH: the group is already gone. Anything else: fall through to
+            // the direct kill below so termination still happens.
+        }
+    }
+    child.kill(signal);
+    return false;
+}
+
+/** Milliseconds between the group SIGTERM and the group SIGKILL. */
+export const WORKER_PROCESS_GROUP_FORCE_KILL_MS = 5000;
+
+/**
+ * SIGKILL the whole group if a graceful stop left anything behind.
+ *
+ * The caller-supplied force kill only reaches the direct child, so a grandchild
+ * the agent forked would survive it. This sweep is what makes the
+ * left-behind-child observation hold.
+ */
+export function scheduleWorkerProcessGroupForceKill(
+    child: ChildProcess,
+    delayMs: number = WORKER_PROCESS_GROUP_FORCE_KILL_MS,
+): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => killWorkerProcessGroup(child, 'SIGKILL'), delayMs);
+    timer.unref();
+    return timer;
+}
+
 export function runWithExecutionAbortSignal<T>(
     signal: AbortSignal,
     operation: () => Promise<T>,
@@ -86,8 +142,9 @@ export function abortSpawnedExecution(
     };
     const hasGenerationFence = Boolean(options.taskId && options.attemptGeneration);
     const childTermination = hasGenerationFence ? waitForChildTermination(child) : null;
-    child.kill('SIGTERM');
+    killWorkerProcessGroup(child, 'SIGTERM');
     options.scheduleForceKill(child);
+    scheduleWorkerProcessGroupForceKill(child);
     state.teardownPromise = (async () => {
         await teardownDockerExecution(teardownOptions);
         if (childTermination) {

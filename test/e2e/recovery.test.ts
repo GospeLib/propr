@@ -630,3 +630,52 @@ describe("E2E Task Recovery", {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Worker termination contract
+//
+// Requeueing a stopped task is only safe if stopping it actually ended the
+// worker. A child the agent forked and left behind would keep writing into the
+// assigned worktree while the retry runs against the same path. This runs
+// without the live API because it observes local process state directly.
+// ---------------------------------------------------------------------------
+
+describe("E2E Task Recovery — worker termination leaves nothing behind", () => {
+  it("kills the agent's left-behind child before the task can be requeued", async () => {
+    const { spawn } = await import("node:child_process");
+    const { readFileSync } = await import("node:fs");
+    const {
+      abortSpawnedExecution,
+      WORKER_PROCESS_GROUP_SPAWN_OPTIONS,
+    } = await import("../../packages/core/src/claude/docker/dockerExecutionOwnership.js");
+
+    const isAlive = (pid: number): boolean => {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] !== "Z";
+      } catch {
+        return false;
+      }
+    };
+
+    const worker = spawn("sh", ["-c", 'sleep 45 & echo "$!"; wait'], {
+      stdio: ["ignore", "pipe", "pipe"],
+      ...WORKER_PROCESS_GROUP_SPAWN_OPTIONS,
+    });
+    const leftBehindPid = await new Promise<number>((resolve, reject) => {
+      worker.stdout!.once("data", (chunk) => resolve(Number(String(chunk).trim())));
+      worker.once("error", reject);
+    });
+    assert.ok(isAlive(leftBehindPid), "left-behind child should start alive");
+
+    await abortSpawnedExecution(
+      worker,
+      { aborted: { value: false }, containerId: { value: null }, teardownPromise: null },
+      { namedContainer: null, scheduleForceKill: () => {} },
+    );
+
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && isAlive(leftBehindPid)) await sleep(25);
+    assert.ok(!isAlive(leftBehindPid), "stopping a task must not leave the agent's child running");
+  });
+});

@@ -1,4 +1,6 @@
 import { availableParallelism } from 'node:os';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const DEFAULT_MEMORY_LIMIT = '6g';
 const DEFAULT_CPU_LIMIT_CEILING = 4;
@@ -105,4 +107,407 @@ export function buildAgentContainerResourceArgs(
         '--cpus', cpus,
         '--pids-limit', pids,
     ];
+}
+
+/* ------------------------------------------------------------------------- *
+ * Confined worker runtime policy
+ *
+ * A git worktree is not a sandbox: the historical `/tmp/git-processor:rw`
+ * mount handed every agent the primary checkout and every other task's
+ * worktree. The policy below is the single place that decides which host
+ * resources a mutating worker may see, what capabilities it keeps, and which
+ * runtime escapes are refused. Path capability lives here; branch capability
+ * is a separate custody control in the shared git setup path.
+ * ------------------------------------------------------------------------- */
+
+export const WORKER_CONFINEMENT_REFUSAL_PREFIX = 'propr-worker-confinement-refused';
+
+export type WorkerConfinementRefusalReason =
+    | 'primary-checkout'
+    | 'unrelated-worktree'
+    | 'controller-state'
+    | 'attestation-store'
+    | 'authoritative-evidence'
+    | 'protected-state-import'
+    | 'out-of-scope-credential'
+    | 'stage-credential'
+    | 'container-control-socket'
+    | 'privileged-runtime'
+    | 'network-outside-policy'
+    | 'unconfined-security-profile'
+    | 'missing-assigned-worktree'
+    | 'missing-assigned-branch';
+
+/**
+ * Refuse a confinement violation by name. Callers raise this before the
+ * `docker run` argument vector is handed to the executor, so the refusal
+ * happens before the attempt can take effect rather than after.
+ */
+export function refuseWorkerConfinement(reason: WorkerConfinementRefusalReason, detail: string): never {
+    throw new Error(`${WORKER_CONFINEMENT_REFUSAL_PREFIX}:${reason} ${detail}`);
+}
+
+/** True when `error` is a confinement refusal, optionally of one specific class. */
+export function isWorkerConfinementRefusal(error: unknown, reason?: WorkerConfinementRefusalReason): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.startsWith(reason
+        ? `${WORKER_CONFINEMENT_REFUSAL_PREFIX}:${reason} `
+        : `${WORKER_CONFINEMENT_REFUSAL_PREFIX}:`);
+}
+
+/** Existing runtime configuration for the shared git storage roots. */
+export function resolveClonesBasePath(): string {
+    return process.env.GIT_CLONES_BASE_PATH || '/tmp/git-processor/clones';
+}
+
+export function resolveWorktreesBasePath(): string {
+    return process.env.GIT_WORKTREES_BASE_PATH || '/tmp/git-processor/worktrees';
+}
+
+/**
+ * Controller state the ProPR control plane keeps on disk. A worker that could
+ * mount any of these could read queue state, logs and managed repositories, or
+ * rewrite the record of its own run.
+ */
+const CONTROLLER_STATE_ROOTS = [
+    '/usr/src/app/data',
+    '/usr/src/app/logs',
+    '/usr/src/app/repos',
+    '/app/data',
+    '/app/logs',
+    '/app/repos',
+];
+
+/**
+ * The root-owned Ezer admission marker the entrypoint writes before dropping
+ * privileges. Mounting over it would let a worker forge its own attestation.
+ */
+const ATTESTATION_STORE_ROOTS = ['/run/propr'];
+
+/** Persisted transcripts and execution logs are the authoritative evidence of a run. */
+const AUTHORITATIVE_EVIDENCE_ROOTS = ['/tmp/git-processor/propr-cache/transcripts'];
+
+/** Host credential material that is out of scope for any agent container. */
+const OUT_OF_SCOPE_CREDENTIAL_SEGMENTS = [
+    '.ssh',
+    '.aws',
+    '.gnupg',
+    '.docker',
+    '.kube',
+    '.netrc',
+    '.npmrc',
+];
+
+const CONTAINER_CONTROL_SOCKETS = ['/var/run/docker.sock', '/run/docker.sock'];
+
+function normalizeHostPath(hostPath: string): string {
+    return path.posix.normalize(hostPath).replace(/\/+$/, '') || '/';
+}
+
+function isWithin(candidate: string, root: string): boolean {
+    const normalizedRoot = normalizeHostPath(root);
+    return candidate === normalizedRoot || candidate.startsWith(`${normalizedRoot}/`);
+}
+
+/**
+ * Classify a host path a mutating worker asked to mount. Returns `null` when
+ * the path carries no locked refusal class; the caller still applies the
+ * default-deny allow-set so an unclassified path cannot slip through.
+ */
+export function classifyConfinementRefusal(
+    hostPath: string,
+    assignedWorktreePath?: string,
+): WorkerConfinementRefusalReason | null {
+    const candidate = normalizeHostPath(hostPath);
+    const assigned = assignedWorktreePath ? normalizeHostPath(assignedWorktreePath) : null;
+    const classes: Array<[WorkerConfinementRefusalReason, string[]]> = [
+        ['primary-checkout', [resolveClonesBasePath()]],
+        ['unrelated-worktree', [resolveWorktreesBasePath()]],
+        ['controller-state', CONTROLLER_STATE_ROOTS],
+        ['attestation-store', ATTESTATION_STORE_ROOTS],
+        ['authoritative-evidence', AUTHORITATIVE_EVIDENCE_ROOTS],
+        ['container-control-socket', CONTAINER_CONTROL_SOCKETS],
+    ];
+
+    // A path inside a locked root is named by that root. Checking containment
+    // first keeps the most specific class winning over a broad mount that
+    // happens to sit above several roots at once.
+    for (const [reason, roots] of classes) {
+        if (!roots.some(root => isWithin(candidate, root))) continue;
+        if (reason === 'unrelated-worktree' && assigned && isWithin(candidate, assigned)) return null;
+        return reason;
+    }
+    // A mount that merely contains a locked root is named by the first root it
+    // exposes, so the blanket git-processor mount reports the checkout.
+    for (const [reason, roots] of classes) {
+        if (roots.some(root => isWithin(normalizeHostPath(root), candidate))) return reason;
+    }
+
+    const segments = candidate.split('/');
+    if (OUT_OF_SCOPE_CREDENTIAL_SEGMENTS.some(segment => segments.includes(segment))) {
+        return 'out-of-scope-credential';
+    }
+    return null;
+}
+
+/**
+ * Credentials that belong to a delivery stage rather than to a worker run.
+ * The worker keeps the scoped GitHub token and the model-provider key it needs;
+ * publishing, deployment and signing material is refused by name.
+ */
+const STAGE_CREDENTIAL_PATTERN = new RegExp(
+    '^(?:'
+    + 'PROPR_STAGE_.*'
+    + '|.*STAG(?:E|ING)_.*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|CREDENTIALS)'
+    + '|NPM_TOKEN|NODE_AUTH_TOKEN'
+    + '|AWS_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)'
+    + '|(?:GOOGLE|GCP)_(?:APPLICATION_CREDENTIALS|SERVICE_ACCOUNT_KEY)'
+    + '|AZURE_(?:CLIENT_SECRET|TENANT_ID)'
+    + '|(?:DOCKERHUB|DOCKER)_(?:TOKEN|PASSWORD)'
+    + '|(?:CLOUDFLARE|VERCEL|NETLIFY|FLY)_(?:API_)?TOKEN'
+    + '|(?:GPG|COSIGN|SIGSTORE)_(?:PRIVATE_KEY|PASSWORD|PASSPHRASE)'
+    + ')$',
+);
+
+/** Protected control-plane state must never be imported into a worker as environment. */
+const PROTECTED_STATE_IMPORT_PATTERN = /^(?:PROPR_EZER_[A-Z0-9_]*|PROPR_ADMISSION_[A-Z0-9_]*|PROPR_CONTROLLER_[A-Z0-9_]*)$/;
+
+export function classifyEnvironmentRefusal(name: string): WorkerConfinementRefusalReason | null {
+    const normalized = name.toUpperCase();
+    if (STAGE_CREDENTIAL_PATTERN.test(normalized)) return 'stage-credential';
+    if (PROTECTED_STATE_IMPORT_PATTERN.test(normalized)) return 'protected-state-import';
+    return null;
+}
+
+/**
+ * Refuse per-execution environment that would hand a worker a stage credential
+ * or import protected control-plane state. The Ezer admission marker is still
+ * delivered by the daemon caller, which this policy does not touch: it is
+ * injected outside the per-execution `environment` map this guard inspects.
+ */
+export function assertConfinedWorkerEnvironment(
+    sources: Array<Record<string, string> | undefined>,
+): void {
+    for (const source of sources) {
+        if (!source) continue;
+        for (const name of Object.keys(source)) {
+            const refusal = classifyEnvironmentRefusal(name);
+            if (refusal) refuseWorkerConfinement(refusal, name);
+        }
+    }
+}
+
+/**
+ * Runtime escapes that are refused regardless of which builder produced them.
+ * `--network bridge` remains the existing runtime policy; this guard only
+ * refuses arguments that reach *past* that policy. It deliberately defines no
+ * egress allowlist, because the locked inputs define none.
+ */
+export function assertConfinedWorkerRuntimeArgs(dockerArgs: readonly string[]): void {
+    for (let index = 0; index < dockerArgs.length; index++) {
+        const arg = dockerArgs[index];
+        const inlineValue = arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : undefined;
+        const value = inlineValue ?? dockerArgs[index + 1] ?? '';
+        const flag = arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg;
+
+        if (flag === '--privileged') refuseWorkerConfinement('privileged-runtime', '--privileged');
+        if (flag === '--device' || flag === '--device-cgroup-rule') {
+            refuseWorkerConfinement('privileged-runtime', `${flag} ${value}`);
+        }
+        if ((flag === '--pid' || flag === '--ipc' || flag === '--uts' || flag === '--userns' || flag === '--cgroupns')
+            && value === 'host') {
+            refuseWorkerConfinement('privileged-runtime', `${flag} host`);
+        }
+        if (flag === '--network' && value !== 'bridge' && value !== 'none') {
+            refuseWorkerConfinement('network-outside-policy', `--network ${value}`);
+        }
+        if (flag === '--security-opt' && /(?:seccomp|apparmor)=unconfined/.test(value)) {
+            refuseWorkerConfinement('unconfined-security-profile', `--security-opt ${value}`);
+        }
+        if (flag === '--cap-add' && !CONFINED_WORKER_CAPABILITIES.includes(value.toUpperCase())) {
+            refuseWorkerConfinement('privileged-runtime', `--cap-add ${value}`);
+        }
+    }
+}
+
+/**
+ * The only capabilities a confined worker keeps. Docker's default set is
+ * dropped wholesale; these are re-added because the agent entrypoints repair
+ * bind-mount ownership and then `su-exec` down to uid 1000. Changing user
+ * clears the effective set, so the model process itself holds none of them,
+ * and the bounding set makes NET_RAW, MKNOD, SYS_CHROOT and friends
+ * unreachable for the whole run.
+ */
+export const CONFINED_WORKER_CAPABILITIES = ['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'SETUID', 'SETGID'];
+
+/**
+ * Writable scratch inside an otherwise read-only capsule. Each entry exists
+ * because an entrypoint or agent CLI provably writes there: `/run` holds the
+ * Ezer admission marker, `/home/node/bin` the `gh` wrapper symlink that the
+ * entrypoints create under `set -e`, and the rest are per-agent caches and XDG
+ * directories that the builders already point into `/tmp`.
+ */
+export const CONFINED_WORKER_TMPFS_PATHS = [
+    '/tmp',
+    '/run',
+    '/home/node/bin',
+    '/home/node/.cache',
+    '/home/node/.config',
+    '/home/node/.npm',
+    '/home/node/.local/state',
+];
+
+/**
+ * The read-only capsule plus its explicit writable scratch. `git config
+ * --global` is redirected into the writable scratch so the entrypoints keep
+ * working when `$HOME` itself is read-only.
+ *
+ * The scratch is sticky (`1777`), which matters for `/run`: the entrypoint
+ * creates the root-owned `/run/propr` admission marker there, and the sticky
+ * bit stops the unprivileged model from unlinking or replacing a directory it
+ * does not own.
+ */
+export function buildConfinedWorkerCapsuleArgs(): string[] {
+    return [
+        '--read-only',
+        ...CONFINED_WORKER_TMPFS_PATHS.flatMap(target => ['--tmpfs', `${target}:rw,mode=1777`]),
+        '-e', 'GIT_CONFIG_GLOBAL=/tmp/propr-git-global.config',
+    ];
+}
+
+/** Capability confinement shared by every agent builder. */
+export function buildConfinedWorkerCapabilityArgs(): string[] {
+    return [
+        '--cap-drop', 'ALL',
+        ...CONFINED_WORKER_CAPABILITIES
+            .filter(capability => capability !== 'CHOWN')
+            .flatMap(capability => ['--cap-add', capability]),
+    ];
+}
+
+/**
+ * Resolve the git storage the assigned worktree genuinely needs.
+ *
+ * A linked worktree keeps its administrative directory and its object database
+ * inside the clone's `.git`, so that directory has to travel with the worktree.
+ * The clone's *working tree* does not, and neither does any sibling worktree —
+ * which is exactly what the old blanket `/tmp/git-processor` mount handed over.
+ */
+export function resolveAssignedWorktreeGitDir(
+    worktreePath: string,
+    readFile: (target: string) => string = target => fs.readFileSync(target, 'utf8'),
+): string | null {
+    let pointer: string;
+    try {
+        pointer = readFile(path.join(worktreePath, '.git'));
+    } catch {
+        return null;
+    }
+    const gitdir = /gitdir:\s*(.+)/.exec(pointer)?.[1]?.trim();
+    if (!gitdir || !gitdir.startsWith('/')) return null;
+    // `<clone>/.git/worktrees/<unit>` — the shared object store is its grandparent.
+    const marker = `${path.posix.sep}.git${path.posix.sep}`;
+    const markerIndex = gitdir.indexOf(marker);
+    return markerIndex === -1 ? gitdir : gitdir.slice(0, markerIndex + marker.length - 1);
+}
+
+/**
+ * Explicit mounts for a mutating worker, replacing the blanket git-processor
+ * mount. Every entry is named; anything else the caller adds still has to
+ * survive {@link assertConfinedWorkerMounts}.
+ */
+export function buildAssignedWorktreeMountArgs(options: {
+    worktreePath: string;
+    agentType: string;
+    resolveGitDir?: (worktreePath: string) => string | null;
+}): string[] {
+    const { worktreePath, agentType, resolveGitDir = resolveAssignedWorktreeGitDir } = options;
+    if (!worktreePath) refuseWorkerConfinement('missing-assigned-worktree', 'no assigned worktree path');
+    const cacheDir = `/tmp/git-processor/propr-cache/${agentType}`;
+    const sharedGitDir = resolveGitDir(worktreePath);
+    return [
+        ...(sharedGitDir ? ['-v', `${sharedGitDir}:${sharedGitDir}:rw`] : []),
+        '-v', `${cacheDir}:${cacheDir}:rw`,
+    ];
+}
+
+/**
+ * The `.git` directory a mount is allowed to expose, given the assigned
+ * worktree. Kept separate from {@link buildAssignedWorktreeMountArgs} so the
+ * mount check accepts a caller-supplied value instead of re-reading the
+ * worktree pointer and risking a different answer than the builder got.
+ */
+export function isAssignedWorktreeGitStorage(hostPath: string, sharedGitDir: string | null): boolean {
+    return Boolean(sharedGitDir) && isWithin(normalizeHostPath(hostPath), sharedGitDir!);
+}
+
+interface ParsedMount {
+    hostPath: string;
+    containerPath: string;
+    mode: string;
+}
+
+export function parseDockerMountArgs(dockerArgs: readonly string[]): ParsedMount[] {
+    const mounts: ParsedMount[] = [];
+    for (let index = 0; index < dockerArgs.length; index++) {
+        if (dockerArgs[index] !== '-v' && dockerArgs[index] !== '--volume') continue;
+        const spec = dockerArgs[index + 1];
+        if (!spec) continue;
+        const parts = spec.split(':');
+        if (parts.length < 2 || !parts[0].startsWith('/')) continue;
+        mounts.push({
+            hostPath: parts[0],
+            containerPath: parts[1],
+            mode: parts[2] ?? 'rw',
+        });
+    }
+    return mounts;
+}
+
+/**
+ * Refuse, by name, every mount a mutating worker must not receive.
+ *
+ * The assigned worktree, its shared git storage and the agent's own cache and
+ * configuration are permitted; the clone's working tree, sibling worktrees,
+ * controller state, the attestation marker, persisted evidence, the container
+ * control socket and host credential directories are each refused under their
+ * own class name.
+ */
+export function assertConfinedWorkerMounts(
+    dockerArgs: readonly string[],
+    context: {
+        worktreePath?: string;
+        /**
+         * The single per-run evidence artifact this worker owns (its own
+         * transcript file). The surrounding evidence store stays refused, so a
+         * worker cannot read or rewrite another run's record.
+         */
+        scopedEvidencePath?: string;
+        /**
+         * Shared git storage for the assigned worktree, as resolved when the
+         * mounts were built. Falls back to resolving from the worktree pointer.
+         */
+        sharedGitDirPath?: string | null;
+        /**
+         * A mutating worker is refused any mount of a locked class. Read-only
+         * analysis keeps its existing ability to inspect a checkout it mounts
+         * `ro`; only writable access is refused there.
+         */
+        mutating?: boolean;
+    },
+): void {
+    const assigned = context.worktreePath ? normalizeHostPath(context.worktreePath) : undefined;
+    const sharedGitDir = context.sharedGitDirPath !== undefined
+        ? context.sharedGitDirPath
+        : (context.worktreePath ? resolveAssignedWorktreeGitDir(context.worktreePath) : null);
+    const scopedEvidence = context.scopedEvidencePath ? normalizeHostPath(context.scopedEvidencePath) : undefined;
+    for (const mount of parseDockerMountArgs(dockerArgs)) {
+        const hostPath = normalizeHostPath(mount.hostPath);
+        if (assigned && isWithin(hostPath, assigned)) continue;
+        if (isAssignedWorktreeGitStorage(hostPath, sharedGitDir)) continue;
+        if (scopedEvidence && hostPath === scopedEvidence) continue;
+        if (!context.mutating && mount.mode.split(',').includes('ro')) continue;
+        const refusal = classifyConfinementRefusal(hostPath, assigned);
+        if (refusal) refuseWorkerConfinement(refusal, `${mount.hostPath} -> ${mount.containerPath}:${mount.mode}`);
+    }
 }

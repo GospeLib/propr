@@ -66,6 +66,9 @@ function buildDockerArgs(agent: AntigravityAgent, params: {
     modelName?: string;
     issueNumber?: number;
     taskId?: string;
+    transcriptPath?: string;
+    branchName?: string;
+    mutating?: boolean;
 } = {}): string[] {
     return (agent as unknown as {
         buildDockerArgs(params: {
@@ -74,13 +77,19 @@ function buildDockerArgs(agent: AntigravityAgent, params: {
             modelName?: string;
             issueNumber: number;
             taskId?: string;
+            transcriptPath?: string;
+            branchName?: string;
+            mutating?: boolean;
         }): string[];
     }).buildDockerArgs({
         worktreePath: params.worktreePath || '/tmp/workspace',
         githubToken: params.githubToken || 'token',
         modelName: params.modelName,
         issueNumber: params.issueNumber ?? 123,
-        taskId: params.taskId
+        taskId: params.taskId,
+        transcriptPath: params.transcriptPath,
+        branchName: params.branchName,
+        mutating: params.mutating
     });
 }
 
@@ -915,5 +924,50 @@ test('Antigravity labels resolve to Antigravity models', async (t) => {
     assert.deepEqual(scopedResolution, {
         agentAlias: 'antigravity',
         model: 'antigravity-gemini-3.5-flash-medium'
+    });
+});
+
+test('Antigravity mounts only the assigned worktree git storage, not the whole git-processor tree', () => {
+    withAntigravityEnv({}, () => {
+        const agent = new AntigravityAgent(createAntigravityConfig({ configPath: '/tmp/antigravity-config' }));
+        const worktreePath = '/tmp/git-processor/worktrees/antigravity-unit-7';
+        const args = buildDockerArgs(agent, {
+            worktreePath,
+            branchName: '7/antigravity-s16-t01',
+            mutating: true,
+        });
+
+        assert.ok(args.includes(`${worktreePath}:/home/node/workspace:rw`));
+        assert.ok(args.includes('/tmp/git-processor/propr-cache/antigravity:/tmp/git-processor/propr-cache/antigravity:rw'));
+        assert.ok(!args.includes('/tmp/git-processor:/tmp/git-processor:rw'));
+        assert.ok(args.includes('--read-only'));
+        assert.deepEqual(args.slice(args.indexOf('--cap-drop'), args.indexOf('--cap-drop') + 2), ['--cap-drop', 'ALL']);
+        assert.ok(args.includes('PROPR_ASSIGNED_BRANCH=7/antigravity-s16-t01'));
+    });
+});
+
+test('Antigravity binds only its own transcript file, not the shared evidence store', () => {
+    withAntigravityEnv({}, () => {
+        const agent = new AntigravityAgent(createAntigravityConfig({ configPath: '/tmp/antigravity-config' }));
+        const transcriptPath = '/tmp/git-processor/propr-cache/transcripts/antigravity/run-7.jsonl';
+        const args = buildDockerArgs(agent, {
+            worktreePath: '/tmp/git-processor/worktrees/antigravity-unit-7',
+            transcriptPath,
+            branchName: '7/antigravity-s16-t01',
+            mutating: true,
+        });
+
+        assert.ok(args.includes(`${transcriptPath}:${transcriptPath}:rw`));
+        assert.ok(!args.some(argument => argument.startsWith('/tmp/git-processor/propr-cache/transcripts/antigravity:')));
+    });
+});
+
+test('Antigravity refuses mutating execution without an assigned unit branch', () => {
+    withAntigravityEnv({}, () => {
+        const agent = new AntigravityAgent(createAntigravityConfig({ configPath: '/tmp/antigravity-config' }));
+        assert.throws(() => buildDockerArgs(agent, {
+            worktreePath: '/tmp/git-processor/worktrees/antigravity-unit-7',
+            mutating: true,
+        }), /propr-worker-confinement-refused:missing-assigned-branch antigravity mutating execution/);
     });
 });

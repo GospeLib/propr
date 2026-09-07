@@ -4,6 +4,10 @@ import { Agent, AgentConfig, AgentTaskOptions, AgentExecutionResult, AnalysisRes
 import { executeDockerCommand } from '../../claude/docker/dockerExecutor.js';
 import { wrapDockerRunArgsWithRepoSetup } from '../../claude/docker/repoSetupWrapper.js';
 import {
+    assertConfinedWorkerEnvironment,
+    buildAssignedWorktreeMountArgs,
+} from '../agentContainerResources.js';
+import {
     verifyWorktreeStructure,
     verifyWorktreePostExecution,
     setWorktreeOwnership,
@@ -123,7 +127,7 @@ export class AntigravityAgent implements Agent {
     }
 
     async executeTask(options: AgentTaskOptions): Promise<AgentExecutionResult> {
-        const { worktreePath, issueRef, prompt: customPrompt, model, isRetry = false, retryReason, onSessionId, onContainerId, githubToken, environment, taskId, prNumber } = options;
+        const { worktreePath, issueRef, prompt: customPrompt, model, isRetry = false, retryReason, branchName, onSessionId, onContainerId, githubToken, environment, taskId, prNumber } = options;
         const startTime = Date.now();
         const effectiveModel = model || this.config.defaultModel;
         const transcriptPath = this.createTransientTranscriptPath(taskId);
@@ -137,7 +141,11 @@ export class AntigravityAgent implements Agent {
             const prompt = this.buildPromptWithRetryContext(customPrompt, isRetry, retryReason);
             await setWorktreeOwnership(worktreePath, issueRef.number);
             const worktreeGitContent = verifyWorktreeStructure(worktreePath, issueRef.number);
-            const dockerArgs = this.buildDockerArgs({ worktreePath, githubToken, modelName: effectiveModel, issueNumber: issueRef.number, environment, taskId, transcriptPath });
+            const dockerArgs = this.buildDockerArgs({
+                worktreePath, githubToken, modelName: effectiveModel, issueNumber: issueRef.number,
+                environment, taskId, transcriptPath,
+                branchName, mutating: true,
+            });
 
             const { result, usageMetrics } = await executeWithUsageTracking(
                 this.getRuntimeName(),
@@ -224,7 +232,11 @@ export class AntigravityAgent implements Agent {
         const safeTaskId = taskId?.slice(-80).replace(/[^a-zA-Z0-9_.-]/g, '-') || 'run';
         const transcriptRoot = getAntigravityTranscriptRoot();
         fs.mkdirSync(transcriptRoot, { recursive: true });
-        return path.join(transcriptRoot, `${safeTaskId}-${suffix}.jsonl`);
+        const transcriptPath = path.join(transcriptRoot, `${safeTaskId}-${suffix}.jsonl`);
+        // Create the file so Docker binds this one artifact instead of creating
+        // a directory at the mount point.
+        fs.writeFileSync(transcriptPath, '', { mode: 0o600 });
+        return transcriptPath;
     }
 
     private cleanupTransientTranscript(transcriptPath: string | undefined): void {
@@ -433,9 +445,10 @@ export class AntigravityAgent implements Agent {
         return ['set -e', `exec ${this.getCliCommand()} ${safetyArgs} "$@"`].join('\n');
     }
 
-    private buildDockerArgs(params: { worktreePath: string; githubToken: string; modelName?: string; issueNumber: number; environment?: Record<string, string>; taskId?: string; executionType?: string; transcriptPath?: string; readOnlyWorkspace?: boolean; repositoryInspection?: boolean }): string[] {
-        const { worktreePath, githubToken, modelName, issueNumber, environment, taskId, executionType, transcriptPath, readOnlyWorkspace = false, repositoryInspection = false } = params;
+    private buildDockerArgs(params: { worktreePath: string; githubToken: string; modelName?: string; issueNumber: number; environment?: Record<string, string>; taskId?: string; executionType?: string; transcriptPath?: string; readOnlyWorkspace?: boolean; repositoryInspection?: boolean; branchName?: string; mutating?: boolean }): string[] {
+        const { worktreePath, githubToken, modelName, issueNumber, environment, taskId, executionType, transcriptPath, readOnlyWorkspace = false, repositoryInspection = false, branchName, mutating = false } = params;
         assertRepositoryInspectionMode(repositoryInspection, readOnlyWorkspace);
+        assertConfinedWorkerEnvironment([this.config.envVars, environment]);
         const configPath = this.getHostConfigPath();
         const envVars = buildAgentEnvironmentArgs(repositoryInspection, this.config.envVars, environment);
         const shortTaskId = createContainerExecutionId(taskId);
@@ -445,7 +458,12 @@ export class AntigravityAgent implements Agent {
         const dockerArgs: string[] = [
             'run', '--rm', '-i', '--name', containerName, '--security-opt', 'no-new-privileges', '--cap-add', 'CHOWN', '--network', 'bridge', '--user', '0:0',
             '-v', `${worktreePath}:${repositoryInspection ? REPOSITORY_SCOUT_CONTAINER_ROOT : '/home/node/workspace'}:${readOnlyWorkspace ? 'ro' : 'rw'}`,
-            ...(repositoryInspection ? [] : ['-v', `/tmp/git-processor:/tmp/git-processor:${readOnlyWorkspace ? 'ro' : 'rw'}`]),
+            ...(repositoryInspection || readOnlyWorkspace
+                ? []
+                : buildAssignedWorktreeMountArgs({ worktreePath, agentType: runtimeName })),
+            // The worker writes only its own transcript file, not the transcript
+            // store that holds every other run's evidence.
+            ...(transcriptPath && !readOnlyWorkspace ? ['-v', `${transcriptPath}:${transcriptPath}:rw`] : []),
             '-v', `${configPath}:${this.getContainerConfigPath()}:rw`,
             ...(repositoryInspection ? [] : ['-e', `GH_TOKEN=${githubToken}`, '-e', `GITHUB_TOKEN=${githubToken}`]),
             '-e', 'ANTIGRAVITY_CLI=1', '-e', 'ANTIGRAVITY_CLI_TRUST_WORKSPACE=true',
@@ -472,7 +490,10 @@ export class AntigravityAgent implements Agent {
             logger.info({ issueNumber, requestedModel: cleanModelName, originalModel: modelName, agentAlias: this.config.alias }, 'Model specified for Antigravity agent');
         } else { logger.debug({ issueNumber, agentAlias: this.config.alias }, 'No model specified, Antigravity agent will use default'); }
         logger.info({ issueNumber, agentAlias: this.config.alias }, 'Docker args built for Antigravity agent');
-        return wrapDockerRunArgsWithRepoSetup(dockerArgs, this.config.dockerImage, runtimeName);
+        return wrapDockerRunArgsWithRepoSetup(dockerArgs, this.config.dockerImage, runtimeName, {
+            branchName, worktreePath, mutating,
+            scopedEvidencePath: readOnlyWorkspace ? undefined : transcriptPath,
+        });
     }
 
     private buildContainerName(alias: string, taskType: string, shortTaskId: string, modelName?: string): string {

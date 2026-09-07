@@ -10,6 +10,7 @@ import {
     getDockerRunContainerName,
     getExecutionOwnershipContext,
     resolveExecutionArgs,
+    WORKER_PROCESS_GROUP_SPAWN_OPTIONS,
 } from './dockerExecutionOwnership.js';
 import {
     plannerAbortSignalKeyForTask,
@@ -21,7 +22,9 @@ export { stopDockerContainer } from './dockerContainerControl.js';
 export {
     addTaskAttemptLabelsToDockerArgs,
     ExecutionAbortedError,
+    killWorkerProcessGroup,
     runWithExecutionAbortSignal,
+    scheduleWorkerProcessGroupForceKill,
 } from './dockerExecutionOwnership.js';
 export {
     buildPlannerAbortSignalKey,
@@ -145,7 +148,13 @@ function spawnCommandProcess(
     cwd: string | undefined,
     stdinData: string | undefined,
 ): ChildProcess {
-    const spawnOptions: SpawnOptions = { stdio: [stdinData ? 'pipe' : 'ignore', 'pipe', 'pipe'], env: process.env };
+    const spawnOptions: SpawnOptions = {
+        stdio: [stdinData ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+        env: process.env,
+        // Own the worker's process group so termination reaches everything the
+        // worker forked, not just `docker` itself.
+        ...WORKER_PROCESS_GROUP_SPAWN_OPTIONS,
+    };
     if (cwd && fs.existsSync(cwd)) spawnOptions.cwd = cwd;
     else if (cwd) logger.warn({ cwd }, 'Working directory does not exist, spawning from current directory');
 

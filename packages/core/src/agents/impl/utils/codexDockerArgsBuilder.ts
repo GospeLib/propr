@@ -2,6 +2,10 @@ import logger from '../../../utils/logger.js';
 import type { AgentConfig } from '../../types.js';
 import { resolveConfigPath, type CodexRuntimeReasoningLevel } from '../../../config/configManager.js';
 import { wrapDockerRunArgsWithRepoSetup } from '../../../claude/docker/repoSetupWrapper.js';
+import {
+    assertConfinedWorkerEnvironment,
+    buildAssignedWorktreeMountArgs,
+} from '../../agentContainerResources.js';
 import { createContainerExecutionId } from './containerExecutionId.js';
 import {
     buildCodexRepositoryScoutArgs,
@@ -45,16 +49,22 @@ export interface CodexDockerArgsParams {
     reasoningLevel?: CodexRuntimeReasoningLevel | '';
     readOnlyWorkspace?: boolean;
     repositoryInspection?: boolean;
+    /** Assigned unit branch (`AgentTaskOptions.branchName`) carried into git custody. */
+    branchName?: string;
+    /** Set by the agent for a real mutating worker run. */
+    mutating?: boolean;
 }
 
 export function buildCodexDockerArgs(config: AgentConfig, params: CodexDockerArgsParams): string[] {
     const {
         worktreePath, githubToken, modelName, issueNumber, jsonOutput = true, environment,
         taskId, executionType, reasoningLevel, readOnlyWorkspace = false, repositoryInspection = false,
+        branchName, mutating = false,
     } = params;
     if (repositoryInspection && !readOnlyWorkspace) {
         throw new Error('Repository inspection requires a read-only workspace');
     }
+    assertConfinedWorkerEnvironment([config.envVars, environment]);
 
     const dockerImage = config.dockerImage;
     const configPath = resolveConfigPath(config.configPath);
@@ -66,14 +76,16 @@ export function buildCodexDockerArgs(config: AgentConfig, params: CodexDockerArg
     const dockerArgs: string[] = [
         'run', '--rm', '-i',
         '--name', containerName,
+        // Codex runs with its own sandbox bypassed, so the container profile is
+        // the only boundary left; it no longer disables seccomp and AppArmor.
         '--security-opt', 'no-new-privileges',
-        '--security-opt', 'seccomp=unconfined',
-        '--security-opt', 'apparmor=unconfined',
         '--cap-add', 'CHOWN',
         '--network', 'bridge',
         '--user', '0:0',
         '-v', `${worktreePath}:${workspaceTarget}:${readOnlyWorkspace ? 'ro' : 'rw'}`,
-        ...(repositoryInspection ? [] : ['-v', `/tmp/git-processor:/tmp/git-processor:${readOnlyWorkspace ? 'ro' : 'rw'}`]),
+        ...(repositoryInspection || readOnlyWorkspace
+            ? []
+            : buildAssignedWorktreeMountArgs({ worktreePath, agentType: 'codex' })),
         '-v', `${configPath}:${CONTAINER_CONFIG_PATH}:rw`,
         ...(repositoryInspection ? [] : ['-e', `GH_TOKEN=${githubToken}`, '-e', `GITHUB_TOKEN=${githubToken}`]),
         ...(readOnlyWorkspace ? ['-e', 'PROPR_REPO_SETUP=0'] : []),
@@ -100,5 +112,7 @@ export function buildCodexDockerArgs(config: AgentConfig, params: CodexDockerArg
         logger.debug({ issueNumber, agentAlias: config.alias }, 'No model specified, Codex agent will use default');
     }
     logger.info({ issueNumber, agentAlias: config.alias }, 'Docker args built for Codex agent');
-    return wrapDockerRunArgsWithRepoSetup(dockerArgs, dockerImage, 'codex');
+    return wrapDockerRunArgsWithRepoSetup(dockerArgs, dockerImage, 'codex', {
+        branchName, worktreePath, mutating,
+    });
 }

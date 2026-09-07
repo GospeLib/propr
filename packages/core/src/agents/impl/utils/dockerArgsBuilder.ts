@@ -11,6 +11,10 @@ import logger from '../../../utils/logger.js';
 import { AgentConfig } from '../../types.js';
 import { resolveConfigPath, type ClaudeRuntimeReasoningLevel } from '../../../config/configManager.js';
 import { wrapDockerRunArgsWithRepoSetup } from '../../../claude/docker/repoSetupWrapper.js';
+import {
+    assertConfinedWorkerEnvironment,
+    buildAssignedWorktreeMountArgs,
+} from '../../agentContainerResources.js';
 import { createContainerExecutionId } from './containerExecutionId.js';
 import {
     buildRepositoryScoutMcpConfig,
@@ -71,6 +75,10 @@ export interface DockerArgsParams {
     readOnlyWorkspace?: boolean;
     /** Expose only the root-confined repository scout MCP tools. */
     repositoryInspection?: boolean;
+    /** Assigned unit branch (`AgentTaskOptions.branchName`) carried into git custody. */
+    branchName?: string;
+    /** Set by the agent for a real mutating worker run. */
+    mutating?: boolean;
 }
 
 function repositoryInspectionArgs(enabled: boolean): string[] {
@@ -133,7 +141,12 @@ function buildBaseDockerArgs(options: {
         '--network', 'bridge',
         '--user', '0:0',
         '-v', `${worktreePath}:${workspaceMountTarget}:${readOnlyWorkspace ? 'ro' : 'rw'}`,
-        ...(readOnlyWorkspace ? [] : ['-v', '/tmp/git-processor:/tmp/git-processor:rw']),
+        // The assigned worktree brings only the git storage it actually needs.
+        // The blanket /tmp/git-processor mount that used to sit here also handed
+        // over the primary checkout and every other task's worktree.
+        ...(readOnlyWorkspace
+            ? []
+            : buildAssignedWorktreeMountArgs({ worktreePath, agentType: config.type })),
         '-v', '/tmp/claude-logs:/tmp/claude-logs:rw',
         '-v', `${configPath}:/home/node/.claude:rw`,
         ...claudeJsonMount,
@@ -175,11 +188,13 @@ export function buildDockerArgs(
     const {
         worktreePath, githubToken, modelName, issueNumber, systemPrompt, tools, environment,
         taskId, executionType, reasoningLevel, readOnlyWorkspace = false, repositoryInspection = false,
+        branchName, mutating = false,
     } = params;
     const configPath = resolveConfigPath(config.configPath);
     if (repositoryInspection && !readOnlyWorkspace) {
         throw new Error('Repository inspection requires a read-only workspace');
     }
+    assertConfinedWorkerEnvironment([config.envVars, environment]);
     // Native file tools can read mounted provider configuration, so read-only runs disable them.
     const effectiveTools = readOnlyWorkspace ? '' : tools;
     const inspectionArgs = repositoryInspectionArgs(repositoryInspection);
@@ -248,5 +263,7 @@ export function buildDockerArgs(
         agentAlias: config.alias
     }, 'Docker args built for Claude agent');
 
-    return wrapDockerRunArgsWithRepoSetup(dockerArgs, config.dockerImage, config.type);
+    return wrapDockerRunArgsWithRepoSetup(dockerArgs, config.dockerImage, config.type, {
+        branchName, worktreePath, mutating,
+    });
 }

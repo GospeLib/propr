@@ -3,6 +3,10 @@ import { isManagedAgentConfigPath } from '@propr/shared';
 import logger from '../../utils/logger.js';
 import { resolveConfigPath } from '../../config/configManager.js';
 import { wrapDockerRunArgsWithRepoSetup } from '../../claude/docker/repoSetupWrapper.js';
+import {
+    assertConfinedWorkerEnvironment,
+    buildAssignedWorktreeMountArgs,
+} from '../agentContainerResources.js';
 import { generateClaudePrompt, type IssueDetails, type IssueRef } from '../../claude/prompts/promptGenerator.js';
 import type { AgentConfig, AnalysisResult } from '../types.js';
 import { createContainerExecutionId } from './utils/containerExecutionId.js';
@@ -43,6 +47,10 @@ export interface OpenCodeDockerArgsParams {
     repositoryInspection?: boolean;
     dataPath?: string;
     ensureConfigPath?: (configPath: string) => void;
+    /** Assigned unit branch (`AgentTaskOptions.branchName`) carried into git custody. */
+    branchName?: string;
+    /** Set by the agent for a real mutating worker run. */
+    mutating?: boolean;
 }
 
 export function evaluateOpenCodeAnalysis(options: {
@@ -105,8 +113,9 @@ export function buildOpenCodePrompt(options: BuildOpenCodePromptOptions): string
 }
 
 export function buildOpenCodeDockerArgs(params: OpenCodeDockerArgsParams): string[] {
-    const { config, worktreePath, githubToken, modelName, issueNumber, taskId, executionType, readOnlyWorkspace, repositoryInspection = false, dataPath, ensureConfigPath = ensureDirectory } = params;
+    const { config, worktreePath, githubToken, modelName, issueNumber, taskId, executionType, readOnlyWorkspace, repositoryInspection = false, dataPath, ensureConfigPath = ensureDirectory, branchName, mutating = false } = params;
     assertRepositoryInspectionMode(repositoryInspection, readOnlyWorkspace);
+    assertConfinedWorkerEnvironment([config.envVars]);
     const configPath = params.configPath || resolveConfigPath(config.configPath);
     const managedCredentials = isManagedAgentConfigPath(config.configPath);
     ensureConfigPath(configPath);
@@ -129,7 +138,9 @@ export function buildOpenCodeDockerArgs(params: OpenCodeDockerArgsParams): strin
     const dockerArgs = [
         'run', '--rm', '-i', '--name', containerName, '--security-opt', 'no-new-privileges', '--cap-add', 'CHOWN', '--network', 'bridge', '--user', '0:0',
         '-v', `${worktreePath}:${repositoryInspection ? REPOSITORY_SCOUT_CONTAINER_ROOT : '/home/node/workspace'}:${workspaceMode}`,
-        ...(repositoryInspection ? [] : ['-v', `/tmp/git-processor:/tmp/git-processor:${readOnlyWorkspace ? 'ro' : 'rw'}`]),
+        ...(repositoryInspection || workspaceMode === 'ro'
+            ? []
+            : buildAssignedWorktreeMountArgs({ worktreePath, agentType: 'opencode' })),
         '-v', `${configPath}:${CONTAINER_CONFIG_PATH}:${configMode}`,
         ...(repositoryInspection ? [] : ['-e', `GH_TOKEN=${githubToken}`, '-e', `GITHUB_TOKEN=${githubToken}`]),
         '-e', 'OPENCODE_CONFIG_DIR=/home/node/.config/opencode',
@@ -148,7 +159,9 @@ export function buildOpenCodeDockerArgs(params: OpenCodeDockerArgsParams): strin
         logger.info({ issueNumber, requestedModel: cleanModelName, originalModel: modelName, agentAlias: config.alias }, 'Model specified for OpenCode agent');
     }
 
-    return wrapDockerRunArgsWithRepoSetup(dockerArgs, config.dockerImage, 'opencode');
+    return wrapDockerRunArgsWithRepoSetup(dockerArgs, config.dockerImage, 'opencode', {
+        branchName, worktreePath, mutating,
+    });
 }
 
 function assertRepositoryInspectionMode(repositoryInspection: boolean, readOnlyWorkspace: boolean | undefined): void {

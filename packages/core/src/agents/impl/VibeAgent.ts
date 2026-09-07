@@ -3,6 +3,10 @@ import logger from '../../utils/logger.js';
 import { Agent, AgentConfig, AgentTaskOptions, AgentExecutionResult, AnalysisResult, AnalyzeOptions } from '../types.js';
 import { executeDockerCommand } from '../../claude/docker/dockerExecutor.js';
 import { buildAgentContainerResourceArgs, wrapDockerRunArgsWithRepoSetup } from '../../claude/docker/repoSetupWrapper.js';
+import {
+    assertConfinedWorkerEnvironment,
+    buildAssignedWorktreeMountArgs,
+} from '../agentContainerResources.js';
 import { verifyWorktreeStructure, verifyWorktreePostExecution, setWorktreeOwnership, UsageLimitError } from '../../claude/claudeHelpers.js';
 import { resolveConfigPath, loadSettings } from '../../config/configManager.js';
 import { persistLlmLog, createLlmLogFromAnalysis, buildTaskWorkRef, buildAnalysisWorkRef, formatUsageMetrics } from '../../utils/llmLogger.js';
@@ -44,6 +48,10 @@ interface VibeDockerArgsParams {
     envFilePath?: string;
     runtimeHomePath?: string;
     repositoryInspection?: boolean;
+    /** Assigned unit branch (`AgentTaskOptions.branchName`) carried into git custody. */
+    branchName?: string;
+    /** Set by the agent for a real mutating worker run. */
+    mutating?: boolean;
 }
 
 export class VibeAgent implements Agent {
@@ -58,7 +66,7 @@ export class VibeAgent implements Agent {
     }
 
     async executeTask(options: AgentTaskOptions): Promise<AgentExecutionResult> {
-        const { worktreePath, issueRef, prompt: customPrompt, model, isRetry = false, retryReason, onSessionId, onContainerId, githubToken, taskId, prNumber } = options;
+        const { worktreePath, issueRef, prompt: customPrompt, model, isRetry = false, retryReason, branchName, onSessionId, onContainerId, githubToken, taskId, prNumber } = options;
         const startTime = Date.now();
         const effectiveModel = model || this.config.defaultModel;
         const repository = `${issueRef.repoOwner}/${issueRef.repoName}`;
@@ -93,7 +101,9 @@ export class VibeAgent implements Agent {
                 taskId,
                 promptFilePath,
                 envFilePath,
-                runtimeHomePath
+                runtimeHomePath,
+                branchName,
+                mutating: true
             });
             const { result, usageMetrics } = await executeWithUsageTracking(
                 'vibe',
@@ -394,10 +404,11 @@ export class VibeAgent implements Agent {
     }
 
     private buildDockerArgs(params: VibeDockerArgsParams): string[] {
-        const { worktreePath, modelName, mistralApiKey, issueNumber, taskId, executionType, maxTurns = this.maxTurns, mode = 'execute', promptFilePath, envFilePath, runtimeHomePath, repositoryInspection = false } = params;
+        const { worktreePath, modelName, mistralApiKey, issueNumber, taskId, executionType, maxTurns = this.maxTurns, mode = 'execute', promptFilePath, envFilePath, runtimeHomePath, repositoryInspection = false, branchName, mutating = false } = params;
         if (repositoryInspection && mode !== 'analysis') {
             throw new Error('Repository inspection requires analysis mode');
         }
+        assertConfinedWorkerEnvironment([this.config.envVars]);
         const { configPath, hasUsableConfig, configMountArgs } = this.resolveCredentialsAndConfig(mistralApiKey);
         const cleanModelName = modelName?.includes(':') ? modelName.split(':').pop()! : modelName;
         const mistralEnvFileArgs = envFilePath ? ['--env-file', envFilePath] : [];
@@ -417,13 +428,19 @@ export class VibeAgent implements Agent {
             'run', '--rm', '--name', containerName, '--security-opt', 'no-new-privileges', '--network', 'bridge',
             ...getAnalysisSandboxArgs(mode),
             '-v', `${worktreePath}:${repositoryInspection ? REPOSITORY_SCOUT_CONTAINER_ROOT : '/home/node/workspace'}:${workspaceMountMode}`,
+            // Explicit git storage for the assigned worktree only; Vibe previously
+            // mounted no git storage at all, so a linked worktree could not resolve
+            // its own gitdir.
+            ...(mode === 'analysis' ? [] : buildAssignedWorktreeMountArgs({ worktreePath, agentType: 'vibe' })),
             ...configMountArgs, ...promptMountArgs, ...runtimeHomeMountArgs, ...mistralEnvFileArgs,
             ...envVars, '-w', '/home/node/workspace', this.config.dockerImage, ...cliArgs
         ];
         const cliArgsSource = (process.env.VIBE_CLI_ARGS ?? this.config.envVars?.VIBE_CLI_ARGS) ? 'custom' : 'default';
         logger.info({ issueNumber, agentAlias: this.config.alias, mode, dockerImage: this.config.dockerImage, configPath, configPathMounted: hasUsableConfig, workspaceMountMode, cliArgsSource, cliArgCount: cliArgs.length }, 'Docker args built for Vibe agent');
         if (mode === 'analysis') return [dockerArgs[0], ...buildAgentContainerResourceArgs(), ...dockerArgs.slice(1)];
-        return wrapDockerRunArgsWithRepoSetup(dockerArgs, this.config.dockerImage, 'vibe');
+        return wrapDockerRunArgsWithRepoSetup(dockerArgs, this.config.dockerImage, 'vibe', {
+            branchName, worktreePath, mutating,
+        });
     }
 
 }

@@ -33,6 +33,7 @@ It may add focused assertions only in these existing tests:
 - `test/e2e/recovery.test.ts`
 - `test/reviewContextScoutRuntime.test.ts`
 - `test/repoSetupWrapper.test.ts`
+- `test/claudeConfigHomeMount.test.ts`
 
 Required outcome: actual unprivileged, explicitly mounted, read-only-capsule workers; named real-worker
 refusals for every locked escape; separate commit and push custody refusals; usable assigned worktree

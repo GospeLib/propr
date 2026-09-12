@@ -1,5 +1,5 @@
 import type { Logger } from 'pino';
-import type { WorkerStateManager } from '@propr/core';
+import type { WorkerAdmissionReceipt, WorkerStateManager } from '@propr/core';
 import { TaskStates } from '@propr/core';
 import fs from 'fs-extra';
 import type { Redis } from 'ioredis';
@@ -18,6 +18,23 @@ export interface SessionIdCallbackOptions {
     stateManager: WorkerStateManager;
     correlatedLogger: Logger;
     redisClient: InstanceType<typeof Redis>;
+    verifiedExecutionCorrelation?: VerifiedExecutionCorrelation;
+}
+
+export interface VerifiedExecutionCorrelation {
+    admissionId: string;
+    operationId: string;
+}
+
+export function deriveVerifiedExecutionCorrelation(
+    ezerAdmissionVerified: boolean | undefined,
+    receipt: WorkerAdmissionReceipt | undefined,
+): VerifiedExecutionCorrelation | undefined {
+    if (!ezerAdmissionVerified || !receipt) return undefined;
+    return {
+        admissionId: receipt.admissionId,
+        operationId: receipt.operationId,
+    };
 }
 
 export function createSessionIdCallback(
@@ -25,7 +42,7 @@ export function createSessionIdCallback(
     issueRef: IssueJobData,
     options: SessionIdCallbackOptions
 ): SessionIdCallback {
-    const { modelName, stateManager, correlatedLogger, redisClient } = options;
+    const { modelName, stateManager, correlatedLogger, redisClient, verifiedExecutionCorrelation } = options;
     const TERMINAL_STATES: string[] = [TaskStates.COMPLETED, TaskStates.FAILED, TaskStates.CANCELLED];
     return async (sessionId: string, conversationId?: string): Promise<void> => {
         try {
@@ -38,14 +55,14 @@ export function createSessionIdCallback(
             if (currentState?.state === TaskStates.CLAUDE_EXECUTION) {
                 // Already in claude_execution, just update the history metadata with session info
                 await stateManager.updateHistoryMetadata(taskId, 'claude_execution', {
-                    sessionId, conversationId, model: modelName
+                    sessionId, conversationId, model: modelName, ...verifiedExecutionCorrelation
                 });
             } else {
                 // Transition to claude_execution state
                 await stateManager.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, {
                     reason: 'Claude execution started',
                     claudeResult: { success: false, sessionId, conversationId },
-                    historyMetadata: { sessionId, conversationId, model: modelName }
+                    historyMetadata: { sessionId, conversationId, model: modelName, ...verifiedExecutionCorrelation }
                 });
             }
 

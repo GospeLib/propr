@@ -9,7 +9,11 @@ import {
 import type { AgentExecutionResult, ClaudeCodeResponse, ClaudeResult } from '@propr/core';
 import type { ExecutionParams, JobContext } from './types.js';
 import { localizeContentImages } from '../issueJobHelpers.js';
-import { createSessionIdCallback, createContainerIdCallback } from '../issueJobCallbacks.js';
+import {
+  createSessionIdCallback,
+  createContainerIdCallback,
+  deriveVerifiedExecutionCorrelation,
+} from '../issueJobCallbacks.js';
 import { redisClient } from './config.js';
 import { buildAdmittedWorkerEnvironment } from '../ezerAdmittedWorkerEnvironment.js';
 
@@ -88,6 +92,10 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
     taskId,
     context.ezerAdmissionVerified,
   );
+  const verifiedExecutionCorrelation = deriveVerifiedExecutionCorrelation(
+    context.ezerAdmissionVerified,
+    issueRef.executionAdmissionReceipt,
+  );
 
   // Localize remote images in issue body and comments
   const issueBodyHtml = (currentIssueData.data as { body_html?: string }).body_html;
@@ -140,7 +148,13 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
       branchName: worktreeInfo.branchName,
       environment: admittedWorkerEnvironment,
       reasoningLevel: issueRef.reasoningLevel,
-      onSessionId: createSessionIdCallback(taskId, issueRef, { modelName, stateManager, correlatedLogger, redisClient }),
+      onSessionId: createSessionIdCallback(taskId, issueRef, {
+        modelName,
+        stateManager,
+        correlatedLogger,
+        redisClient,
+        verifiedExecutionCorrelation,
+      }),
       onContainerId: createContainerIdCallback(taskId, stateManager, correlatedLogger, worktreeInfo.worktreePath),
       taskId
     });
@@ -165,7 +179,12 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
   await stateManager.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, {
     reason: `${agent.config.type} agent execution completed`,
     claudeResult: { success: claudeResult.success, sessionId: claudeResult.sessionId, conversationId: claudeResult.conversationId, executionTime: claudeResult.executionTime },
-    historyMetadata: { sessionId: claudeResult.sessionId, conversationId: claudeResult.conversationId, model: claudeResult.model }
+    historyMetadata: {
+      sessionId: claudeResult.sessionId,
+      conversationId: claudeResult.conversationId,
+      model: claudeResult.model,
+      ...verifiedExecutionCorrelation,
+    }
   });
 
   await recordLLMMetrics(toClaudeResult(agentResult), { number: issueRef.number, repoOwner: issueRef.repoOwner, repoName: issueRef.repoName }, { jobType: 'issue', correlationId, taskId });

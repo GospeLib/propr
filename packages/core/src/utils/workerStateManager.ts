@@ -26,9 +26,57 @@ const TERMINAL_TASK_STATES = new Set<TaskState>([
     TaskStates.CANCELLED,
 ]);
 
+interface TaskHistoryMetadataRow {
+    history_id: number;
+    metadata: string | Record<string, unknown> | null;
+}
+
 async function waitForAtomicUpdateRetry(attempt: number): Promise<void> {
     const delayMs = Math.min(5 * (2 ** attempt), 100);
     await new Promise(resolve => setTimeout(resolve, delayMs));
+}
+
+function parseTaskHistoryMetadata(value: TaskHistoryMetadataRow['metadata']): Record<string, unknown> {
+    if (!value) return {};
+    if (typeof value === 'string') return JSON.parse(value) as Record<string, unknown>;
+    return value;
+}
+
+async function persistHistoryMetadata(
+    taskId: string,
+    historyState: TaskState,
+    historyTimestamp: string,
+    metadata: Record<string, unknown>,
+): Promise<boolean> {
+    const target = await db('task_history')
+        .select('history_id')
+        .where({ task_id: taskId, state: historyState, timestamp: historyTimestamp })
+        .orderBy('history_id', 'desc')
+        .first<Pick<TaskHistoryMetadataRow, 'history_id'>>();
+    if (!target) return false;
+
+    for (let attempt = 0; attempt < MAX_ATOMIC_UPDATE_ATTEMPTS; attempt++) {
+        const current = await db('task_history')
+            .select('history_id', 'metadata')
+            .where({ history_id: target.history_id })
+            .first<TaskHistoryMetadataRow>();
+        if (!current) return false;
+
+        const serializedMetadata = JSON.stringify({
+            ...parseTaskHistoryMetadata(current.metadata),
+            ...metadata,
+        });
+        const update = db('task_history').where({ history_id: target.history_id });
+        if (current.metadata === null) update.whereNull('metadata');
+        else update.andWhere(
+            'metadata',
+            typeof current.metadata === 'string' ? current.metadata : JSON.stringify(current.metadata),
+        );
+        const updatedRows = await update.update({ metadata: serializedMetadata });
+        if (updatedRows === 1) return true;
+        await waitForAtomicUpdateRetry(attempt);
+    }
+    throw new Error(`Task history metadata update conflicted ${MAX_ATOMIC_UPDATE_ATTEMPTS} times for taskId: ${taskId}`);
 }
 
 export { TaskStates, type TaskState, type IssueRef };
@@ -330,6 +378,20 @@ export class WorkerStateManager {
 
             const correlatedLogger: Logger = logger.withCorrelation(state.correlationId);
             correlatedLogger.debug({ taskId, historyState, metadata, version: state.version }, 'Updated history metadata');
+
+            try {
+                const persisted = await persistHistoryMetadata(
+                    taskId,
+                    historyState,
+                    state.history[historyIndex].timestamp,
+                    metadata,
+                );
+                if (!persisted) {
+                    correlatedLogger.warn({ taskId, historyState }, 'Could not find database history entry to update metadata');
+                }
+            } catch (error) {
+                correlatedLogger.warn({ error: (error as Error).message, taskId, historyState }, 'Failed to persist history metadata update');
+            }
 
             // Publish real-time event for metadata update so UI can refresh
             try {

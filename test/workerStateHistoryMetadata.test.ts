@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mock, test } from 'node:test';
+import { beforeEach, mock, test } from 'node:test';
 
 const HISTORY_TIMESTAMP = '2026-09-11T12:00:00.000Z';
 const TASK_ID = 'task-container-first';
@@ -9,6 +9,7 @@ const CONTAINER_ID = 'container-17';
 const SESSION_ID = 'session-17';
 const ADMISSION_ID = 'admission-17';
 const OPERATION_ID = 'operation-17';
+const MAX_TEST_ATTEMPTS = 3;
 
 const redisState = {
     taskId: TASK_ID,
@@ -47,6 +48,9 @@ const historyRow = {
     metadata: JSON.stringify({ containerId: CONTAINER_ID }),
 };
 
+let targetLookupMissesRemaining = 0;
+let targetLookupCount = 0;
+
 function matches(criteria: Record<string, unknown>): boolean {
     return Object.entries(criteria).every(([key, value]) => historyRow[key as keyof typeof historyRow] === value);
 }
@@ -61,7 +65,17 @@ function historyQuery() {
             return query;
         },
         orderBy: (..._order: string[]) => query,
-        first: async () => matches(criteria) ? { ...historyRow } : undefined,
+        first: async () => {
+            if (!matches(criteria)) return undefined;
+            if ('task_id' in criteria) {
+                targetLookupCount++;
+                if (targetLookupMissesRemaining > 0) {
+                    targetLookupMissesRemaining--;
+                    return undefined;
+                }
+            }
+            return { ...historyRow };
+        },
         whereNull: (column: string) => {
             if (column === 'metadata') expectedMetadata = null;
             return query;
@@ -104,6 +118,16 @@ await mock.module('../packages/core/src/utils/logger.js', {
 });
 
 const { WorkerStateManager } = await import('../packages/core/src/utils/workerStateManager.js');
+const { persistHistoryMetadata } = await import('../packages/core/src/utils/workerStateHistoryMetadata.js');
+
+beforeEach(() => {
+    historyRow.metadata = JSON.stringify({ containerId: CONTAINER_ID });
+    targetLookupMissesRemaining = 0;
+    targetLookupCount = 0;
+    redis.eval.mock.resetCalls();
+    publishTaskUpdate.mock.resetCalls();
+    correlatedLogger.warn.mock.resetCalls();
+});
 
 test('container-first session metadata is merged into the same DB history row', async () => {
     const stateManager = new WorkerStateManager();
@@ -125,4 +149,54 @@ test('container-first session metadata is merged into the same DB history row', 
     assert.equal(correlatedLogger.warn.mock.callCount(), 0);
 
     await stateManager.close();
+});
+
+test('retries until the container-created history row becomes visible', async () => {
+    targetLookupMissesRemaining = 1;
+    const waitForRetry = mock.fn(async () => undefined);
+
+    const persisted = await persistHistoryMetadata({
+        taskId: TASK_ID,
+        historyState: CLAUDE_EXECUTION,
+        historyTimestamp: HISTORY_TIMESTAMP,
+        metadata: {
+            sessionId: SESSION_ID,
+            admissionId: ADMISSION_ID,
+            operationId: OPERATION_ID,
+        },
+    }, {
+        maxAttempts: MAX_TEST_ATTEMPTS,
+        waitForRetry,
+    });
+
+    assert.equal(persisted, true);
+    assert.equal(targetLookupCount, 2);
+    assert.equal(waitForRetry.mock.callCount(), 1);
+    assert.equal(waitForRetry.mock.calls[0].arguments[0], 0);
+    assert.deepEqual(JSON.parse(historyRow.metadata), {
+        containerId: CONTAINER_ID,
+        sessionId: SESSION_ID,
+        admissionId: ADMISSION_ID,
+        operationId: OPERATION_ID,
+    });
+});
+
+test('returns false after the target row remains missing for the bounded attempts', async () => {
+    targetLookupMissesRemaining = MAX_TEST_ATTEMPTS;
+    const waitForRetry = mock.fn(async () => undefined);
+
+    const persisted = await persistHistoryMetadata({
+        taskId: TASK_ID,
+        historyState: CLAUDE_EXECUTION,
+        historyTimestamp: HISTORY_TIMESTAMP,
+        metadata: { sessionId: SESSION_ID },
+    }, {
+        maxAttempts: MAX_TEST_ATTEMPTS,
+        waitForRetry,
+    });
+
+    assert.equal(persisted, false);
+    assert.equal(targetLookupCount, MAX_TEST_ATTEMPTS);
+    assert.equal(waitForRetry.mock.callCount(), MAX_TEST_ATTEMPTS - 1);
+    assert.deepEqual(JSON.parse(historyRow.metadata), { containerId: CONTAINER_ID });
 });

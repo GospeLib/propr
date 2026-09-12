@@ -29,14 +29,18 @@ export async function persistHistoryMetadata(
     options: HistoryMetadataPersistenceOptions,
 ): Promise<boolean> {
     const { taskId, historyState, historyTimestamp, metadata } = update;
-    const target = await db('task_history')
-        .select('history_id')
-        .where({ task_id: taskId, state: historyState, timestamp: historyTimestamp })
-        .orderBy('history_id', 'desc')
-        .first<Pick<TaskHistoryMetadataRow, 'history_id'>>();
-    if (!target) return false;
-
     for (let attempt = 0; attempt < options.maxAttempts; attempt++) {
+        const target = await db('task_history')
+            .select('history_id')
+            .where({ task_id: taskId, state: historyState, timestamp: historyTimestamp })
+            .orderBy('history_id', 'desc')
+            .first<Pick<TaskHistoryMetadataRow, 'history_id'>>();
+        if (!target) {
+            if (attempt === options.maxAttempts - 1) return false;
+            await options.waitForRetry(attempt);
+            continue;
+        }
+
         const current = await db('task_history')
             .select('history_id', 'metadata')
             .where({ history_id: target.history_id })

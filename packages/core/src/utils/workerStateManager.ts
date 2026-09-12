@@ -18,6 +18,7 @@ import {
     publishTaskStateTransition,
 } from './workerStateTransition.js';
 import { scanNonTerminalTaskStates } from './workerStateScan.js';
+import { persistHistoryMetadata } from './workerStateHistoryMetadata.js';
 
 const MAX_ATOMIC_UPDATE_ATTEMPTS = 8;
 const TERMINAL_TASK_STATES = new Set<TaskState>([
@@ -330,6 +331,26 @@ export class WorkerStateManager {
 
             const correlatedLogger: Logger = logger.withCorrelation(state.correlationId);
             correlatedLogger.debug({ taskId, historyState, metadata, version: state.version }, 'Updated history metadata');
+
+            try {
+                const persisted = await persistHistoryMetadata(
+                    {
+                        taskId,
+                        historyState,
+                        historyTimestamp: state.history[historyIndex].timestamp,
+                        metadata,
+                    },
+                    {
+                        maxAttempts: MAX_ATOMIC_UPDATE_ATTEMPTS,
+                        waitForRetry: waitForAtomicUpdateRetry,
+                    },
+                );
+                if (!persisted) {
+                    correlatedLogger.warn({ taskId, historyState }, 'Could not find database history entry to update metadata');
+                }
+            } catch (error) {
+                correlatedLogger.warn({ error: (error as Error).message, taskId, historyState }, 'Failed to persist history metadata update');
+            }
 
             // Publish real-time event for metadata update so UI can refresh
             try {

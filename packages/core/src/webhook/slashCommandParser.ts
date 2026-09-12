@@ -2,10 +2,15 @@
  * Slash command parser for PR comment intake.
  *
  * Recognizes `/review`, `/fix`, `/merge`, `/switch`, `/use`, and `/ultrafix` commands from PR comments.
+ * `/ezer` is accepted as an alias for `/fix` (Ezer-originated follow-up instructions ride the same
+ * manual fix/follow-up path, including its deterministic per-comment job id).
  * Splits the comment into command name, arguments, and trailing multiline instructions.
  */
 
 export type SlashCommandName = 'review' | 'fix' | 'merge' | 'switch' | 'use' | 'ultrafix';
+
+/** Command text aliases, normalized to their canonical SlashCommandName before dispatch. */
+const COMMAND_ALIASES: Readonly<Record<string, SlashCommandName>> = { ezer: 'fix' };
 
 export interface ParsedSlashCommand {
     /** The recognized command */
@@ -94,7 +99,8 @@ export function parseSlashCommand(body: string | undefined | null): ParsedSlashC
 
     const separatorOffset = firstLineTrimmed.slice(1).search(/\s/);
     const separatorIndex = separatorOffset === -1 ? -1 : separatorOffset + 1;
-    const commandText = firstLineTrimmed.slice(1, separatorIndex === -1 ? undefined : separatorIndex);
+    const rawCommandText = firstLineTrimmed.slice(1, separatorIndex === -1 ? undefined : separatorIndex);
+    const commandText = COMMAND_ALIASES[rawCommandText] ?? rawCommandText;
     if (!SLASH_COMMANDS.has(commandText as SlashCommandName)) return null;
 
     const command = commandText as SlashCommandName;

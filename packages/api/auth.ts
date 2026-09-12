@@ -8,6 +8,7 @@ import type { Express, Request, Response, NextFunction, RequestHandler } from 'e
 import { validateSessionSecret } from '@propr/shared';
 import { validateGitHubToken } from './authBearer.js';
 import { configureDemoMode, getDemoUser, isDemoMode } from './demoMode.js';
+import { EZER_INTERNAL_SECRET_HEADER, isEzerInternalEligibleRoute, verifyEzerInternalRequest } from './ezerInternalAuth.js';
 import { clearSessionForReauth, isGitHubTokenExpired, refreshGitHubTokenIfNeeded, refreshGitHubTokenWithResult } from './authGithubTokens.js';
 import { getValidatedRedirectTo, getDefaultRedirectUrl } from './authRedirect.js';
 import { isUserWhitelisted } from './userWhitelist.js';
@@ -386,6 +387,21 @@ export async function ensureAuthenticated(req: Request, res: Response, next: Nex
         // Demo mode is deployment-wide: browser callers receive the synthetic read-only user.
         // Stale bearer headers are ignored so public demo visitors are treated consistently.
         (req as Request & { user: GitHubUser }).user = getDemoUser();
+        return next();
+    }
+
+    // Ezer internal service auth: restricted to the three durable read routes
+    // Ezer polls (status/tasks/task-history). A header on any other route is
+    // ignored here and falls through to the normal session/bearer checks below,
+    // so this alternate credential can never grant a mutation or unrelated read.
+    // There is no GitHub identity behind this credential, so req.user is never
+    // set for it; `resolveAuthorization` rechecks the same predicate and attaches
+    // a minimal read-only authorization directly.
+    if (isEzerInternalEligibleRoute(req.method, req.path) && req.headers[EZER_INTERNAL_SECRET_HEADER] !== undefined) {
+        if (!verifyEzerInternalRequest(req)) {
+            res.status(401).json({ error: 'Invalid or missing Ezer internal secret' });
+            return;
+        }
         return next();
     }
 

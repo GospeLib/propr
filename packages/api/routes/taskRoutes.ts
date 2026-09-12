@@ -49,6 +49,13 @@ export function createTaskRoutes(deps: TaskRoutesDeps) {
         return;
       }
 
+      // Validate issue number filter (exact match, positive integer)
+      const issueNumberValidation = validatePositiveInteger(req.query.issueNumber, 'Issue number', { min: 1, max: Number.MAX_SAFE_INTEGER });
+      if (!issueNumberValidation.valid) {
+        res.status(400).json({ error: issueNumberValidation.error });
+        return;
+      }
+
       // Validate search parameter length
       const searchValidation = validateStringLength(search, 'Search', { maxLength: 500 });
       if (!searchValidation.valid) {
@@ -60,6 +67,7 @@ export function createTaskRoutes(deps: TaskRoutesDeps) {
         db,
         status,
         repository,
+        issueNumber: issueNumberValidation.value,
         limit,
         offset,
         search,

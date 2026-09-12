@@ -83,6 +83,8 @@ function buildTaskInfoFromDb(
   if (isPr && issueNumber) taskInfo.issueNumber = issueNumber;
   if (commandMode) taskInfo.commandMode = commandMode;
   if (hasUltrafixMeta) taskInfo.ultrafixCycle = true;
+  if (task.commit_hash) taskInfo.commitHash = task.commit_hash;
+  if (task.pr_number) taskInfo.prNumber = task.pr_number;
   return taskInfo;
 }
 
@@ -230,18 +232,25 @@ function enrichMetadataWithExecution(
 // This matters for ultrafix flows that alternate review/fix states.
 function findLatestMetadata(
   historyEntries: Array<Record<string, unknown>>
-): { commandMode?: unknown; ultrafixCycle?: boolean } {
+): { commandMode?: unknown; ultrafixCycle?: boolean; admissionId?: string; operationId?: string; sessionId?: string } {
   let commandMode: unknown;
   let ultrafixCycle: boolean | undefined;
+  let admissionId: string | undefined;
+  let operationId: string | undefined;
+  let sessionId: string | undefined;
   for (let i = historyEntries.length - 1; i >= 0; i--) {
     const h = historyEntries[i];
     if (!h.metadata || typeof h.metadata !== 'object') continue;
     const meta = h.metadata as Record<string, unknown>;
     if (commandMode === undefined && 'commandMode' in meta) commandMode = meta.commandMode;
     if (ultrafixCycle === undefined && meta.ultrafixCycle === true) ultrafixCycle = true;
-    if (commandMode !== undefined && ultrafixCycle !== undefined) break;
+    if (admissionId === undefined && typeof meta.admissionId === 'string') admissionId = meta.admissionId;
+    if (operationId === undefined && typeof meta.operationId === 'string') operationId = meta.operationId;
+    if (sessionId === undefined && typeof meta.sessionId === 'string') sessionId = meta.sessionId;
+    if (commandMode !== undefined && ultrafixCycle !== undefined
+      && admissionId !== undefined && operationId !== undefined && sessionId !== undefined) break;
   }
-  return { commandMode, ultrafixCycle };
+  return { commandMode, ultrafixCycle, admissionId, operationId, sessionId };
 }
 
 function resolveIssueNumber(ref: Record<string, unknown>): number | null {
@@ -264,9 +273,12 @@ function applyMetadataFlags(
   taskInfo: Record<string, unknown>,
   historyEntries: Array<Record<string, unknown>>
 ): void {
-  const { commandMode, ultrafixCycle } = findLatestMetadata(historyEntries);
+  const { commandMode, ultrafixCycle, admissionId, operationId, sessionId } = findLatestMetadata(historyEntries);
   if (commandMode) taskInfo.commandMode = commandMode;
   if (ultrafixCycle) taskInfo.ultrafixCycle = true;
+  if (admissionId) taskInfo.admissionId = admissionId;
+  if (operationId) taskInfo.operationId = operationId;
+  if (sessionId) taskInfo.sessionId = sessionId;
 }
 
 function buildTaskInfoFromState(

@@ -34,6 +34,7 @@ function buildEnvironmentVariableArgs(
 }
 
 export interface CodexDockerArgsParams {
+    disableOptionalStorybookMcp?: boolean;
     worktreePath: string;
     githubToken: string;
     modelName?: string;
@@ -50,7 +51,7 @@ export interface CodexDockerArgsParams {
 export function buildCodexDockerArgs(config: AgentConfig, params: CodexDockerArgsParams): string[] {
     const {
         worktreePath, githubToken, modelName, issueNumber, jsonOutput = true, environment,
-        taskId, executionType, reasoningLevel, readOnlyWorkspace = false, repositoryInspection = false,
+        taskId, executionType, reasoningLevel, readOnlyWorkspace = false, repositoryInspection = false, disableOptionalStorybookMcp = false,
     } = params;
     if (repositoryInspection && !readOnlyWorkspace) {
         throw new Error('Repository inspection requires a read-only workspace');
@@ -85,6 +86,7 @@ export function buildCodexDockerArgs(config: AgentConfig, params: CodexDockerArg
         ...(repositoryInspection
             ? buildCodexRepositoryScoutArgs()
             : ['--dangerously-bypass-approvals-and-sandbox', '--config', 'features.multi_agent=false']),
+        ...(disableOptionalStorybookMcp ? ['--config', 'mcp_servers.storybook.enabled=false'] : []),
         ...(reasoningLevel ? ['--config', `model_reasoning_effort="${reasoningLevel}"`] : []),
         '--skip-git-repo-check',
         '--cd', '/home/node/workspace',

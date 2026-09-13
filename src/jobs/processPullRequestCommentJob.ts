@@ -97,6 +97,7 @@ interface LockParams {
 
 interface ProcessingState {
     ezerAdmissionVerified?: boolean;
+    artifactCorrection?: import('@propr/core').TypedArtifactCorrection;
     octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>> | null;
     localRepoPath: string | undefined;
     worktreeInfo: WorktreeInfo | undefined;
@@ -370,8 +371,12 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
 
     const prompt = buildPrompt({ pullRequestNumber, combinedCommentBody: localizedCombinedCommentBody, commentHistory, originalTaskSpec: localizedOriginalTaskSpec, worktreeInfo: state.worktreeInfo, repoOwner, repoName, commentCount: state.unprocessedComments.length, commandMode: job.data.commandMode || 'default', reviewCommentsSection });
 
+    const correction = state.artifactCorrection;
+    if (correction && Date.parse(correction.deadline) <= Date.now()) throw new Error('TYPED_CORRECTION_DEADLINE_EXCEEDED');
     const { claudeResult, agentType } = await resolveAndExecuteAgent({
-        llm, worktreePath: state.worktreeInfo.worktreePath, branchName: state.worktreeInfo.branchName, prompt,
+        llm, worktreePath: state.worktreeInfo.worktreePath, branchName: state.worktreeInfo.branchName,
+        prompt: correction ? `${prompt}\n\nThis is a separately admitted exact owner correction to typed artifact ${correction.itemId}, not a new investigation or implementation. Modify only ${correction.outputPath}. Preserve owner decisions and all other files. The original investigation budget remains consumed. This correction expires at ${correction.deadline}.` : prompt,
+        timeoutMs: correction ? Date.parse(correction.deadline)-Date.now() : undefined,
         pullRequestNumber, repoOwner, repoName, stateManager, correlatedLogger, githubToken: githubToken.token, taskId, redisClient,
         reasoningLevel: job.data.reasoningLevel,
         admittedEnvironment: buildAdmittedWorkerEnvironment({ repoOwner, repoName, number: pullRequestNumber,
@@ -379,6 +384,13 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
         verifiedExecutionCorrelation: state.ezerAdmissionVerified ? job.data.executionAdmissionReceipt : undefined,
     });
     state.claudeResult = claudeResult;
+    if (correction) {
+        if (Date.parse(correction.deadline) <= Date.now()) throw new Error('TYPED_CORRECTION_DEADLINE_EXCEEDED');
+        const paths = execFileSync('git', ['diff','--name-only',correction.priorRevision,'--'], {cwd:state.worktreeInfo.worktreePath,encoding:'utf8'}).trim().split('\n').filter(Boolean);
+        const untracked = execFileSync('git', ['ls-files','--others','--exclude-standard'], {cwd:state.worktreeInfo.worktreePath,encoding:'utf8'}).trim().split('\n').filter(Boolean);
+        const changed = [...new Set([...paths,...untracked])];
+        if (changed.length !== 1 || changed[0] !== correction.outputPath) throw new Error('TYPED_CORRECTION_OUTPUT_SCOPE_MISMATCH');
+    }
 
     checkTerminalStateAfterExecution(await stateManager.getTaskState(taskId), taskId, correlatedLogger);
 
@@ -448,7 +460,7 @@ export async function processPullRequestCommentJob(job: Job<CommentJobData>): Pr
     const state: ProcessingState = { octokit: null, localRepoPath: undefined, worktreeInfo: undefined, claudeResult: null, authorsText: '', unprocessedComments: [], startingWorkComment: null };
 
     try {
-        state.ezerAdmissionVerified = await verifyAdmittedPRComment(job.data, redisClient);
+        state.ezerAdmissionVerified = await verifyAdmittedPRComment(job.data, redisClient, binding => { state.artifactCorrection = binding; });
         // Branch early for review mode — read-only analysis, no commits or pushes
         if (job.data.commandMode === 'review') {
             return await runWithExecutionAbortSignal(executionController.signal, () => executeReviewProcessing({ job, context, llm, taskId, stateManager, state, redisClient, validatePRAndComments }), hashTaskAttemptToken(lockToken));

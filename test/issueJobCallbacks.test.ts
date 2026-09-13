@@ -22,7 +22,9 @@ await mock.module('fs-extra', {
 
 const {
     createSessionIdCallback,
+    createContainerIdCallback,
     deriveVerifiedExecutionCorrelation,
+    startFileChangesMonitor,
 } = await import('../src/jobs/issueJobCallbacks.js');
 
 const TASK_ID = 'task-ezb-p1-03';
@@ -149,4 +151,44 @@ describe('issue execution session correlation', () => {
         );
         assert.match(source, /verifiedExecutionCorrelation,/);
     });
+});
+
+
+test('container start carries verified admission before a provider session exists', async () => {
+    const manager = createStateManager('processing');
+    const callback = createContainerIdCallback(TASK_ID, manager as never, createLogger() as never, '/worktree', deriveVerifiedExecutionCorrelation(true, RECEIPT));
+    await callback('container-id', 'container-name');
+    assert.deepEqual(manager.updateTaskState.mock.calls[0].arguments[2].historyMetadata, {
+        containerId: 'container-id', containerName: 'container-name', worktreePath: '/worktree',
+        admissionId: ADMISSION_ID, operationId: OPERATION_ID,
+    });
+});
+
+
+test('file observation cannot overlap and settlement aborts its live scan', async t => {
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    let scans = 0;
+    let active = false;
+    let observedSignal: AbortSignal | undefined;
+    const stop = startFileChangesMonitor(signal => {
+        scans += 1;
+        active = true;
+        observedSignal = signal;
+        return new Promise<void>(resolve => signal.addEventListener('abort', () => {
+            active = false;
+            resolve();
+        }, { once: true }));
+    }, error => { throw error; });
+    t.mock.timers.tick(2000);
+    await Promise.resolve();
+    t.mock.timers.tick(20000);
+    await Promise.resolve();
+    assert.equal(scans, 1);
+    assert.equal(active, true);
+    await stop();
+    assert.equal(observedSignal?.aborted, true);
+    assert.equal(active, false);
+    t.mock.timers.tick(20000);
+    await Promise.resolve();
+    assert.equal(scans, 1);
 });

@@ -263,6 +263,7 @@ export async function resolvePRCommentModelName(llm: string | null | undefined, 
 }
 
 export interface AgentExecutionParams {
+    timeoutMs?: number;
     admittedEnvironment?: Record<string, string>;
     verifiedExecutionCorrelation?: { admissionId: string; operationId: string };
     llm: string | null | undefined;
@@ -315,6 +316,7 @@ export async function resolveAndExecuteAgent(params: AgentExecutionParams): Prom
 
     const agentResult = await agent.executeTask({
         environment: params.admittedEnvironment,
+        timeoutMs: params.timeoutMs,
         worktreePath,
         issueRef: { number: pullRequestNumber, repoOwner, repoName },
         prompt,

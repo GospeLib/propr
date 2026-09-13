@@ -208,9 +208,9 @@ async function parseStatLine(line: string, statusOutput: string, git: SimpleGit)
  * Get the current file changes from a git worktree
  * Uses git diff --stat and git diff to get change information
  */
-export async function getWorktreeChanges(worktreePath: string): Promise<FileChange[]> {
+export async function getWorktreeChanges(worktreePath: string, signal?: AbortSignal): Promise<FileChange[]> {
     try {
-        const git: SimpleGit = simpleGit({ baseDir: worktreePath });
+        const git: SimpleGit = simpleGit({ baseDir: worktreePath, abort: signal });
         const statusOutput = await getGitStatusOutput(git);
         const statOutput = await getGitDiffStatOutput(git, !!statusOutput);
 
@@ -300,8 +300,9 @@ export async function clearFileChanges(taskId: string): Promise<void> {
  * Update file changes by scanning the worktree and storing results
  * This is the main function to call during task execution
  */
-export async function updateFileChangesFromWorktree(taskId: string, worktreePath: string): Promise<FileChange[]> {
-    const changes = await getWorktreeChanges(worktreePath);
+export async function updateFileChangesFromWorktree(taskId: string, worktreePath: string, signal?: AbortSignal): Promise<FileChange[]> {
+    const changes = await getWorktreeChanges(worktreePath, signal);
+    if (signal?.aborted) return changes;
     await storeFileChanges(taskId, changes);
     return changes;
 }

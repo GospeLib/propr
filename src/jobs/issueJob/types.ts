@@ -26,6 +26,7 @@ export interface JobContext {
   PR_LABEL: string;
   /** True only after the signed, single-use Ezer worker receipt was consumed successfully. */
   ezerAdmissionVerified?: boolean;
+  typedInvestigation?: import('@propr/core').TypedInvestigationAdmission;
 }
 
 export interface CurrentIssueData {

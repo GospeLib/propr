@@ -177,7 +177,7 @@ export function executeDockerCommand(command: string, args: string[], options: D
         let hasOwnershipFailure = false;
         let timeoutInitiatedAbort = false;
         const pendingCallbacks = new Set<Promise<void>>();
-        let containerDetectionTimer: ReturnType<typeof setTimeout> | null = null;
+        let containerDetectionTimer: ReturnType<typeof setInterval> | null = null;
         const messageTimestamps = new Map<string, string>();
         const abortExecution = (executionTimeout = false): void => {
             void abortSpawnedExecution(
@@ -250,6 +250,7 @@ export function executeDockerCommand(command: string, args: string[], options: D
                 state,
                 onContainerId,
                 invokeExecutionCallback,
+                namedContainer,
             );
         }
 
@@ -272,7 +273,7 @@ export function executeDockerCommand(command: string, args: string[], options: D
 
         child.on('close', async (exitCode: number | null) => {
             clearTimeout(timeoutHandle);
-            if (containerDetectionTimer) clearTimeout(containerDetectionTimer);
+            if (containerDetectionTimer) clearInterval(containerDetectionTimer);
             if (abortChecker) await abortChecker.close();
             await Promise.allSettled([...pendingCallbacks]);
             if (state.teardownPromise) await state.teardownPromise;
@@ -302,7 +303,7 @@ export function executeDockerCommand(command: string, args: string[], options: D
         });
         child.on('error', async (error: Error) => {
             clearTimeout(timeoutHandle);
-            if (containerDetectionTimer) clearTimeout(containerDetectionTimer);
+            if (containerDetectionTimer) clearInterval(containerDetectionTimer);
             executionSignal?.removeEventListener('abort', abortForExecutionSignal);
             if (abortChecker) await abortChecker.close();
             await Promise.allSettled([...pendingCallbacks]);
@@ -339,30 +340,40 @@ async function cleanupRedisStreaming(state: { client: Redis | null; interval: Re
     }
 }
 
-function detectContainerId(
+const CONTAINER_DETECTION_INTERVAL_MS = 2000;
+const CONTAINER_DETECTION_TIMEOUT_MS = 5000;
+
+/** Observe startup until the enclosing execution ends; a slow Docker create is not absence. */
+export function detectContainerId(
     worktreePath: string,
     state: { containerIdDetected: boolean; containerId: { value: string | null } },
     onContainerId?: (containerId: string, containerName: string) => void | Promise<void>,
     invokeCallback?: (callback: () => void | Promise<void>) => void,
-): ReturnType<typeof setTimeout> {
-    return setTimeout(() => {
-        if (state.containerIdDetected) return;
+    expectedName?: string | null,
+    inspect: typeof execFileSync = execFileSync,
+): ReturnType<typeof setInterval> {
+    const timer = setInterval(() => {
+        if (state.containerIdDetected) { clearInterval(timer); return; }
         try {
-            const out = execFileSync('/usr/bin/docker', [
+            const out = inspect('/usr/bin/docker', [
                 'ps',
                 '--filter', `volume=${worktreePath}`,
+                ...(expectedName ? ['--filter', `name=${expectedName}`] : []),
                 '--format', '{{.ID}}:{{.Names}}',
-                '--latest',
-            ], { encoding: 'utf8', timeout: 5000 }).trim();
-            if (out) {
-                const [id, name] = out.split(':');
+            ], { encoding: 'utf8', timeout: CONTAINER_DETECTION_TIMEOUT_MS }).toString().trim();
+            const matches = out.split('\n').filter(Boolean).map(line => line.split(':'))
+                .filter(([, name]) => !expectedName || name === expectedName);
+            if (matches.length === 1) {
+                const [id, name] = matches[0];
                 state.containerIdDetected = true;
                 state.containerId.value = id;
+                clearInterval(timer);
                 if (onContainerId && invokeCallback) invokeCallback(() => onContainerId(id, name));
                 logger.debug({ containerId: id, containerName: name, worktreePath }, 'Detected Docker container ID');
             }
         } catch (err) { logger.debug({ error: (err as Error).message }, 'Failed to detect container ID'); }
-    }, 2000);
+    }, CONTAINER_DETECTION_INTERVAL_MS);
+    return timer;
 }
 
 // Re-export image builder functions for backward compatibility

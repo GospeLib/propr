@@ -1,3 +1,4 @@
+import { isManagedBundleImage } from '../agents/configuredAgentImages.js';
 import path from 'path';
 import {
     AGENT_DEFAULTS,
@@ -161,7 +162,7 @@ function applyDefaultAgentFields(agent: AgentConfig): boolean {
         logger.info({ agentAlias: agent.alias, configPath: agent.configPath }, 'Added missing agent config path');
     }
 
-    if (!agent.dockerImage || (agent.dockerImage !== defaults.dockerImage && !agent.dockerImage.startsWith(MANAGED_AGENT_IMAGE_PREFIX))) {
+    if (!agent.dockerImage) {
         agent.dockerImage = defaults.dockerImage;
         migrated = true;
         logger.info({ agentAlias: agent.alias, dockerImage: agent.dockerImage }, 'Normalized agent Docker image');
@@ -369,7 +370,7 @@ export async function migrateAgentConfigs(): Promise<boolean> {
 
         const bundleImage = generateAgentBundleImageTag(getAgentCliVersionMatrix(agents), computeContentHash());
         for (const agent of agents) {
-            if (agent.dockerImage !== bundleImage) {
+            if (isManagedBundleImage(agent.dockerImage) && agent.dockerImage !== bundleImage) {
                 agent.dockerImage = bundleImage;
                 migrated = true;
             }

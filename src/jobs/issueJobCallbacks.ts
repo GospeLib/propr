@@ -98,7 +98,8 @@ export function createContainerIdCallback(
     taskId: string,
     stateManager: WorkerStateManager,
     correlatedLogger: Logger,
-    worktreePath?: string
+    worktreePath?: string,
+    verifiedExecutionCorrelation?: VerifiedExecutionCorrelation
 ): ContainerIdCallback {
     const TERMINAL_STATES: string[] = [TaskStates.COMPLETED, TaskStates.FAILED, TaskStates.CANCELLED];
     return async (containerId: string, containerName: string): Promise<void> => {
@@ -115,7 +116,7 @@ export function createContainerIdCallback(
                 return;
             }
 
-            const metadata = { containerId, containerName, ...(worktreePath && { worktreePath }) };
+            const metadata = { containerId, containerName, ...(worktreePath && { worktreePath }), ...verifiedExecutionCorrelation };
 
             if (currentState.state === TaskStates.CLAUDE_EXECUTION) {
                 // Already in claude_execution, just update the history metadata
@@ -132,5 +133,27 @@ export function createContainerIdCallback(
         } catch (err) {
             correlatedLogger.warn({ taskId, error: (err as Error).message }, 'Failed to update state with container info');
         }
+    };
+}
+
+const FILE_CHANGES_INTERVAL_MS = 2000;
+
+/** One observation at a time; ending the execution also aborts its current git child. */
+export function startFileChangesMonitor(
+    scan: (signal: AbortSignal) => Promise<unknown>,
+    onError: (error: unknown) => void,
+): () => Promise<void> {
+    const controller = new AbortController();
+    let active: Promise<unknown> | undefined;
+    const timer = setInterval(() => {
+        if (active || controller.signal.aborted) return;
+        active = Promise.resolve().then(() => scan(controller.signal))
+            .catch(error => { if (!controller.signal.aborted) onError(error); })
+            .finally(() => { active = undefined; });
+    }, FILE_CHANGES_INTERVAL_MS);
+    return async () => {
+        clearInterval(timer);
+        controller.abort();
+        await active;
     };
 }

@@ -1,3 +1,5 @@
+import { enqueueAdmittedComment } from '../admission/admittedComment.js';
+import { EZER_REVIEW_REQUEST } from '../admission/reviewRequest.js';
 import { requiresEzerExecutionAdmission } from '../admission/ezerExecutionAdmission.js';
 /* eslint-disable max-lines */
 import logger, { generateCorrelationId } from '../utils/logger.js';
@@ -600,6 +602,13 @@ export async function processCommentEvent(payload: IssueCommentEvent | PullReque
     const { prNumber, comment } = eventDetails;
 
     const commentAuthor = comment.user.login;
+    const ezerReview = EZER_REVIEW_REQUEST.exec(comment.body || '');
+    if (ezerReview && eventType === 'issue_comment') {
+        const queued = await enqueueAdmittedComment({ repository: repoFullName, prNumber, commentId: comment.id,
+            body: comment.body!, admissionId: ezerReview[1]!, review: true });
+        correlatedLogger.info({ jobId: queued.jobId, commentId: comment.id }, 'Signed Ezer candidate review admitted through GitHub');
+        return { status: 'accepted', evidence: { triggerCommentIds: [comment.id] } };
+    }
     if (comment.body?.startsWith('/ezer ') && requiresEzerExecutionAdmission({ repository: repoFullName,
         protectedRepositories: process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES })) {
         return { status: 'ignored', reason: 'awaiting_ezer_comment_admission' };

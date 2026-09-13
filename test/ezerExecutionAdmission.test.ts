@@ -172,3 +172,50 @@ test('comment receipt retains exact PR head and is single use at the worker', as
   await verifyWorkerAdmissionReceipt({ receipt: result.receipt, expected, store: sharedStore });
   await assert.rejects(() => verifyWorkerAdmissionReceipt({ receipt: result.receipt, expected, store: sharedStore }), /missing-worker-receipt/);
 });
+
+describe('typed investigation admission', () => {
+  const itemId='4b822e57-8eec-40d1-ad03-3a9553e58908';
+  const outputPath=`docs/research/ezer-${itemId}.md`;
+  function typedClaims(): ExecutionAdmissionClaims {
+    const now=Date.now();
+    return claims({storyId:`typed-work:${itemId}`,scope:[outputPath],issuedAt:new Date(now-1000).toISOString(),expiresAt:new Date(now+60000).toISOString(),
+      typedWork:{provider:'codex',model:'gpt-5.6-sol',kind:'research',itemId,deadline:new Date(now+120000).toISOString(),outputPath,outputKind:'research-report'}});
+  }
+  test('carries the verified type and deadline through the single-use worker receipt', async()=>{
+    const admissionStore=store();const payload=typedClaims();
+    const admitted=await consumeExecutionAdmission({token:sign(payload),signingSecret:SIGNING_SECRET,expected:{repository:payload.repository,issueNumber:payload.issueNumber},store:admissionStore});
+    const verified=await verifyWorkerAdmissionReceipt({receipt:admitted.receipt,expected:{repository:payload.repository,issueNumber:payload.issueNumber,target:'stage'},store:admissionStore});
+    assert.deepEqual(verified,payload.typedWork);
+    await assert.rejects(()=>verifyWorkerAdmissionReceipt({receipt:admitted.receipt,expected:{repository:payload.repository,issueNumber:payload.issueNumber,target:'stage'},store:admissionStore}),/missing-worker-receipt/);
+  });
+  test('refuses typed work masquerading as an implementation story or broadening its scope', async()=>{
+    for(const mutation of [{storyId:'approved-story'},{scope:['src/main.ts']},{comment:{commentId:1,bodyDigest:'digest',headSha:'head',headBranch:'branch'}}]){
+      const payload={...typedClaims(),...mutation};
+      await assert.rejects(()=>consumeExecutionAdmission({token:sign(payload),signingSecret:SIGNING_SECRET,expected:{repository:payload.repository,issueNumber:payload.issueNumber},store:store()}),/typed-authority-mismatch/);
+    }
+  });
+  test('refuses wrong output kinds and admissions lasting beyond the recorded deadline',async()=>{
+    const payload=typedClaims();payload.typedWork!.outputKind='implementation';
+    await assert.rejects(()=>consumeExecutionAdmission({token:sign(payload),signingSecret:SIGNING_SECRET,expected:{repository:payload.repository,issueNumber:payload.issueNumber},store:store()}),/INVALID_TYPED_ADMISSION/);
+    const expired=typedClaims();expired.typedWork!.deadline=expired.issuedAt;
+    await assert.rejects(()=>consumeExecutionAdmission({token:sign(expired),signingSecret:SIGNING_SECRET,expected:{repository:expired.repository,issueNumber:expired.issueNumber},store:store()}),/typed-authority-mismatch/);
+  });
+});
+
+
+test('typed artifact correction is a separate exact comment admission with one-use receipt', async()=>{
+  const itemId='4b192513-5153-45af-9629-7aa4e486d65a';
+  const deadline=new Date(Date.now()+60_000).toISOString();
+  const correction={itemId,outputPath:`docs/spikes/ezer-${itemId}.md`,priorRevision:'a'.repeat(40),priorDigest:`sha256:${'b'.repeat(64)}`,deadline};
+  const comment={commentId:2331,bodyDigest:'sha256:comment',headSha:correction.priorRevision,headBranch:'typed-artifact'};
+  const value=claims({storyId:`typed-output:${itemId}`,scope:[correction.outputPath],comment,artifactCorrection:correction,issuedAt:new Date().toISOString(),expiresAt:deadline});
+  const shared=store();const admitted=await consumeExecutionAdmission({token:sign(value),signingSecret:SIGNING_SECRET,expected:{repository:value.repository,issueNumber:value.issueNumber,comment},store:shared});
+  let received:any;
+  await verifyWorkerAdmissionReceipt({receipt:admitted.receipt,expected:{repository:value.repository,issueNumber:value.issueNumber,target:'stage',comment},store:shared,onArtifactCorrection:c=>{received=c;}});
+  assert.deepEqual(received,correction);
+  await assert.rejects(()=>verifyWorkerAdmissionReceipt({receipt:admitted.receipt,expected:{repository:value.repository,issueNumber:value.issueNumber,target:'stage',comment},store:shared}),/missing-worker-receipt/);
+  for(const change of [{storyId:'approved-implementation'},{scope:['services/unsafe.ts']},{comment:{...comment,headSha:'c'.repeat(40)}},{artifactCorrection:{...correction,outputPath:'docs/spikes/other.md'}},
+    {typedWork:{kind:'spike',itemId,outputKind:'registry-open-question',outputPath:correction.outputPath,deadline}}] as any[]){
+    await assert.rejects(()=>consumeExecutionAdmission({token:sign({...value,...change}),signingSecret:SIGNING_SECRET,expected:{repository:value.repository,issueNumber:value.issueNumber,comment:change.comment??comment},store:store()}));
+  }
+});

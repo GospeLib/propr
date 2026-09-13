@@ -1,3 +1,4 @@
+import { configuredAgentImages } from './configuredAgentImages.js';
 import path from 'path';
 import os from 'os';
 import logger from '../utils/logger.js';
@@ -95,8 +96,14 @@ export class AgentRegistry {
                 return;
             }
 
-            const bundleImage = await this.ensureUnifiedAgentImage(configs);
-            if (!bundleImage) {
+            const installedImages = await configuredAgentImages(configs, async image => {
+                try {
+                    const observed = await executeDockerCommand('docker', ['image', 'inspect', image]);
+                    return observed.exitCode === 0;
+                } catch { return false; }
+            });
+            const bundleImage = installedImages ? undefined : await this.ensureUnifiedAgentImage(configs);
+            if (!installedImages && !bundleImage) {
                 await this.captureRuntimePackageStateVersion();
                 this.initialized = true;
                 logger.warn('Agent registry initialized without agents because the unified agent image is unavailable');
@@ -120,7 +127,8 @@ export class AgentRegistry {
                         continue;
                     }
 
-                    config.dockerImage = bundleImage;
+                    config.dockerImage = await resolveAgentRuntimeImage(
+                        installedImages?.get(config.id) ?? bundleImage!, { buildMissing: false });
 
                     const agent = this.createAgentFromConfig(config);
                     this.agents.set(config.id, agent);

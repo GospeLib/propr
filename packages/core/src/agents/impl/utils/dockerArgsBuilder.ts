@@ -24,10 +24,12 @@ const CLAUDE_RUNTIME_HOME = '/home/node/runtime-home';
 const DEFAULT_CONTAINER_OWNER = Object.freeze({ uid: 1000, gid: 1000 });
 
 /** Match the entrypoint's unprivileged mounted-config owner without changing credentials. */
-export function resolveClaudeRuntimeOwner(configPath: string): { uid: number; gid: number } {
+export function resolveAgentRuntimeOwner(configPath: string): { uid: number; gid: number } {
     const owner = fs.statSync(resolveConfigPath(configPath));
     return owner.uid === 0 ? DEFAULT_CONTAINER_OWNER : { uid: owner.uid, gid: owner.gid };
 }
+
+export const resolveClaudeRuntimeOwner = resolveAgentRuntimeOwner;
 
 function isGitHubCredentialEnvironmentVariable(name: string): boolean {
     const normalizedName = name.toUpperCase();

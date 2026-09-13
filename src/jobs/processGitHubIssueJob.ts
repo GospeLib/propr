@@ -39,7 +39,7 @@ export async function processGitHubIssueJob(job: Job<IssueJobData>): Promise<Job
   }
 
   try {
-    context.ezerAdmissionVerified = await verifyConfiguredEzerAdmission(job.data);
+    context.ezerAdmissionVerified = await verifyConfiguredEzerAdmission(job.data, typed => { context.typedInvestigation = typed; });
   } catch (error) {
     await stateManager.updateTaskState(taskId, TaskStates.FAILED, {
       reason: error instanceof Error ? error.message : String(error),

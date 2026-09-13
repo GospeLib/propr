@@ -1,12 +1,14 @@
 import { createHash } from 'node:crypto';
-import { createRedisAdmissionStore, requiresEzerExecutionAdmission, verifyWorkerAdmissionReceipt, getAuthenticatedOctokit, type CommentJobData } from '@propr/core';
+import { createRedisAdmissionStore, requiresEzerExecutionAdmission, verifyWorkerAdmissionReceipt, getAuthenticatedOctokit, requireReviewRequestMode, type TypedArtifactCorrection, type CommentJobData } from '@propr/core';
 import type { Redis } from 'ioredis';
 
-export async function verifyAdmittedPRComment(data: CommentJobData, redis: Redis): Promise<boolean> {
+export async function verifyAdmittedPRComment(data: CommentJobData, redis: Redis, onArtifactCorrection?: (binding: TypedArtifactCorrection) => void): Promise<boolean> {
   const repository = `${data.repoOwner}/${data.repoName}`;
-  if (!requiresEzerExecutionAdmission({ repository, protectedRepositories: process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES })) return false;
+  if (!data.executionAdmissionReceipt && !requiresEzerExecutionAdmission({ repository, protectedRepositories: process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES })) return false;
+  requireReviewRequestMode({ body: data.comments?.[0]?.body || '', admissionId: data.executionAdmissionReceipt?.admissionId || '',
+    mode: data.commandMode || '', models: data.requestedModels, instructions: data.commandInstructions });
   const binding = data.executionAdmissionComment;
-  if (!binding || !data.executionAdmissionReceipt || !data.executionAdmissionTarget || data.comments?.length !== 1 || data.commandMode !== 'default') {
+  if (!binding || !data.executionAdmissionReceipt || !data.executionAdmissionTarget || data.comments?.length !== 1 || !['default', 'review'].includes(data.commandMode || '')) {
     throw new Error('ezer-comment-refused:missing-or-ambiguous-worker-admission');
   }
   const octokit = await getAuthenticatedOctokit();
@@ -25,6 +27,6 @@ export async function verifyAdmittedPRComment(data: CommentJobData, redis: Redis
   }
   await verifyWorkerAdmissionReceipt({ receipt: data.executionAdmissionReceipt,
     expected: { repository, issueNumber: data.pullRequestNumber, target: data.executionAdmissionTarget, comment: actual },
-    store: createRedisAdmissionStore(redis) });
+    store: createRedisAdmissionStore(redis), onArtifactCorrection });
   return true;
 }

@@ -54,6 +54,11 @@ describe('context analysis runtime safeguards', () => {
 
     const firstArgs = buildCodexDockerArgs(config, params);
     const secondArgs = buildCodexDockerArgs(config, params);
+    const boundedArgs = buildCodexDockerArgs(config, { ...params, disableOptionalStorybookMcp: true });
+    assert.ok(boundedArgs.includes('mcp_servers.storybook.enabled=false'));
+    assert.ok(!firstArgs.includes('mcp_servers.storybook.enabled=false'));
+    assert.ok(!boundedArgs.includes('--ignore-rules'));
+    assert.ok(!boundedArgs.includes('--ignore-user-config'));
     const firstName = firstArgs[firstArgs.indexOf('--name') + 1];
     const secondName = secondArgs[secondArgs.indexOf('--name') + 1];
 

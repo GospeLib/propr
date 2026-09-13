@@ -1,3 +1,6 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+const typedGit = promisify(execFile);
 /**
  * Agent execution for GitHub issue job.
  */
@@ -13,6 +16,7 @@ import {
   createSessionIdCallback,
   createContainerIdCallback,
   deriveVerifiedExecutionCorrelation,
+  startFileChangesMonitor,
 } from '../issueJobCallbacks.js';
 import { redisClient } from './config.js';
 import { buildAdmittedWorkerEnvironment } from '../ezerAdmittedWorkerEnvironment.js';
@@ -126,23 +130,25 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
     baseBranch: issueRef.baseBranch || null
   });
 
-  // Start periodic file changes updates during agent execution
-  const FILE_CHANGES_INTERVAL_MS = 2000;
-  const fileChangesInterval = setInterval(async () => {
-    try {
-      await updateFileChangesFromWorktree(taskId, worktreeInfo.worktreePath);
-    } catch (err) {
-      correlatedLogger.debug({ error: (err as Error).message }, 'Periodic file changes update failed');
-    }
-  }, FILE_CHANGES_INTERVAL_MS);
-
+  const typed = context.typedInvestigation;
+  if(typed?.provider&&agent.config.type!==typed.provider)throw new Error('TYPED_PROVIDER_ROUTE_MISMATCH');
+  if(typed?.model&&modelName!==typed.model)throw new Error('TYPED_MODEL_ROUTE_MISMATCH');
+  const remainingMs = typed ? Date.parse(typed.deadline) - Date.now() : undefined;
+  if (remainingMs !== undefined && remainingMs <= 0) throw new Error('TYPED_DEADLINE_EXCEEDED');
+  const typedBase = typed ? (await typedGit('git',['rev-parse','HEAD'],{cwd:worktreeInfo.worktreePath})).stdout.trim() : undefined;
   // Execute task via agent abstraction
+  const stopFileChanges = startFileChangesMonitor(
+    signal => updateFileChangesFromWorktree(taskId, worktreeInfo.worktreePath, signal),
+    error => correlatedLogger.debug({ error: (error as Error).message }, 'Periodic file changes update failed'),
+  );
   let agentResult;
   try {
     agentResult = await agent.executeTask({
       worktreePath: worktreeInfo.worktreePath,
       issueRef: agentIssueRef,
-      prompt,
+      prompt: typed ? `${prompt}\n\nEzer signed typed investigation: ${typed.kind}; item ${typed.itemId}. This is NOT implementation authority. Only create ${typed.outputPath}, the ${typed.outputKind}. Use the required artifact sections stated in the admitted issue; recommendations are not owner decisions. Do not change any other file, merge, approve, or claim a unit outcome. Deadline ${typed.deadline}.` : prompt,
+      timeoutMs: remainingMs,
+      disableOptionalStorybookMcp: Boolean(typed) && agent.config.type === 'codex' && process.env.PROPR_TYPED_STORYBOOK_MCP_UNAVAILABLE === 'true',
       model: modelName,
       githubToken: githubToken.token,
       branchName: worktreeInfo.branchName,
@@ -155,13 +161,21 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
         redisClient,
         verifiedExecutionCorrelation,
       }),
-      onContainerId: createContainerIdCallback(taskId, stateManager, correlatedLogger, worktreeInfo.worktreePath),
+      onContainerId: createContainerIdCallback(taskId, stateManager, correlatedLogger, worktreeInfo.worktreePath, verifiedExecutionCorrelation),
       taskId
     });
   } finally {
-    clearInterval(fileChangesInterval);
+    await stopFileChanges();
   }
 
+  if (typed && typedBase) {
+    if (Date.parse(typed.deadline) <= Date.now()) throw new Error('TYPED_DEADLINE_EXCEEDED');
+    const changed = await typedGit('git',['diff','--name-only',typedBase,'--'],{cwd:worktreeInfo.worktreePath});
+    const untracked = await typedGit('git',['ls-files','--others','--exclude-standard'],{cwd:worktreeInfo.worktreePath});
+    const paths = [...new Set(`${changed.stdout}\n${untracked.stdout}`.split('\n').filter(Boolean))];
+    if (paths.length === 0) throw new Error(`TYPED_OUTPUT_MISSING: ${agentResult.error || agentResult.summary || 'Provider returned without the required artifact.'}`);
+    if (paths.length !== 1 || paths[0] !== typed.outputPath) throw new Error('TYPED_OUTPUT_SCOPE_VIOLATION');
+  }
   // Convert to ClaudeCodeResponse for backwards compatibility
   const claudeResult = agentResultToClaudeResponse(agentResult);
 

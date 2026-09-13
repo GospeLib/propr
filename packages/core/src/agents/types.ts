@@ -40,6 +40,10 @@ export interface AgentConfig {
 }
 
 export interface AgentTaskOptions {
+    /** Per-invocation restriction for an explicitly unavailable optional local Storybook MCP. */
+    disableOptionalStorybookMcp?: boolean;
+    /** Verified task deadline translated to a maximum runtime by ProPR. */
+    timeoutMs?: number;
     worktreePath: string;
     issueRef: IssueRef;
     issueDetails?: IssueDetails;

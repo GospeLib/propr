@@ -417,3 +417,10 @@ export type {
     RepositoryRenameResult,
     MigrationResult
 } from './services/repositoryMigrationService.js';
+
+export { enqueueAdmittedComment } from './admission/admittedComment.js';
+export { EZER_REVIEW_REQUEST, requireReviewRequestMode } from './admission/reviewRequest.js';
+
+export { requireTypedInvestigation, type TypedInvestigationAdmission } from './admission/ezerExecutionAdmission.js';
+
+export { requireTypedArtifactCorrection, type TypedArtifactCorrection } from './admission/ezerExecutionAdmission.js';

@@ -24,7 +24,51 @@ export interface CommentAdmissionBinding {
     headBranch: string;
 }
 
+export interface TypedInvestigationAdmission {
+  kind: 'research' | 'design' | 'spike';
+  provider?: 'claude' | 'codex' | 'ollama';
+  model?: string;
+  itemId: string;
+  deadline: string;
+  outputPath: string;
+  outputKind: string;
+}
+export function requireTypedInvestigation(value: unknown): TypedInvestigationAdmission {
+  if (!value || typeof value !== 'object') throw new Error('INVALID_TYPED_ADMISSION');
+  const v = value as Record<string, unknown>;
+  const kinds: Record<string, string> = { research: 'research-report', design: 'design-artifact', spike: 'registry-open-question' };
+  if (typeof v.kind !== 'string' || !Object.hasOwn(kinds, v.kind) || v.outputKind !== kinds[v.kind] ||
+      typeof v.itemId !== 'string' || !/^[a-f0-9-]{36}$/.test(v.itemId) ||
+      typeof v.deadline !== 'string' || !Number.isFinite(Date.parse(v.deadline)) ||
+      typeof v.outputPath !== 'string' || !/^docs\/(research|design|spikes)\/ezer-[a-f0-9-]{36}\.md$/.test(v.outputPath))
+    throw new Error('INVALID_TYPED_ADMISSION');
+  if(v.provider!==undefined&&!['claude','codex','ollama'].includes(String(v.provider)))throw new Error('INVALID_TYPED_PROVIDER');
+  if(v.model!==undefined&&(typeof v.model!=='string'||!v.model.trim()||!v.provider))throw new Error('INVALID_TYPED_MODEL');
+  return { ...(v.provider===undefined?{}:{provider:v.provider as TypedInvestigationAdmission['provider']}),...(v.model===undefined?{}:{model:v.model as string}),kind: v.kind as TypedInvestigationAdmission['kind'], itemId: v.itemId, deadline: v.deadline, outputPath: v.outputPath, outputKind: v.outputKind as string };
+}
+
+/** A separately admitted owner correction to an existing typed artifact, never investigation authority. */
+export interface TypedArtifactCorrection {
+    itemId: string;
+    outputPath: string;
+    priorRevision: string;
+    priorDigest: string;
+    deadline: string;
+}
+export function requireTypedArtifactCorrection(value: unknown): TypedArtifactCorrection {
+    if (!value || typeof value !== 'object') throw new Error('INVALID_TYPED_ARTIFACT_CORRECTION');
+    const v = value as Record<string, unknown>;
+    if (typeof v.itemId !== 'string' || !/^[a-f0-9-]{36}$/.test(v.itemId) ||
+        typeof v.outputPath !== 'string' || !new RegExp(`^docs/(research|design|spikes)/ezer-${v.itemId}\\.md$`).test(v.outputPath) ||
+        typeof v.priorRevision !== 'string' || !/^[a-f0-9]{40}$/.test(v.priorRevision) ||
+        typeof v.priorDigest !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(v.priorDigest) ||
+        typeof v.deadline !== 'string' || !Number.isFinite(Date.parse(v.deadline))) throw new Error('INVALID_TYPED_ARTIFACT_CORRECTION');
+    return {itemId:v.itemId,outputPath:v.outputPath,priorRevision:v.priorRevision,priorDigest:v.priorDigest,deadline:v.deadline};
+}
+
 export interface ExecutionAdmissionClaims {
+    artifactCorrection?: TypedArtifactCorrection;
+    typedWork?: TypedInvestigationAdmission;
     comment?: CommentAdmissionBinding;
     version: 1;
     admissionId: string;
@@ -118,6 +162,8 @@ function parseClaims(encodedPayload: string): ExecutionAdmissionClaims {
     }
     if (!Number.isSafeInteger(candidate.issueNumber) || Number(candidate.issueNumber) < 1) refuse('invalid-issue');
     return {
+        ...(candidate.artifactCorrection === undefined ? {} : { artifactCorrection: requireTypedArtifactCorrection(candidate.artifactCorrection) }),
+        ...(candidate.typedWork === undefined ? {} : { typedWork: requireTypedInvestigation(candidate.typedWork) }),
         ...(candidate.comment === undefined ? {} : { comment: parseCommentBinding(candidate.comment) }),
         version: 1,
         admissionId: requiredString(candidate.admissionId, 'missing-admission-id'),
@@ -161,8 +207,15 @@ function verifySignature(encodedPayload: string, presentedSignature: string, sig
 }
 
 function validateClaims(claims: ExecutionAdmissionClaims, expected: ExpectedExecution, nowMs: number): number {
+    if (claims.typedWork && (claims.comment || claims.storyId !== `typed-work:${claims.typedWork.itemId}` ||
+        claims.scope.length !== 1 || claims.scope[0] !== claims.typedWork.outputPath || Date.parse(claims.expiresAt) > Date.parse(claims.typedWork.deadline))) refuse('typed-authority-mismatch');
     if (claims.repository !== expected.repository) refuse('wrong-repository');
     if (claims.issueNumber !== expected.issueNumber) refuse('wrong-issue');
+    if (claims.artifactCorrection && (claims.typedWork || !claims.comment ||
+        claims.storyId !== `typed-output:${claims.artifactCorrection.itemId}` ||
+        claims.scope.length !== 1 || claims.scope[0] !== claims.artifactCorrection.outputPath ||
+        claims.comment.headSha !== claims.artifactCorrection.priorRevision ||
+        claims.expiresAt !== claims.artifactCorrection.deadline)) refuse('typed-correction-authority-mismatch');
     requireExactComment(claims.comment, expected.comment);
     const issuedAtMs = Date.parse(claims.issuedAt);
     const expiresAtMs = Date.parse(claims.expiresAt);
@@ -193,6 +246,8 @@ export async function consumeExecutionAdmission(input: {
         repository: claims.repository,
         issueNumber: claims.issueNumber,
         target: claims.target,
+        ...(claims.artifactCorrection === undefined ? {} : { artifactCorrection: claims.artifactCorrection }),
+        ...(claims.typedWork === undefined ? {} : { typedWork: claims.typedWork }),
         ...(claims.comment === undefined ? {} : { comment: claims.comment }),
     });
     if (!await input.store.consumeAndIssue(consumedKey, receiptKey, receiptValue, ttlSeconds)) refuse('replayed-admission');
@@ -203,7 +258,8 @@ export async function verifyWorkerAdmissionReceipt(input: {
     receipt: WorkerAdmissionReceipt;
     expected: ExpectedExecution & { target: string };
     store: Pick<AdmissionStore, 'take'>;
-}): Promise<void> {
+    onArtifactCorrection?: (binding: TypedArtifactCorrection) => void;
+}): Promise<TypedInvestigationAdmission | undefined> {
     const stored = await input.store.take(input.receipt.receiptKey);
     if (!stored) refuse('missing-worker-receipt');
     let value: Record<string, unknown>;
@@ -217,4 +273,12 @@ export async function verifyWorkerAdmissionReceipt(input: {
     if (value.issueNumber !== input.expected.issueNumber) refuse('wrong-issue');
     if (value.target !== input.expected.target) refuse('wrong-target');
     requireExactComment(value.comment as CommentAdmissionBinding | undefined, input.expected.comment);
+    const typed = value.typedWork === undefined ? undefined : requireTypedInvestigation(value.typedWork);
+    if (typed && Date.parse(typed.deadline) <= Date.now()) refuse('typed-deadline-exceeded');
+    if (value.artifactCorrection !== undefined) {
+        const correction = requireTypedArtifactCorrection(value.artifactCorrection);
+        if (!input.expected.comment || input.expected.comment.headSha !== correction.priorRevision || Date.parse(correction.deadline) <= Date.now()) refuse('typed-correction-expired-or-head-changed');
+        input.onArtifactCorrection?.(correction);
+    }
+    return typed;
 }

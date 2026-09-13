@@ -21,6 +21,13 @@ import {
 const GITHUB_CREDENTIAL_ENV_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_ACCESS_TOKEN']);
 const GITHUB_CREDENTIAL_ENV_PATTERN = /^(?:GH|GITHUB)_.*(?:TOKEN|KEY|SECRET|PASSWORD|PAT|PRIVATE_KEY)$/;
 const CLAUDE_RUNTIME_HOME = '/home/node/runtime-home';
+const DEFAULT_CONTAINER_OWNER = Object.freeze({ uid: 1000, gid: 1000 });
+
+/** Match the entrypoint's unprivileged mounted-config owner without changing credentials. */
+export function resolveClaudeRuntimeOwner(configPath: string): { uid: number; gid: number } {
+    const owner = fs.statSync(resolveConfigPath(configPath));
+    return owner.uid === 0 ? DEFAULT_CONTAINER_OWNER : { uid: owner.uid, gid: owner.gid };
+}
 
 function isGitHubCredentialEnvironmentVariable(name: string): boolean {
     const normalizedName = name.toUpperCase();

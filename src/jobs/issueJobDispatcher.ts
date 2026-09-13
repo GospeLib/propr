@@ -142,7 +142,12 @@ export async function handleDispatchWithDeps(job: Job<IssueJobData>, deps: Dispa
             customLabels.some(cl => cl.toLowerCase() === l.toLowerCase())
         );
 
-        const basesToProcess: BaseToProcess[] = baseLabels.length > 0
+        if (issueRef.executionAdmissionReceipt && !issueRef.baseBranch?.trim()) {
+            throw new Error('ezer-execution-admission-refused:missing-target');
+        }
+        const basesToProcess: BaseToProcess[] = issueRef.executionAdmissionReceipt
+            ? [{ branch: issueRef.baseBranch!, label: null }]
+            : baseLabels.length > 0
             ? baseLabels.map(l => ({ branch: l.substring('base-'.length), label: l }))
             : [{ branch: defaultBranch, label: null }];
 
@@ -201,6 +206,11 @@ export async function handleDispatchWithDeps(job: Job<IssueJobData>, deps: Dispa
                 model: resolvedModel,
                 label: null
             });
+        }
+
+        // One signed admission authorizes one worker, never a label-driven matrix.
+        if (issueRef.executionAdmissionReceipt && agentModelsToProcess.length !== 1) {
+            throw new Error('ezer-execution-admission-refused:ambiguous-agent-matrix');
         }
 
         let jobsEnqueued = 0;

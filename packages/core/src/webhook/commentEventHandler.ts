@@ -1,3 +1,4 @@
+import { requiresEzerExecutionAdmission } from '../admission/ezerExecutionAdmission.js';
 /* eslint-disable max-lines */
 import logger, { generateCorrelationId } from '../utils/logger.js';
 import { handleError } from '../utils/errorHandler.js';
@@ -599,6 +600,10 @@ export async function processCommentEvent(payload: IssueCommentEvent | PullReque
     const { prNumber, comment } = eventDetails;
 
     const commentAuthor = comment.user.login;
+    if (comment.body?.startsWith('/ezer ') && requiresEzerExecutionAdmission({ repository: repoFullName,
+        protectedRepositories: process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES })) {
+        return { status: 'ignored', reason: 'awaiting_ezer_comment_admission' };
+    }
     const parsedCommand = parseSlashCommand(comment.body);
     const configuredBotUsernames = new Set(
         [getBotUsername(), process.env.GITHUB_BOT_USERNAME, 'propr-dev[bot]']

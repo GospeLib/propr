@@ -150,3 +150,25 @@ describe('Ezer execution admission', () => {
     }), /wrong-target/);
   });
 });
+
+test('comment admission refuses a different exact instruction before consuming its receipt', async () => {
+  const sharedStore = store();
+  const comment = { commentId: 123, bodyDigest: 'sha256:original', headSha: 'head-a', headBranch: 'feature-a' };
+  await assert.rejects(() => consumeExecutionAdmission({
+    token: sign({ ...claims(), comment } as ExecutionAdmissionClaims),
+    signingSecret: SIGNING_SECRET,
+    expected: { repository: 'GospeLib/main', issueNumber: 2260, comment: { ...comment, bodyDigest: 'sha256:changed' } },
+    store: sharedStore,
+    nowMs: NOW_MS,
+  }), /wrong-comment/);
+});
+
+test('comment receipt retains exact PR head and is single use at the worker', async () => {
+  const sharedStore = store();
+  const comment = { commentId: 123, bodyDigest: 'sha256:original', headSha: 'head-a', headBranch: 'feature-a' };
+  const result = await consumeExecutionAdmission({ token: sign(claims({ comment })), signingSecret: SIGNING_SECRET,
+    expected: { repository: 'GospeLib/main', issueNumber: 2260, comment }, store: sharedStore, nowMs: NOW_MS });
+  const expected = { repository: 'GospeLib/main', issueNumber: 2260, target: 'stage', comment };
+  await verifyWorkerAdmissionReceipt({ receipt: result.receipt, expected, store: sharedStore });
+  await assert.rejects(() => verifyWorkerAdmissionReceipt({ receipt: result.receipt, expected, store: sharedStore }), /missing-worker-receipt/);
+});

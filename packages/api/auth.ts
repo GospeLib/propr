@@ -390,8 +390,8 @@ export async function ensureAuthenticated(req: Request, res: Response, next: Nex
         return next();
     }
 
-    // Ezer internal service auth: restricted to the three durable read routes
-    // Ezer polls (status/tasks/task-history). A header on any other route is
+    // Ezer internal service auth: restricted to durable projections and isolated agent chat.
+    // A header on any other route is
     // ignored here and falls through to the normal session/bearer checks below,
     // so this alternate credential can never grant a mutation or unrelated read.
     // There is no GitHub identity behind this credential, so req.user is never

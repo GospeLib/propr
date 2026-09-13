@@ -28,19 +28,29 @@ export async function processGitHubIssueJob(job: Job<IssueJobData>): Promise<Job
     return await handleDispatch(job);
   }
 
-  const ezerAdmissionVerified = await verifyConfiguredEzerAdmission(job.data);
-
   const context = await initializeJobContext(job);
-  context.ezerAdmissionVerified = ezerAdmissionVerified;
   const { jobId, issueRef, correlationId, correlatedLogger, stateManager, modelName, taskId, AI_PROCESSING_TAG, AI_DONE_TAG, AI_WAITING_TAG } = context;
 
-  await addModelSpecificDelay(modelName);
 
   try {
     await stateManager.createTaskState(taskId, { number: issueRef.number, repoOwner: issueRef.repoOwner, repoName: issueRef.repoName, modelName } as import('@propr/core').IssueRef, correlationId);
   } catch (stateError) {
     correlatedLogger.warn({ taskId, error: (stateError as Error).message }, 'Failed to create task state, continuing anyway');
   }
+
+  try {
+    context.ezerAdmissionVerified = await verifyConfiguredEzerAdmission(job.data);
+  } catch (error) {
+    await stateManager.updateTaskState(taskId, TaskStates.FAILED, {
+      reason: error instanceof Error ? error.message : String(error),
+      historyMetadata: {
+        admissionId: issueRef.executionAdmissionReceipt?.admissionId,
+        operationId: issueRef.executionAdmissionReceipt?.operationId,
+      },
+    });
+    throw error;
+  }
+  await addModelSpecificDelay(modelName);
 
   // Update plan issue with task_id for progress tracking
   const repository = `${issueRef.repoOwner}/${issueRef.repoName}`;

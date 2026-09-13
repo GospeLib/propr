@@ -46,9 +46,9 @@ export function createTaskHistoryRoutes(deps: TaskHistoryRoutesDeps) {
       let taskInfo: Record<string, unknown> | null = null;
       const redisResult = await getHistoryFromRedis(redisClient, taskId);
       if (redisResult) { history = redisResult.history; taskInfo = redisResult.taskInfo; }
-      if (history.length === 0 && taskQueue) {
+      if ((history.length === 0 || !taskInfo) && taskQueue) {
         const queueResult = await getHistoryFromQueue(taskQueue, taskId);
-        if (queueResult) { if (!taskInfo) taskInfo = queueResult.taskInfo; history = queueResult.history; }
+        if (queueResult) { if (!taskInfo) taskInfo = queueResult.taskInfo; if (history.length === 0) history = queueResult.history; }
       }
       res.json({ taskId, history, taskInfo });
     } catch (error) {
@@ -58,6 +58,13 @@ export function createTaskHistoryRoutes(deps: TaskHistoryRoutesDeps) {
   }
 
   return { getTaskHistory };
+}
+
+function admissionIdentity(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object') return {};
+  const receipt = (value as Record<string, unknown>).executionAdmissionReceipt as Record<string, unknown> | undefined;
+  if (typeof receipt?.admissionId !== 'string' || typeof receipt.operationId !== 'string') return {};
+  return { admissionId: receipt.admissionId, operationId: receipt.operationId };
 }
 
 function buildTaskInfoFromDb(
@@ -77,7 +84,8 @@ function buildTaskInfoFromDb(
     correlationId: task.correlation_id,
     title,
     subtitle,
-    modelName: task.model_name
+    modelName: task.model_name,
+    ...admissionIdentity(typeof task.initial_job_data === 'string' ? JSON.parse(task.initial_job_data) : task.initial_job_data)
   };
 
   if (isPr && issueNumber) taskInfo.issueNumber = issueNumber;
@@ -290,7 +298,7 @@ function buildTaskInfoFromState(
   const number = type === 'pr-comment' ? ref.pullRequestNumber || ref.number : ref.number;
   const taskInfo: Record<string, unknown> = {
     repoOwner: ref.repoOwner, repoName: ref.repoName, number,
-    type, comments: ref.comments,
+    type, comments: ref.comments, ...admissionIdentity(ref),
     title: ref.title || null, subtitle: ref.subtitle || null, modelName: ref.modelName
   };
   if (issueNumber) taskInfo.issueNumber = issueNumber;
@@ -351,7 +359,7 @@ function buildTaskInfoFromJob(job: Job<JobData, JobReturnValue>, taskId: string)
   const taskInfo: Record<string, unknown> = {
     repoOwner: job.data.repoOwner, repoName: job.data.repoName,
     number: job.data.pullRequestNumber || job.data.number,
-    type: isPr ? 'pr-comment' : 'issue', comments: job.data.comments,
+    type: isPr ? 'pr-comment' : 'issue', comments: job.data.comments, ...admissionIdentity(job.data),
     title: job.data.title || null, subtitle: job.data.subtitle || null, modelName: job.data?.modelName
   };
   if (isPr) {

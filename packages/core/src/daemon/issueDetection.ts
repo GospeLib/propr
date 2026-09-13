@@ -256,6 +256,7 @@ export async function processDetectedIssue(issue: DetectedIssue, correlationId: 
     }, 'Detected eligible issue');
 
     let executionAdmissionReceipt;
+    let admittedBaseBranch: string | undefined;
     if (requiresEzerExecutionAdmission({
         repository: repoFullName,
         triggeringLabel,
@@ -274,12 +275,14 @@ export async function processDetectedIssue(issue: DetectedIssue, correlationId: 
             return { status: 'blocked', reason: 'ezer_admission_missing' };
         }
         try {
-            ({ receipt: executionAdmissionReceipt } = await consumeExecutionAdmission({
+            const admission = await consumeExecutionAdmission({
                 token: pendingToken,
                 signingSecret,
                 expected: { repository: repoFullName, issueNumber: issue.number },
                 store: admissionStore,
-            }));
+            });
+            executionAdmissionReceipt = admission.receipt;
+            admittedBaseBranch = admission.claims.target;
         } catch (error) {
             correlatedLogger.warn({ repository: repoFullName, issueNumber: issue.number, error: (error as Error).message }, 'Signed Ezer admission refused');
             return { status: 'blocked', reason: 'ezer_admission_refused' };
@@ -329,6 +332,7 @@ export async function processDetectedIssue(issue: DetectedIssue, correlationId: 
             triggeringLabel: triggeringLabel,
             correlationId: generateCorrelationId(),
             executionAdmissionReceipt,
+            ...(admittedBaseBranch === undefined ? {} : { baseBranch: admittedBaseBranch }),
         };
 
         const addToQueueWithRetry = (): Promise<unknown> => withRetry(

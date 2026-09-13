@@ -124,7 +124,7 @@ describe('wrapDockerRunArgsWithRepoSetup', () => {
     test('Claude creates an immutable admitted-worker marker before dropping privileges', () => {
         const script = fs.readFileSync('scripts/claude-entrypoint.sh', 'utf8');
         const markerIndex = script.indexOf('PROPR_EZER_ADMISSION_MARKER_B64');
-        const dropPrivilegesIndex = script.indexOf('exec su-exec node');
+        const dropPrivilegesIndex = script.indexOf('exec su-exec');
 
         assert.ok(markerIndex > -1);
         assert.ok(markerIndex < dropPrivilegesIndex);
@@ -132,7 +132,7 @@ describe('wrapDockerRunArgsWithRepoSetup', () => {
         assert.match(script, /chmod 0444 "\$PROPR_EZER_MARKER_PATH"/);
         assert.match(script, /chmod 0555 "\$PROPR_EZER_MARKER_DIR"/);
         assert.match(script, /unset PROPR_EZER_ADMISSION_MARKER_B64/);
-        assert.match(script, /exec su-exec node env HOME="\$\{PROPR_CLAUDE_HOME:-\/home\/node\}" USER=node LOGNAME=node "\$@"/);
+        assert.match(script, /exec su-exec "\$PROPR_CLAUDE_RUN_USER" env HOME="\$\{PROPR_CLAUDE_HOME:-\/home\/node\}" USER=node LOGNAME=node "\$@"/);
     });
 
     test('throws when the configured docker image cannot be found', () => {

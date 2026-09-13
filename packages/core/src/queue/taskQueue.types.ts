@@ -4,7 +4,7 @@ import type { ConversationStep, TokenUsage } from '../utils/llmMetrics.types.js'
 import type { SubscriptionUsageMetrics } from '../utils/github/formatSubscriptionUsage.js';
 import type { CommandMeta, UltrafixCommandMeta } from '../webhook/slashCommandParser.js';
 import type { ReasoningLevel } from '@propr/shared';
-import type { WorkerAdmissionReceipt } from '../admission/ezerExecutionAdmission.js';
+import type { CommentAdmissionBinding, WorkerAdmissionReceipt } from '../admission/ezerExecutionAdmission.js';
 
 export interface IssueJobData {
     repoOwner: string;
@@ -42,6 +42,9 @@ export interface AutoResolveContext {
 }
 
 export interface CommentJobData {
+    executionAdmissionReceipt?: WorkerAdmissionReceipt;
+    executionAdmissionComment?: CommentAdmissionBinding;
+    executionAdmissionTarget?: string;
     pullRequestNumber: number;
     commentId?: number;
     commentBody?: string;

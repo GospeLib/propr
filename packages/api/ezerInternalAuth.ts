@@ -4,7 +4,7 @@ import type { InstanceAuthorization } from './authorization.js';
 
 /**
  * Env var carrying the shared secret Ezer presents on the narrow set of
- * durable read routes it polls (status/tasks/task-history). Machine-to-machine
+ * durable projections it polls plus the existing read-only agent analysis route. Machine-to-machine
  * only: this is not a user session credential and must never be reachable
  * from the browser. Consumed directly by `ensureAuthenticated` in auth.ts —
  * this file holds no route or middleware of its own.
@@ -17,6 +17,11 @@ const EZER_INTERNAL_ELIGIBLE_ROUTES: ReadonlyArray<{ method: string; pattern: Re
   { method: 'GET', pattern: /^\/status$/ },
   { method: 'GET', pattern: /^\/tasks$/ },
   { method: 'GET', pattern: /^\/task\/[^/]+\/history$/ },
+  // `agent.analyze` runs in an isolated scratch workspace with tools disabled. This route cannot
+  // enqueue or execute a ProPR product task; admitted work continues through the task APIs.
+  { method: 'POST', pattern: /^\/agents\/chat$/ },
+  // Handler requires an existing exact GitHub comment and a fresh signed Ezer admission.
+  { method: 'POST', pattern: /^\/tasks\/[^/]+\/followup$/ },
 ];
 
 /** `path` is the request path relative to the `/api` mount (e.g. `/tasks`), as seen inside `ensureAuthenticated`. */
@@ -54,7 +59,7 @@ export function verifyEzerInternalRequest(req: Request): boolean {
 /**
  * Authorization granted to a verified Ezer internal request. There is no GitHub
  * identity behind this credential, so it carries no permissions beyond the
- * read-only routes it is eligible for — role/permissions must never be widened
+ * narrowly eligible routes — role/permissions must never be widened
  * without also widening `EZER_INTERNAL_ELIGIBLE_ROUTES`.
  */
 export function getEzerInternalAuthorization(): InstanceAuthorization {

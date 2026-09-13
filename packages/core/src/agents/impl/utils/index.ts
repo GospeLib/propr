@@ -16,7 +16,7 @@ export {
 } from './dockerResultProcessor.js';
 
 export {
-    buildDockerArgs,
+    buildDockerArgs, resolveClaudeRuntimeOwner,
     type DockerArgsParams
 } from './dockerArgsBuilder.js';
 

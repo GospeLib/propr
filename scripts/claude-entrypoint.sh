@@ -38,35 +38,37 @@ else
     echo "GitHub CLI will use GH_TOKEN environment variable for authentication"
 fi
 
-# Claude config should be directly mounted now
-if [ -d "/home/node/.claude" ]; then
+# Use the mounted config's unprivileged owner instead of recursively rewriting a
+# host directory. Large session histories and symlinks must never delay startup
+# or have their ownership changed by an analysis request.
+PROPR_CLAUDE_CONFIG_DIR='/home/node/.claude'
+PROPR_CLAUDE_RUN_USER='node'
+if [ -d "$PROPR_CLAUDE_CONFIG_DIR" ]; then
     echo "Claude config directory mounted"
-    echo "Contents of /home/node/.claude:"
-    ls -la /home/node/.claude/
-
-    # Fix ownership if running as root. The container keeps Docker's
-    # no-new-privileges boundary for the entire run, so do not rely on sudo here.
     if [ "$(id -u)" = "0" ]; then
-        echo "Fixing ownership of Claude config files..."
-        chown -R node:node /home/node/.claude 2>/dev/null || echo "Could not change ownership"
-    fi
-
-    # Ensure necessary subdirectories exist (they might not be in the mounted volume)
-    for dir in todos projects shell-snapshots statsig; do
-        if [ ! -d "/home/node/.claude/$dir" ]; then
-            echo "Creating missing directory: /home/node/.claude/$dir"
-            mkdir -p "/home/node/.claude/$dir" 2>/dev/null || echo "Could not create $dir (permission issue)"
+        config_uid=$(stat -c %u "$PROPR_CLAUDE_CONFIG_DIR")
+        config_gid=$(stat -c %g "$PROPR_CLAUDE_CONFIG_DIR")
+        if [ "$config_uid" != "0" ]; then
+            PROPR_CLAUDE_RUN_USER="$config_uid:$config_gid"
+        else
+            # Docker may create an empty named volume as root. Repair only its
+            # root and known credential file, never existing history recursively.
+            chown node:node "$PROPR_CLAUDE_CONFIG_DIR"
+            credentials_path="$PROPR_CLAUDE_CONFIG_DIR/.credentials.json"
+            if [ -f "$credentials_path" ] && [ "$(stat -c %u "$credentials_path")" = "0" ]; then
+                chown node:node "$credentials_path"
+            fi
         fi
-    done
-
-    # Pre-create the project directory for our workspace to avoid the dash issue
-    project_dir="/home/node/.claude/projects/home-node-workspace"
-    if [ ! -d "$project_dir" ]; then
-        echo "Creating project directory: $project_dir"
-        mkdir -p "$project_dir" 2>/dev/null || echo "Could not create project directory"
+        # This is the container home itself, not the mounted config tree.
+        chown "$PROPR_CLAUDE_RUN_USER" /home/node
+        su-exec "$PROPR_CLAUDE_RUN_USER" mkdir -p \
+            "$PROPR_CLAUDE_CONFIG_DIR/todos" \
+            "$PROPR_CLAUDE_CONFIG_DIR/projects" \
+            "$PROPR_CLAUDE_CONFIG_DIR/shell-snapshots" \
+            "$PROPR_CLAUDE_CONFIG_DIR/statsig"
     fi
 else
-    echo "WARNING: Claude config directory not mounted at /home/node/.claude"
+    echo "WARNING: Claude config directory not mounted at $PROPR_CLAUDE_CONFIG_DIR"
 fi
 
 # Ensure Claude config is accessible
@@ -117,7 +119,7 @@ if [ $# -gt 0 ]; then
     if [ "$(id -u)" = "0" ]; then
         echo "Switching to node user..."
         cd /home/node/workspace
-        exec su-exec node env HOME="${PROPR_CLAUDE_HOME:-/home/node}" USER=node LOGNAME=node "$@"
+        exec su-exec "$PROPR_CLAUDE_RUN_USER" env HOME="${PROPR_CLAUDE_HOME:-/home/node}" USER=node LOGNAME=node "$@"
     else
         exec "$@"
     fi

@@ -64,9 +64,11 @@ const ELIGIBLE_REQUESTS: Array<[string, string]> = [
   ['GET', '/status'],
   ['GET', '/tasks'],
   ['GET', '/task/abc-123/history'],
+  ['POST', '/agents/chat'],
+  ['POST', '/tasks/abc-123/followup'],
 ];
 
-test('accepts a valid internal secret on all three eligible read routes without setting req.user', async () => {
+test('accepts a valid internal secret on every narrow Ezer service route without setting req.user', async () => {
   configureDemoMode(false);
   process.env[EZER_INTERNAL_SECRET_ENV] = VALID_SECRET;
   process.env.ENABLE_BEARER_AUTH = 'false';
@@ -129,6 +131,20 @@ test('the header cannot authenticate a mutation route even with a valid secret',
   assert.equal(status(), 401);
   // Falls through to the generic session/bearer failure, not the Ezer-specific message.
   assert.equal((body() as { error: string }).error, 'Unauthorized');
+});
+
+test('the agent-chat exception is exact and cannot authenticate adjacent agent mutations', async () => {
+  configureDemoMode(false);
+  process.env[EZER_INTERNAL_SECRET_ENV] = VALID_SECRET;
+  process.env.ENABLE_BEARER_AUTH = 'false';
+
+  const req = createRequest('POST', '/agents/runtime/refresh', {
+    [EZER_INTERNAL_SECRET_HEADER]: VALID_SECRET,
+  });
+  const { nextCalled, status } = await runEnsureAuthenticated(req);
+
+  assert.equal(nextCalled, false);
+  assert.equal(status(), 401);
 });
 
 test('the header cannot authenticate an unrelated read route even with a valid secret', async () => {

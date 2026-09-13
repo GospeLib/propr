@@ -17,7 +17,15 @@ redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
 return 1
 `;
 
+export interface CommentAdmissionBinding {
+    commentId: number;
+    bodyDigest: string;
+    headSha: string;
+    headBranch: string;
+}
+
 export interface ExecutionAdmissionClaims {
+    comment?: CommentAdmissionBinding;
     version: 1;
     admissionId: string;
     operationId: string;
@@ -80,6 +88,7 @@ export interface AdmissionStore {
 }
 
 interface ExpectedExecution {
+    comment?: CommentAdmissionBinding;
     repository: string;
     issueNumber: number;
 }
@@ -109,6 +118,7 @@ function parseClaims(encodedPayload: string): ExecutionAdmissionClaims {
     }
     if (!Number.isSafeInteger(candidate.issueNumber) || Number(candidate.issueNumber) < 1) refuse('invalid-issue');
     return {
+        ...(candidate.comment === undefined ? {} : { comment: parseCommentBinding(candidate.comment) }),
         version: 1,
         admissionId: requiredString(candidate.admissionId, 'missing-admission-id'),
         operationId: requiredString(candidate.operationId, 'missing-operation-id'),
@@ -126,6 +136,18 @@ function parseClaims(encodedPayload: string): ExecutionAdmissionClaims {
     };
 }
 
+function parseCommentBinding(value: unknown): CommentAdmissionBinding {
+    if (!value || typeof value !== 'object') refuse('invalid-comment');
+    const candidate = value as Record<string, unknown>;
+    if (!Number.isSafeInteger(candidate.commentId) || Number(candidate.commentId) < 1) refuse('invalid-comment');
+    return { commentId: Number(candidate.commentId), bodyDigest: requiredString(candidate.bodyDigest, 'invalid-comment'),
+        headSha: requiredString(candidate.headSha, 'invalid-comment'), headBranch: requiredString(candidate.headBranch, 'invalid-comment') };
+}
+
+function requireExactComment(actual: CommentAdmissionBinding | undefined, expected: CommentAdmissionBinding | undefined): void {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) refuse('wrong-comment');
+}
+
 function verifySignature(encodedPayload: string, presentedSignature: string, signingSecret: string): void {
     if (Buffer.byteLength(signingSecret) < MINIMUM_SECRET_BYTES) refuse('weak-signing-secret');
     const expected = createHmac(SIGNATURE_ALGORITHM, signingSecret).update(encodedPayload).digest();
@@ -141,6 +163,7 @@ function verifySignature(encodedPayload: string, presentedSignature: string, sig
 function validateClaims(claims: ExecutionAdmissionClaims, expected: ExpectedExecution, nowMs: number): number {
     if (claims.repository !== expected.repository) refuse('wrong-repository');
     if (claims.issueNumber !== expected.issueNumber) refuse('wrong-issue');
+    requireExactComment(claims.comment, expected.comment);
     const issuedAtMs = Date.parse(claims.issuedAt);
     const expiresAtMs = Date.parse(claims.expiresAt);
     if (!Number.isFinite(issuedAtMs) || !Number.isFinite(expiresAtMs) || expiresAtMs <= issuedAtMs) refuse('invalid-expiry');
@@ -170,6 +193,7 @@ export async function consumeExecutionAdmission(input: {
         repository: claims.repository,
         issueNumber: claims.issueNumber,
         target: claims.target,
+        ...(claims.comment === undefined ? {} : { comment: claims.comment }),
     });
     if (!await input.store.consumeAndIssue(consumedKey, receiptKey, receiptValue, ttlSeconds)) refuse('replayed-admission');
     return { claims, receipt: { admissionId: claims.admissionId, operationId: claims.operationId, receiptKey } };
@@ -192,4 +216,5 @@ export async function verifyWorkerAdmissionReceipt(input: {
     if (value.repository !== input.expected.repository) refuse('wrong-repository');
     if (value.issueNumber !== input.expected.issueNumber) refuse('wrong-issue');
     if (value.target !== input.expected.target) refuse('wrong-target');
+    requireExactComment(value.comment as CommentAdmissionBinding | undefined, input.expected.comment);
 }

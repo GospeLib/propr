@@ -32,7 +32,7 @@ import {
 import { AGENT_DEFAULT_VERSIONS } from '../version/types.js';
 import { DEFAULT_AGENT_EXECUTION_TIMEOUT_MS } from '../constants.js';
 import { persistLlmLog, createLlmLogFromAnalysis, buildTaskWorkRef, buildAnalysisWorkRef, formatUsageMetrics } from '../../utils/llmLogger.js';
-import { processDockerResult, buildDockerArgs, getCorrectedTokenUsage, ensurePromptInConversationLog, executeWithUsageTracking, getClaudeAnalysisText, buildAnalysisSafetySuffix, type PersistLogsParams } from './utils/index.js';
+import { processDockerResult, buildDockerArgs, resolveClaudeRuntimeOwner, getCorrectedTokenUsage, ensurePromptInConversationLog, executeWithUsageTracking, getClaudeAnalysisText, buildAnalysisSafetySuffix, type PersistLogsParams } from './utils/index.js';
 import type { ExecutionType } from '../../utils/llmMetrics.types.js';
 
 export { UsageLimitError };
@@ -111,7 +111,7 @@ export class ClaudeAgent implements Agent {
                 customPrompt, issueRef, branchName, modelName: effectiveModel, issueDetails, isRetry, retryReason
             });
 
-            await setWorktreeOwnership(worktreePath, issueRef.number);
+            await setWorktreeOwnership(worktreePath, issueRef.number, resolveClaudeRuntimeOwner(this.config.configPath));
             const worktreeGitContent = verifyWorktreeStructure(worktreePath, issueRef.number);
 
             effectiveReasoningLevel = await this.resolveEffectiveReasoningLevel(reasoningLevel, effectiveModel);

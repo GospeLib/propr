@@ -157,10 +157,13 @@ export function buildClaudePrompt(options: BuildClaudePromptOptions): string {
     return prompt;
 }
 
-export async function setWorktreeOwnership(worktreePath: string, issueNumber: number): Promise<void> {
+export async function setWorktreeOwnership(
+    worktreePath: string, issueNumber: number,
+    owner: { uid: number; gid: number } = { uid: 1000, gid: 1000 },
+): Promise<void> {
     try {
-        await executeDockerCommand('sudo', ['chown', '-R', '1000:1000', worktreePath], { timeout: 10000 });
-        logger.debug({ issueNumber, worktreePath }, 'Set worktree ownership to UID 1000 for container compatibility');
+        await executeDockerCommand('sudo', ['chown', '-R', `${owner.uid}:${owner.gid}`, worktreePath], { timeout: 10000 });
+        logger.debug({ issueNumber, worktreePath, ...owner }, 'Set worktree ownership to the container runtime owner');
     } catch (chownError) {
         const error = chownError as Error;
         logger.warn({ issueNumber, worktreePath, error: error.message }, 'Failed to set worktree ownership - container may have permission issues');

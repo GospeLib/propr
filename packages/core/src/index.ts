@@ -34,7 +34,7 @@ export { getGitHubInstallationToken, getAuthenticatedOctokit, validateGithubInta
 export type { PaginatedOctokitInstance } from './auth/githubAuth.js';
 export { buildAuthPayload, generateAuthToken, verifyAuthToken, AUTH_TOKEN_MAX_AGE_MS, AUTH_TOKEN_MAX_CLOCK_SKEW_MS } from './auth/systemTaskAuth.js';
 export { consumeExecutionAdmission, createRedisAdmissionStore, pendingExecutionAdmissionKey, requiresEzerExecutionAdmission, verifyWorkerAdmissionReceipt } from './admission/ezerExecutionAdmission.js';
-export type { AdmissionStore, ExecutionAdmissionClaims, WorkerAdmissionReceipt } from './admission/ezerExecutionAdmission.js';
+export type { CommentAdmissionBinding, AdmissionStore, ExecutionAdmissionClaims, WorkerAdmissionReceipt } from './admission/ezerExecutionAdmission.js';
 
 export * from './config/configManager.js';
 // Note: loadUltrafixRatingGoal, loadUltrafixMaxCycles, loadUltrafixPauseSeconds, loadPrReviewModel

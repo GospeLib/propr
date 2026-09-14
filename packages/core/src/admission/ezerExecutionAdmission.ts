@@ -280,6 +280,7 @@ export async function consumeExecutionAdmission(input: {
         repository: claims.repository,
         issueNumber: claims.issueNumber,
         target: claims.target,
+        ...(claims.storyId === `${claims.epicId}:integration:${claims.authorityDigest}` ? {integrationDigest:claims.authorityDigest} : {}),
         ...(claims.route === undefined ? {} : {route:claims.route}),
         ...(claims.control === undefined ? {} : {control:claims.control}),
         ...(claims.artifactCorrection === undefined ? {} : { artifactCorrection: claims.artifactCorrection }),
@@ -295,6 +296,7 @@ export async function verifyWorkerAdmissionReceipt(input: {
     expected: ExpectedExecution & { target: string };
     store: Pick<AdmissionStore, 'take'>;
     expectedRoute?: {agentId:string;agentAlias:string;provider:string;model:string};
+    expectedIntegrationDigest?: string;
     onArtifactCorrection?: (binding: TypedArtifactCorrection) => void;
 }): Promise<TypedInvestigationAdmission | undefined> {
     const stored = await input.store.take(input.receipt.receiptKey);
@@ -306,6 +308,7 @@ export async function verifyWorkerAdmissionReceipt(input: {
         refuse('malformed-worker-receipt');
     }
     if(value.control!==undefined)refuse('stop-control-cannot-start-worker');
+    if (value.integrationDigest !== input.expectedIntegrationDigest) refuse('integration-worker-binding-changed');
     if (value.admissionId !== input.receipt.admissionId || value.operationId !== input.receipt.operationId) refuse('mismatched-worker-receipt');
     if (value.repository !== input.expected.repository) refuse('wrong-repository');
     if (value.issueNumber !== input.expected.issueNumber) refuse('wrong-issue');

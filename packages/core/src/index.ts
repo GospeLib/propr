@@ -419,6 +419,9 @@ export type {
 } from './services/repositoryMigrationService.js';
 
 export { enqueueAdmittedComment } from './admission/admittedComment.js';
+export { requireIntegrationPayload, integrationDigest } from './admission/integrationPayload.js';
+export type { IntegrationPayload, IntegrationJobData } from './admission/integrationPayload.js';
+export { executeIntegration, validateCurrentIntegration } from './admission/integrationExecution.js';
 export { EZER_REVIEW_REQUEST, requireReviewRequestMode } from './admission/reviewRequest.js';
 
 export { requireTypedInvestigation, type TypedInvestigationAdmission } from './admission/ezerExecutionAdmission.js';

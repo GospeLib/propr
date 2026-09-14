@@ -157,7 +157,7 @@ export interface MergeConflictJobData {
     systemGenerated: true;    // Distinguishes from user-authored follow-up comments
 }
 
-export type JobData = IssueJobData | CommentJobData | TaskImportJobData | AnalysisJobData | SystemTaskJobData | IndexingJobData | MergeConflictJobData;
+export type JobData = IssueJobData | CommentJobData | TaskImportJobData | AnalysisJobData | SystemTaskJobData | IndexingJobData | MergeConflictJobData | import('../admission/integrationPayload.js').IntegrationJobData;
 
 export interface ClaudeOutputResult {
     type?: string;

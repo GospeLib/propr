@@ -14,6 +14,8 @@ export const EZER_INTERNAL_SECRET_HEADER = 'x-ezer-internal-secret';
 const MINIMUM_SECRET_BYTES = 32;
 
 const EZER_INTERNAL_ELIGIBLE_ROUTES: ReadonlyArray<{ method: string; pattern: RegExp }> = [
+  { method: 'POST', pattern: /^\/tasks\/integration$/ },
+  { method: 'GET', pattern: /^\/tasks\/integration\/[a-f0-9]{64}$/ },
   { method: 'GET', pattern: /^\/status$/ },
   { method: 'GET', pattern: /^\/tasks$/ },
   { method: 'GET', pattern: /^\/task\/[^/]+\/history$/ },

@@ -20,6 +20,7 @@ import {
 } from '../issueJobCallbacks.js';
 import { redisClient } from './config.js';
 import { buildAdmittedWorkerEnvironment } from '../ezerAdmittedWorkerEnvironment.js';
+import { verifyConfiguredEzerAdmission } from '../ezerExecutionAdmission.js';
 
 export function toClaudeResult(response: AgentExecutionResult): ClaudeResult {
   return {
@@ -91,16 +92,6 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
     repoOwner: issueRef.repoOwner,
     repoName: issueRef.repoName
   };
-  const admittedWorkerEnvironment = buildAdmittedWorkerEnvironment(
-    issueRef,
-    taskId,
-    context.ezerAdmissionVerified,
-  );
-  const verifiedExecutionCorrelation = deriveVerifiedExecutionCorrelation(
-    context.ezerAdmissionVerified,
-    issueRef.executionAdmissionReceipt,
-  );
-
   // Localize remote images in issue body and comments
   const issueBodyHtml = (currentIssueData.data as { body_html?: string }).body_html;
   const localizedBody = currentIssueData.data.body
@@ -136,9 +127,31 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
     : prompt;
   if(typed?.provider&&agent.config.type!==typed.provider)throw new Error('TYPED_PROVIDER_ROUTE_MISMATCH');
   if(typed?.model&&modelName!==typed.model)throw new Error('TYPED_MODEL_ROUTE_MISMATCH');
-  const remainingMs = typed ? Date.parse(typed.deadline) - Date.now() : undefined;
-  if (remainingMs !== undefined && remainingMs <= 0) throw new Error('TYPED_DEADLINE_EXCEEDED');
+  const deadline = typed?.deadline ?? context.executionDeadline;
+  if (context.storyExecution && !deadline) throw new Error('STORY_EXECUTION_DEADLINE_REQUIRED');
+  let remainingMs = deadline ? Date.parse(deadline) - Date.now() : undefined;
+  if (remainingMs !== undefined && (!Number.isFinite(remainingMs) || remainingMs <= 0)) throw new Error('EXECUTION_DEADLINE_EXCEEDED');
   const typedBase = typed ? (await typedGit('git',['rev-parse','HEAD'],{cwd:worktreeInfo.worktreePath})).stdout.trim() : undefined;
+  // Preparation may fail without spending authority. Atomic receipt consumption is the final
+  // gate before invoking the configured agent; missing/expired receipts never reach it.
+  if (context.ezerAdmissionPrepared) {
+    context.ezerAdmissionVerified = await verifyConfiguredEzerAdmission(issueRef,
+      binding => { if (JSON.stringify(binding) !== JSON.stringify(context.typedInvestigation)) throw new Error('PREPARED_TYPED_AUTHORITY_CHANGED'); },
+      binding => { if (JSON.stringify(binding) !== JSON.stringify(context.storyExecution)) throw new Error('PREPARED_STORY_AUTHORITY_CHANGED'); },
+      value => { if (value !== context.executionDeadline) throw new Error('PREPARED_EXECUTION_DEADLINE_CHANGED'); });
+    if (!context.ezerAdmissionVerified) throw new Error('ezer-execution-admission-refused:protection-changed');
+  }
+  remainingMs = deadline ? Date.parse(deadline) - Date.now() : undefined;
+  if (remainingMs !== undefined && remainingMs <= 0) throw new Error('EXECUTION_DEADLINE_EXCEEDED');
+  const admittedWorkerEnvironment = buildAdmittedWorkerEnvironment(
+    issueRef,
+    taskId,
+    context.ezerAdmissionVerified,
+  );
+  const verifiedExecutionCorrelation = deriveVerifiedExecutionCorrelation(
+    context.ezerAdmissionVerified,
+    issueRef.executionAdmissionReceipt,
+  );
   // Execute task via agent abstraction
   const stopFileChanges = startFileChangesMonitor(
     signal => updateFileChangesFromWorktree(taskId, worktreeInfo.worktreePath, signal),

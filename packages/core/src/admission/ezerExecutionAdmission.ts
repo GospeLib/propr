@@ -286,7 +286,7 @@ export async function consumeExecutionAdmission(input: {
         repository: claims.repository,
         issueNumber: claims.issueNumber,
         target: claims.target,
-        ...(claims.storyExecution === undefined ? {} : { storyExecution: claims.storyExecution }),
+        ...(claims.storyExecution === undefined ? {} : { storyExecution: claims.storyExecution, executionDeadline: claims.expiresAt }),
         ...(claims.storyId === `${claims.epicId}:integration:${claims.authorityDigest}` ? {integrationDigest:claims.authorityDigest} : {}),
         ...(claims.route === undefined ? {} : {route:claims.route}),
         ...(claims.control === undefined ? {} : {control:claims.control}),
@@ -298,17 +298,31 @@ export async function consumeExecutionAdmission(input: {
     return { claims, receipt: { ...(claims.route ? {route:claims.route} : {}), admissionId: claims.admissionId, operationId: claims.operationId, receiptKey } };
 }
 
-export async function verifyWorkerAdmissionReceipt(input: {
+interface WorkerReceiptVerification {
     receipt: WorkerAdmissionReceipt;
     expected: ExpectedExecution & { target: string };
-    store: Pick<AdmissionStore, 'take'>;
     expectedRoute?: {agentId:string;agentAlias:string;provider:string;model:string};
     expectedIntegrationDigest?: string;
     onArtifactCorrection?: (binding: TypedArtifactCorrection) => void;
     requireStoryExecution?: boolean;
     onStoryExecution?: (binding: StoryExecutionContract) => void;
+    onExecutionDeadline?: (deadline: string) => void;
+}
+
+/** Authorizes preparation only. Execution must still consume the receipt atomically. */
+export async function inspectWorkerAdmissionReceipt(input: WorkerReceiptVerification & {
+    store: Pick<AdmissionStore, 'get'>;
 }): Promise<TypedInvestigationAdmission | undefined> {
-    const stored = await input.store.take(input.receipt.receiptKey);
+    return validateWorkerAdmissionReceipt(await input.store.get(input.receipt.receiptKey), input);
+}
+
+export async function verifyWorkerAdmissionReceipt(input: WorkerReceiptVerification & {
+    store: Pick<AdmissionStore, 'take'>;
+}): Promise<TypedInvestigationAdmission | undefined> {
+    return validateWorkerAdmissionReceipt(await input.store.take(input.receipt.receiptKey), input);
+}
+
+function validateWorkerAdmissionReceipt(stored: string | null, input: WorkerReceiptVerification): TypedInvestigationAdmission | undefined {
     if (!stored) refuse('missing-worker-receipt');
     let value: Record<string, unknown>;
     try {
@@ -333,7 +347,11 @@ export async function verifyWorkerAdmissionReceipt(input: {
         const execution = requireStoryExecutionContract(value.storyExecution);
         if (typed || value.comment || value.artifactCorrection || value.integrationDigest || execution.targetBranch !== value.target)
             refuse('story-execution-authority-mismatch');
+        if (typeof value.executionDeadline !== 'string' || !Number.isFinite(Date.parse(value.executionDeadline)))
+            refuse('story-execution-deadline-required');
+        if (Date.parse(value.executionDeadline) <= Date.now()) refuse('story-execution-deadline-exceeded');
         input.onStoryExecution?.(execution);
+        input.onExecutionDeadline?.(value.executionDeadline);
     } else if (input.requireStoryExecution && !typed) refuse('story-execution-contract-required');
     if (typed && Date.parse(typed.deadline) <= Date.now()) refuse('typed-deadline-exceeded');
     if (value.artifactCorrection !== undefined) {

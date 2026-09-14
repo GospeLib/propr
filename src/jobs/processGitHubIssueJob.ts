@@ -8,7 +8,7 @@ import {
   logger, TaskStates, ensureRepoCloned, getRepoUrl, safeAddLabel, safeRemoveLabel, ensureGitRepository,
   UsageLimitError, validateRepositoryInfo, addModelSpecificDelay, withRetry, retryConfigs, updatePlanIssueTaskId
 } from '@propr/core';
-import { verifyConfiguredEzerAdmission } from './ezerExecutionAdmission.js';
+import { inspectConfiguredEzerAdmission } from './ezerExecutionAdmission.js';
 import type { IssueJobData, JobResult, WorktreeInfo, ClaudeCodeResponse, CommitResult, RepoValidationResult } from '@propr/core';
 import { handleDispatch } from './issueJobDispatcher.js';
 import { handleUsageLimitError, handleGenericError, updateTaskTitleInStorage, buildFinalResult } from './issueJobHelpers.js';
@@ -45,10 +45,14 @@ export async function processGitHubIssueJob(job: Job<IssueJobData>): Promise<Job
   }
 
   try {
-    context.ezerAdmissionVerified = await verifyConfiguredEzerAdmission(job.data,
+    context.ezerAdmissionPrepared = await inspectConfiguredEzerAdmission(job.data,
         typed => { context.typedInvestigation = typed; },
-        execution => { context.storyExecution = execution; });
+        execution => { context.storyExecution = execution; },
+        deadline => { context.executionDeadline = deadline; });
+    // Only an explicitly admitted attempt may execute. BullMQ must not invent another attempt.
+    if (context.ezerAdmissionPrepared) job.discard();
   } catch (error) {
+    job.discard();
     await stateManager.updateTaskState(taskId, TaskStates.FAILED, {
       reason: error instanceof Error ? error.message : String(error),
       historyMetadata: {
@@ -154,7 +158,7 @@ export async function processGitHubIssueJob(job: Job<IssueJobData>): Promise<Job
       job.discard();
       return { status: 'cancelled', reason: 'user_request' };
     }
-    if (error instanceof UsageLimitError) {
+    if (error instanceof UsageLimitError && !context.ezerAdmissionPrepared) {
       await handleUsageLimitError(error, job, issueRef, {
         octokit, correlatedLogger, stateManager, taskId,
         AI_PROCESSING_TAG, AI_WAITING_TAG

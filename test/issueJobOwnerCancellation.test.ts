@@ -22,7 +22,7 @@ await mock.module('../src/jobs/issueJobCallbacks.js',{namedExports:{createSessio
 await mock.module('../src/jobs/issueJob/config.js',{namedExports:{redisClient:{}}});
 await mock.module('../src/jobs/ezerAdmittedWorkerEnvironment.js',{namedExports:{buildAdmittedWorkerEnvironment:()=>({})}});
 const verifyAdmission=mock.fn(async()=>{throw new Error('receipt consumed');});
-await mock.module('../src/jobs/ezerExecutionAdmission.js',{namedExports:{verifyConfiguredEzerAdmission:verifyAdmission}});
+await mock.module('../src/jobs/ezerExecutionAdmission.js',{namedExports:{verifyConfiguredEzerAdmission:verifyAdmission,inspectConfiguredEzerAdmission:verifyAdmission}});
 await mock.module('../src/jobs/issueJobDispatcher.js',{namedExports:{handleDispatch:mock.fn()}});
 await mock.module('../src/jobs/issueJobPostProcessing.js',{namedExports:{performFinalValidation:noOp}});
 await mock.module('../src/jobs/issueJob/index.js',{namedExports:{initializeJobContext:async()=>context,getAuthenticatedClient:noOp,checkLabelConditions:noOp,ensureProcessingLabel:noOp,executeWorktreeOperations:noOp,markTaskComplete:noOp}});
@@ -40,4 +40,21 @@ test('retained owner cancellation suppresses redelivery before pending state or 
  assert.equal(discard.mock.callCount(),1);
  assert.equal(createTaskState.mock.callCount(),0);
  assert.equal(verifyAdmission.mock.callCount(),0);
+});
+test('ordinary admitted agent receives only the remaining signed execution time',async()=>{
+ const budgetMs=60_000;
+ const deadline=new Date(Date.now()+budgetMs).toISOString();
+ verifyAdmission.mock.mockImplementation(async()=>true);
+ const prepared={...context,typedInvestigation:undefined,ezerAdmissionVerified:false,ezerAdmissionPrepared:true,executionDeadline:deadline};
+ await assert.rejects(executeAgentAndRecordMetrics({worktreeInfo:{worktreePath:'/unused',branchName:'branch'},issueRef:{repoOwner:'owner',repoName:'repo',number:1},githubToken:{token:'test'},currentIssueData:{data:{body:'',title:'',labels:[]}},issueComments:[]} as never,prepared as never),/Execution aborted by user request/);
+ const timeout=(executeTask.mock.calls.at(-1)?.arguments[0] as {timeoutMs?:number}|undefined)?.timeoutMs;
+ assert.equal(typeof timeout,'number');
+ assert(timeout!>0 && timeout!<=budgetMs);
+});
+test('a receipt consumed by another worker cannot reach the agent after preparation',async()=>{
+ const calls=executeTask.mock.callCount();
+ verifyAdmission.mock.mockImplementation(async()=>{throw new Error('missing-worker-receipt');});
+ const prepared={...context,typedInvestigation:undefined,ezerAdmissionVerified:false,ezerAdmissionPrepared:true,executionDeadline:new Date(Date.now()+60_000).toISOString()};
+ await assert.rejects(executeAgentAndRecordMetrics({worktreeInfo:{worktreePath:'/unused',branchName:'branch'},issueRef:{repoOwner:'owner',repoName:'repo',number:1},githubToken:{token:'test'},currentIssueData:{data:{body:'',title:'',labels:[]}},issueComments:[]} as never,prepared as never),/missing-worker-receipt/);
+ assert.equal(executeTask.mock.callCount(),calls);
 });

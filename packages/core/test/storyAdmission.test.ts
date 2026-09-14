@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { consumeExecutionAdmission, verifyWorkerAdmissionReceipt } from '../src/admission/ezerExecutionAdmission.js';
 import { requireStoryExecutionContract } from '../src/admission/storyExecutionContract.js';
+import * as admission from '../src/admission/ezerExecutionAdmission.js';
 
 const SECRET = 'story-authority-test-secret-at-least-32-bytes';
 const SHA = 'a'.repeat(40);
@@ -32,6 +33,51 @@ test('ordinary worker receives only the exact signed stored contract, once', asy
   assert.deepEqual(binding, EXECUTION);
   await assert.rejects(verifyWorkerAdmissionReceipt({ receipt, store: f.store, expected: EXPECTED,
     requireStoryExecution: true }), /missing-worker-receipt/);
+});
+test('preparation validates the signed contract without spending its single execution receipt', async () => {
+  const f = fixture();
+  const { receipt } = await consumeExecutionAdmission({ ...f, signingSecret: SECRET, expected: EXPECTED });
+  let binding: unknown;
+  await admission.inspectWorkerAdmissionReceipt({ receipt, store: f.store, expected: EXPECTED,
+    requireStoryExecution: true, onStoryExecution: value => { binding = value; } });
+  assert.deepEqual(binding, EXECUTION);
+  assert.notEqual(await f.store.get(receipt.receiptKey), null, 'setup failure must leave execution authority unspent');
+  await verifyWorkerAdmissionReceipt({ receipt, store: f.store, expected: EXPECTED, requireStoryExecution: true });
+  await assert.rejects(admission.inspectWorkerAdmissionReceipt({ receipt, store: f.store, expected: EXPECTED }), /missing-worker-receipt/);
+});
+test('a changed receipt fails inspection without consuming another execution authority', async () => {
+  const f = fixture();
+  const { receipt } = await consumeExecutionAdmission({ ...f, signingSecret: SECRET, expected: EXPECTED });
+  await assert.rejects(admission.inspectWorkerAdmissionReceipt({ receipt, store: f.store,
+    expected: { ...EXPECTED, target: 'different-branch' } }), /wrong-target/);
+  assert.notEqual(await f.store.get(receipt.receiptKey), null);
+});
+test('ordinary execution deadline is carried from signed admission expiry', async () => {
+  const deadline = new Date(Date.now() + 60_000).toISOString();
+  const f = fixture({ expiresAt: deadline });
+  const { receipt } = await consumeExecutionAdmission({ ...f, signingSecret: SECRET, expected: EXPECTED });
+  let observed: string | undefined;
+  await admission.inspectWorkerAdmissionReceipt({ receipt, store: f.store, expected: EXPECTED,
+    onExecutionDeadline: value => { observed = value; } });
+  assert.equal(observed, deadline);
+});
+test('expired preparation authority cannot reach execution and is never renewed', async () => {
+  const issuedAtMs = Date.now() - 120_000;
+  const f = fixture({ issuedAt: new Date(issuedAtMs).toISOString(), expiresAt: new Date(issuedAtMs + 60_000).toISOString() });
+  const { receipt } = await consumeExecutionAdmission({ ...f, signingSecret: SECRET, expected: EXPECTED, nowMs: issuedAtMs });
+  await assert.rejects(admission.inspectWorkerAdmissionReceipt({ receipt, store: f.store, expected: EXPECTED }), /deadline-exceeded/);
+  await assert.rejects(verifyWorkerAdmissionReceipt({ receipt, store: f.store, expected: EXPECTED }), /deadline-exceeded/);
+});
+test('concurrent execution claims following preparation allow exactly one execution', async () => {
+  const f = fixture();
+  const { receipt } = await consumeExecutionAdmission({ ...f, signingSecret: SECRET, expected: EXPECTED });
+  await admission.inspectWorkerAdmissionReceipt({ receipt, store: f.store, expected: EXPECTED });
+  const attempts = await Promise.allSettled([
+    verifyWorkerAdmissionReceipt({ receipt, store: f.store, expected: EXPECTED }),
+    verifyWorkerAdmissionReceipt({ receipt, store: f.store, expected: EXPECTED }),
+  ]);
+  assert.equal(attempts.filter(result => result.status === 'fulfilled').length, 1);
+  assert.equal(attempts.filter(result => result.status === 'rejected').length, 1);
 });
 test('legacy ordinary receipt cannot start a protected story worker', async () => {
   const f = fixture({ storyExecution: undefined });

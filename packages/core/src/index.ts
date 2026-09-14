@@ -424,3 +424,5 @@ export { EZER_REVIEW_REQUEST, requireReviewRequestMode } from './admission/revie
 export { requireTypedInvestigation, type TypedInvestigationAdmission } from './admission/ezerExecutionAdmission.js';
 
 export { requireTypedArtifactCorrection, type TypedArtifactCorrection } from './admission/ezerExecutionAdmission.js';
+
+export type { StopAdmissionBinding } from './admission/ezerExecutionAdmission.js';

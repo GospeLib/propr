@@ -370,3 +370,16 @@ test('stopTaskExecution reports notRunning for already-finished tasks', async ()
   assert.equal(result.notRunning, true);
   assert.equal(result.currentState, 'completed');
 });
+
+test('signed stop refuses changed execution before abort, queue removal or container action',async()=>{
+ const redis=makeFakeRedis({'worker:state:task-a':runningTaskState('different-container')});
+ await assert.rejects(()=>stopTaskExecution('task-a',{redisClient:redis,expectedExecution:{admissionId:'execution',operationId:'operation',containerId:'expected-container'}}),/execution-changed/);
+ assert.equal(redis.calls.filter(c=>c.method!=='get').length,0);
+});
+
+test('exact owner stop records original execution and signed control identity only after the bound container stops',async()=>{
+ const expectedExecution={admissionId:'original',operationId:'original-op',containerId:'bound-container'};
+ const redis=makeFakeRedis({'worker:state:task-owner':JSON.stringify({history:[{state:'claude_execution',metadata:expectedExecution}]})});let metadata:any;const stopped:string[]=[];
+ const result=await stopTaskExecution('task-owner',{redisClient:redis,expectedExecution,controlAdmission:{admissionId:'stop-admission',operationId:'stop-operation'},requestedBy:'owner',cancellationReason:'ezer_owner_stop',getQueue:async()=>makeFakeQueue([]),stopContainer:async id=>{stopped.push(id);return{success:true};},markCancelled:async(_id,_by,value)=>{metadata=value.historyMetadata;}});
+ assert.equal(result.containerStopped,true);assert.equal(result.cancellationRecorded,true);assert.deepEqual(stopped,['bound-container']);assert.equal(metadata.controlAdmissionId,'stop-admission');assert.equal(metadata.controlOperationId,'stop-operation');assert.equal(metadata.containerId,'bound-container');
+});

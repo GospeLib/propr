@@ -255,6 +255,30 @@ export async function processDetectedIssue(issue: DetectedIssue, correlationId: 
         triggeringLabel: triggeringLabel
     }, 'Detected eligible issue');
 
+    // Preserve the next single-use admission when an equivalent parent already
+    // owns this issue. The Redis intake lock above serializes this check.
+    const queue = await getIssueQueue();
+    const activeJobs = await queue.getActive();
+    const waitingJobs = await queue.getWaiting();
+    const existingJobs = [...activeJobs, ...waitingJobs];
+    interface JobData {
+        number?: number;
+        repoOwner?: string;
+        repoName?: string;
+        isChildJob?: boolean;
+    }
+    const jobExists = existingJobs.some(job =>
+        job.name === 'processGitHubIssue' &&
+        (job.data as JobData).number === issue.number &&
+        (job.data as JobData).repoOwner === issue.repoOwner &&
+        (job.data as JobData).repoName === issue.repoName &&
+        !(job.data as JobData).isChildJob
+    );
+    if (jobExists) {
+        correlatedLogger.debug({ issueNumber: issue.number, repository: repoFullName }, 'A parent job for this issue is already active or waiting, skipping duplicate');
+        return { status: 'ignored', reason: 'job_already_queued' };
+    }
+
     let executionAdmissionReceipt;
     let admittedBaseBranch: string | undefined;
     if (requiresEzerExecutionAdmission({
@@ -287,31 +311,6 @@ export async function processDetectedIssue(issue: DetectedIssue, correlationId: 
             correlatedLogger.warn({ repository: repoFullName, issueNumber: issue.number, error: (error as Error).message }, 'Signed Ezer admission refused');
             return { status: 'blocked', reason: 'ezer_admission_refused' };
         }
-    }
-
-    const queue = await getIssueQueue();
-    const activeJobs = await queue.getActive();
-    const waitingJobs = await queue.getWaiting();
-    const existingJobs = [...activeJobs, ...waitingJobs];
-
-    interface JobData {
-        number?: number;
-        repoOwner?: string;
-        repoName?: string;
-        isChildJob?: boolean;
-    }
-
-    const jobExists = existingJobs.some(job =>
-        job.name === 'processGitHubIssue' &&
-        (job.data as JobData).number === issue.number &&
-        (job.data as JobData).repoOwner === issue.repoOwner &&
-        (job.data as JobData).repoName === issue.repoName &&
-        !(job.data as JobData).isChildJob
-    );
-
-    if (jobExists) {
-        correlatedLogger.debug({ issueNumber: issue.number, repository: repoFullName }, 'A parent job for this issue is already active or waiting, skipping duplicate');
-        return { status: 'ignored', reason: 'job_already_queued' };
     }
 
     correlatedLogger.info({

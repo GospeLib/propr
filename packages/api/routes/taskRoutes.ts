@@ -7,7 +7,7 @@ import { Queue, type JobType } from 'bullmq';
 const LIVE_ISSUE_JOB_STATES: JobType[] = ['active', 'wait', 'delayed', 'prioritized', 'paused', 'waiting-children'];
 import { issueQueue, COMMENT_BATCH_DELAY_MS, getAuthenticatedOctokit, generateCorrelationId, logger } from '@propr/core';
 import type { CommentJobData, UnprocessedComment } from '@propr/core';
-import { getTasksFromDb } from './taskHelpers.js';
+import { getTasksFromDb, taskFollowupPullRequest } from './taskHelpers.js';
 import { validateTaskId, validateRepositoryFilter, validateStringLength, validatePositiveInteger } from './validation.js';
 import { validateRevertRequestBody, formatCommit, validateRevertPreviewParams, checkRevertAuthorization, checkRevertPreviewAuthorization, lookupPr, buildRevertJobData, verifyCommitBelongsToPr, resolveRepoAndCheckAccess } from './revertHelpers.js';
 
@@ -340,12 +340,13 @@ export function createTaskRoutes(deps: TaskRoutesDeps) {
       }
 
       if (req.headers[EZER_INTERNAL_SECRET_HEADER] !== undefined || req.body.existingCommentId !== undefined) {
+        const followupPrNumber = taskFollowupPullRequest(task);
         if (!verifyEzerInternalRequest(req) || !Number.isSafeInteger(req.body.existingCommentId) ||
-            req.body.existingCommentId < 1 || typeof req.body.admissionId !== 'string' || !task.pr_number) {
+            req.body.existingCommentId < 1 || typeof req.body.admissionId !== 'string' || !followupPrNumber) {
           res.status(403).json({ error: 'An existing task PR, exact comment and authenticated Ezer admission are required' });
           return;
         }
-        const result = await enqueueAdmittedComment({ repository: task.repository, prNumber: task.pr_number,
+        const result = await enqueueAdmittedComment({ repository: task.repository, prNumber: followupPrNumber,
           commentId: req.body.existingCommentId, body, admissionId: req.body.admissionId });
         res.json({ success: true, ...result });
         return;

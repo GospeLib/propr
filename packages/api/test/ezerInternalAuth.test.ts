@@ -66,6 +66,7 @@ const ELIGIBLE_REQUESTS: Array<[string, string]> = [
   ['GET', '/task/abc-123/history'],
   ['POST', '/agents/chat'],
   ['POST', '/tasks/abc-123/followup'],
+  ['POST', '/task/abc-123/stop'],
 ];
 
 test('accepts a valid internal secret on every narrow Ezer service route without setting req.user', async () => {

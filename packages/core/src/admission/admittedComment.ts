@@ -3,6 +3,7 @@ import { Redis } from 'ioredis';
 import { consumeExecutionAdmission, createRedisAdmissionStore, pendingExecutionAdmissionKey, getAuthenticatedOctokit, issueQueue, generateCorrelationId, extractLlmFromLabels, logger } from '../index.js';
 
 const COMMENT_PREFIX = '/ezer ';
+const RESERVED_OWNER_CONTROL = /^\s*\/ezer\s+(?:stop|accept-review-stop|approve|retry|pause|resume|use)(?:\s|$)/i;
 import { EZER_REVIEW_REQUEST } from './reviewRequest.js';
 
 const COMMENT_JOB_PREFIX = 'pr-comments-batch-ezer-';
@@ -11,6 +12,7 @@ const COMMENT_JOB_PREFIX = 'pr-comments-batch-ezer-';
 export async function enqueueAdmittedComment(input: {
   repository: string; prNumber: number; commentId: number; body: string; admissionId: string; review?: boolean;
 }): Promise<{ jobId: string; commentId: number }> {
+  if (RESERVED_OWNER_CONTROL.test(input.body)) throw new Error('ezer-comment-refused:reserved-owner-control');
   const review = input.review ? EZER_REVIEW_REQUEST.exec(input.body) : null;
   if (input.review && (!review || review[1] !== input.admissionId)) throw new Error('ezer-review-refused:request-mismatch');
   if (!input.review && EZER_REVIEW_REQUEST.test(input.body)) throw new Error('ezer-review-refused:review-cannot-run-as-correction');

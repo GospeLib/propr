@@ -1367,3 +1367,20 @@ test('getStatus() does not record an ACK time when the socket cannot send', asyn
 
     await service.stop();
 });
+
+
+test('owner relay accepts one actual created delivery before ACK and never dispatches product execution', async()=>{
+ const names=['EZER_OWNER_RELAY_ENABLED','EZER_OWNER_RELAY_BASE_URL','EZER_INTERNAL_API_SECRET'];
+ const saved=Object.fromEntries(names.map(name=>[name,process.env[name]]));
+ process.env.EZER_OWNER_RELAY_ENABLED='true';process.env.EZER_OWNER_RELAY_BASE_URL='http://ezer:8791';process.env.EZER_INTERNAL_API_SECRET='test-relay-secret-at-least-32-bytes';
+ let complete!:()=>void;const gate=new Promise<void>(resolve=>{complete=resolve;});let sent=0;
+ const intercepted=mock.method(globalThis,'fetch',async(_url:any,init:any)=>{sent++;const envelope=JSON.parse(init.body);assert.equal(envelope.deliveryId,'actual-owner-delivery-123456');assert.equal(envelope.installationId,'161226896');await gate;return new Response(JSON.stringify({accepted:true}));});
+ const {service,dispatched}=makeService({installationId:161226896});
+ try{
+  await service.start();const socket=FakeWebSocket.instances[0];socket.emit('open');
+  const payload={action:'created',installation:{id:161226896},repository:{full_name:'GospeLib/product-hub'},comment:{body:`/ezer accept-review-stop stop:abcd ${'a'.repeat(40)} sha256:${'b'.repeat(64)} 55`}};
+  const frame=eventFrame({sequence:100,deliveryId:'actual-owner-delivery-123456',eventType:'issue_comment',rawPayload:payload});socket.emit('message',frame);await flush();
+  assert.equal(sent,1);assert.equal(dispatched.length,0);assert.equal(socket.sentFrames().filter(f=>f.type==='ack').length,0);
+  complete();await flush();assert.equal(socket.sentFrames().filter(f=>f.type==='ack').length,1);socket.emit('message',frame);await flush();assert.equal(sent,1);assert.equal(dispatched.length,0);
+ }finally{complete();await service.stop();intercepted.mock.restore();for(const name of names){if(saved[name]===undefined)delete process.env[name];else process.env[name]=saved[name];}}
+});

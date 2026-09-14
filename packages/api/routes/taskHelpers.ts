@@ -1,5 +1,18 @@
 import { Knex } from 'knex';
 
+// A consumed owner stop remains terminal when the only later rows are refused automatic retries.
+const CURRENT_TASK_HISTORY_ORDER = `ROW_NUMBER() OVER(PARTITION BY task_id ORDER BY
+  CASE WHEN state = 'cancelled' AND json_valid(metadata) = 1 THEN
+    CASE WHEN json_extract(metadata, '$.cancellationReason') = 'ezer_owner_stop'
+      AND json_extract(metadata, '$.controlAdmissionId') IS NOT NULL
+      AND json_extract(metadata, '$.controlOperationId') IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM task_history later WHERE later.task_id = task_history.task_id
+        AND later.timestamp > task_history.timestamp
+        AND NOT ((later.state = 'pending' AND later.reason = 'Task created')
+          OR (later.state = 'failed' AND later.reason = 'ezer-execution-admission-refused:missing-worker-receipt')))
+    THEN 1 ELSE 0 END ELSE 0 END DESC, timestamp DESC) as rn`;
+
+
 export interface TaskQuery {
   db: Knex;
   status: string;
@@ -22,7 +35,7 @@ export async function getTasksFromDb(
       'state',
       'timestamp',
       'reason',
-      db.raw('ROW_NUMBER() OVER(PARTITION BY task_id ORDER BY timestamp DESC) as rn')
+      db.raw(CURRENT_TASK_HISTORY_ORDER)
     )
     .as('h');
 
@@ -241,4 +254,11 @@ function mapDbTaskToResponse(row: Record<string, unknown>, correlation?: Durable
     sessionId: correlation?.sessionId ?? null,
     commitHash: (row.commit_hash as string | null) ?? null
   };
+}
+
+const ADMITTED_PR_COMMENT_TASK = /^pr-comments-batch-ezer-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+/** These task IDs are created only by the signed PR-comment ingress; their issue number is the PR. */
+export function taskFollowupPullRequest(task: {task_id:string;issue_number:number;pr_number?:number|null}): number | undefined {
+ const candidate=task.pr_number??(ADMITTED_PR_COMMENT_TASK.test(task.task_id)?task.issue_number:undefined);
+ return typeof candidate==='number'&&Number.isSafeInteger(candidate)&&candidate>0?candidate:undefined;
 }

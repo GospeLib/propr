@@ -155,7 +155,7 @@ export async function handleDispatchWithDeps(job: Job<IssueJobData>, deps: Dispa
         const agentModelsToProcess: AgentModelToProcess[] = [];
 
         // First, process standard llm- prefixed labels
-        if (llmLabels.length > 0) {
+        if (!issueRef.executionAdmissionReceipt?.route && llmLabels.length > 0) {
             for (const label of llmLabels) {
                 const llmPart = label.substring('llm-'.length);
                 const resolution = await deps.resolveLlmLabel(llmPart);
@@ -173,7 +173,7 @@ export async function handleDispatchWithDeps(job: Job<IssueJobData>, deps: Dispa
         }
 
         // Then, process custom labels (that don't overlap with llm- labels)
-        if (customLabelMatches.length > 0) {
+        if (!issueRef.executionAdmissionReceipt?.route && customLabelMatches.length > 0) {
             for (const label of customLabelMatches) {
                 const resolution = await deps.resolveCustomLabel(label);
                 if (resolution) {
@@ -191,6 +191,9 @@ export async function handleDispatchWithDeps(job: Job<IssueJobData>, deps: Dispa
             }
         }
 
+        // This is a routing hint from verified intake; the worker independently checks the retained receipt.
+        const selectedRoute=issueRef.executionAdmissionReceipt?.route;
+        if(selectedRoute)agentModelsToProcess.push({agentAlias:selectedRoute.agentAlias,model:selectedRoute.model,label:null});
         // If no LLM or custom labels found, use the default agent
         if (agentModelsToProcess.length === 0) {
             // No LLM or custom labels - use default agent from settings

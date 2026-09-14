@@ -5,7 +5,7 @@
 # agent. Only this final image is published.
 
 # The full managed bundle includes an amd64-only Antigravity binary. The
-# claude-runtime target uses the same CLI stage and supports native arm64; apt
+# claude-runtime and codex-runtime targets reuse their CLI stages on native arm64; apt
 # resolves package revisions from each architecture using the prefixes below.
 ARG AGENT_PLATFORM=linux/amd64
 ARG UV_VERSION=0.8.17
@@ -132,6 +132,17 @@ RUN npm install -g "@openai/codex@${CODEX_CLI_VERSION}" \
     && npm cache clean --force \
     && rm -rf /root/.npm \
     && codex --version
+
+# Native Codex retains the same admission dispatcher, authenticated config mount,
+# and owner-safe entrypoint as the managed bundle; only the CPU architecture differs.
+FROM codex-cli AS codex-runtime
+COPY --chmod=755 scripts/agent-entrypoint.sh scripts/codex-entrypoint.sh /home/node/
+USER node
+RUN git config --global user.name "ProPR Agent Bot" \
+    && git config --global user.email "agent-bot@propr.dev" \
+    && git config --global --add safe.directory '*'
+WORKDIR /home/node/workspace
+ENTRYPOINT ["/usr/bin/tini", "--", "/home/node/agent-entrypoint.sh"]
 
 
 FROM agent-base AS opencode-cli

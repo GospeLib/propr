@@ -20,6 +20,8 @@ const EZER_INTERNAL_ELIGIBLE_ROUTES: ReadonlyArray<{ method: string; pattern: Re
   // `agent.analyze` runs in an isolated scratch workspace with tools disabled. This route cannot
   // enqueue or execute a ProPR product task; admitted work continues through the task APIs.
   { method: 'POST', pattern: /^\/agents\/chat$/ },
+  // Owner-approved StopUnit capability; handler independently validates signed exact execution.
+  { method: 'POST', pattern: /^\/task\/[^/]+\/stop$/ },
   // Handler requires an existing exact GitHub comment and a fresh signed Ezer admission.
   { method: 'POST', pattern: /^\/tasks\/[^/]+\/followup$/ },
 ];

@@ -168,6 +168,18 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
     await stopFileChanges();
   }
 
+  // Check if task was cancelled during execution
+  const currentState = await stateManager.getTaskState(taskId);
+  const TERMINAL_STATES: string[] = [TaskStates.COMPLETED, TaskStates.FAILED, TaskStates.CANCELLED];
+  if (currentState && TERMINAL_STATES.includes(currentState.state)) {
+    correlatedLogger.info({ taskId, currentState: currentState.state }, 'Task already in terminal state after agent execution, skipping state update');
+    if (currentState.state === TaskStates.CANCELLED) {
+      throw new Error('Execution aborted by user request');
+    }
+    throw new Error(`Task already in terminal state: ${currentState.state}`);
+  }
+
+
   if (typed && typedBase) {
     if (Date.parse(typed.deadline) <= Date.now()) throw new Error('TYPED_DEADLINE_EXCEEDED');
     const changed = await typedGit('git',['diff','--name-only',typedBase,'--'],{cwd:worktreeInfo.worktreePath});
@@ -179,16 +191,6 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
   // Convert to ClaudeCodeResponse for backwards compatibility
   const claudeResult = agentResultToClaudeResponse(agentResult);
 
-  // Check if task was cancelled during execution
-  const currentState = await stateManager.getTaskState(taskId);
-  const TERMINAL_STATES: string[] = [TaskStates.COMPLETED, TaskStates.FAILED, TaskStates.CANCELLED];
-  if (currentState && TERMINAL_STATES.includes(currentState.state)) {
-    correlatedLogger.info({ taskId, currentState: currentState.state }, 'Task already in terminal state after agent execution, skipping state update');
-    if (currentState.state === TaskStates.CANCELLED) {
-      throw new Error('Execution aborted by user request');
-    }
-    throw new Error(`Task already in terminal state: ${currentState.state}`);
-  }
 
   await stateManager.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, {
     reason: `${agent.config.type} agent execution completed`,

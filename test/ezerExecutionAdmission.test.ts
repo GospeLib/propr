@@ -219,3 +219,13 @@ test('typed artifact correction is a separate exact comment admission with one-u
     await assert.rejects(()=>consumeExecutionAdmission({token:sign({...value,...change}),signingSecret:SIGNING_SECRET,expected:{repository:value.repository,issueNumber:value.issueNumber,comment:change.comment??comment},store:store()}));
   }
 });
+
+const SELECTED_ROUTE={selectionId:'route-event',routeId:'local:gpt-5.6-sol',agentId:'agent-1',agentAlias:'local',provider:'codex',model:'gpt-5.6-sol',attemptOrdinal:2};
+test('retains the exact signed route and rejects changed worker models and forged receipt hints',async()=>{
+ for(const mode of ['exact','model','hint'] as const){
+  const memory=store(),admitted=await consumeExecutionAdmission({token:sign(claims({route:SELECTED_ROUTE})),signingSecret:SIGNING_SECRET,expected:{repository:'GospeLib/main',issueNumber:2260},store:memory,nowMs:NOW_MS});
+  assert.deepEqual(admitted.receipt.route,SELECTED_ROUTE);
+  const check=()=>verifyWorkerAdmissionReceipt({receipt:mode==='hint'?{...admitted.receipt,route:{...SELECTED_ROUTE,selectionId:'forged'}}:admitted.receipt,expected:{repository:'GospeLib/main',issueNumber:2260,target:'stage'},expectedRoute:{...SELECTED_ROUTE,model:mode==='model'?'other':SELECTED_ROUTE.model},store:memory});
+  if(mode==='exact')await check();else await assert.rejects(check,/selected-route/);
+ }
+});

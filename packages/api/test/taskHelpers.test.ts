@@ -111,3 +111,22 @@ describe('getTasksFromDb', () => {
     assert.equal(task.sessionId, null);
   });
 });
+
+
+test('authenticated owner cancellation stays current after refused same-task retries, retaining every history row', async () => {
+  const taskId = await insertTask();
+  const originalRows = await database('task_history').where({task_id:taskId});
+  const base = Date.now();
+  const rows = [
+    {state:'cancelled',reason:'Owner stop comment; Ezer admission.',metadata:JSON.stringify({cancellationReason:'ezer_owner_stop',controlAdmissionId:'stop-admission',controlOperationId:'stop-operation'})},
+    {state:'pending',reason:'Task created',metadata:'{}'},
+    {state:'failed',reason:'ezer-execution-admission-refused:missing-worker-receipt',metadata:'{}'},
+  ].map((row,index)=>({...row,task_id:taskId,timestamp:new Date(base+index+1).toISOString()}));
+  await database('task_history').insert(rows);
+  const before=await database('task_history').where({task_id:taskId}).orderBy('history_id');
+  const result=await getTasksFromDb({db:database,status:'cancelled',repository:'all',limit:50,offset:0});
+  assert.equal(result.total,1);
+  assert.equal((result.tasks[0] as Record<string,unknown>).status,'cancelled');
+  assert.deepEqual(await database('task_history').where({task_id:taskId}).orderBy('history_id'),before);
+  assert.equal(before.length,originalRows.length+rows.length);
+});

@@ -687,3 +687,10 @@ test('/api/status caps summarization cooldown warnings', async () => {
     },
   ]);
 });
+
+test('/api/status projects exact configured model IDs without config paths, secrets or implicit fallback routes',async()=>{
+ const config=createAgentConfig({supportedModels:['gpt-5.6-sol'],envVars:{PRIVATE_TOKEN:'test-only-do-not-project'},configPath:'/private/test-credentials'});
+ const agent=createAgent(config,async()=>true);const body=await readStatus({loadAgents:async()=>[config],agentRegistry:createRegistry([agent])});
+ assert.deepEqual((body.agents as Array<Record<string,unknown>>)[0],{id:config.id,type:config.type,alias:config.alias,status:'connected',supportedModels:['gpt-5.6-sol']});
+ const fallback=await readStatus({loadAgents:async()=>[]});assert.equal((fallback.agents as Array<Record<string,unknown>>)[0].supportedModels,undefined);
+});

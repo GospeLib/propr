@@ -32,6 +32,12 @@ export async function processGitHubIssueJob(job: Job<IssueJobData>): Promise<Job
   const { jobId, issueRef, correlationId, correlatedLogger, stateManager, modelName, taskId, AI_PROCESSING_TAG, AI_DONE_TAG, AI_WAITING_TAG } = context;
 
 
+  // A stopped task keeps its identity across BullMQ redelivery. Never recreate it.
+  if (await stateManager.getTaskCancellation(taskId)) {
+    job.discard();
+    return { status: 'cancelled', reason: 'user_request' };
+  }
+
   try {
     await stateManager.createTaskState(taskId, { number: issueRef.number, repoOwner: issueRef.repoOwner, repoName: issueRef.repoName, modelName } as import('@propr/core').IssueRef, correlationId);
   } catch (stateError) {
@@ -142,6 +148,10 @@ export async function processGitHubIssueJob(job: Job<IssueJobData>): Promise<Job
     return buildFinalResult(issueRef, localRepoPath || '', { worktreeInfo, claudeResult, postProcessingResult, commitResult });
 
   } catch (error) {
+    if (await stateManager.getTaskCancellation(taskId)) {
+      job.discard();
+      return { status: 'cancelled', reason: 'user_request' };
+    }
     if (error instanceof UsageLimitError) {
       await handleUsageLimitError(error, job, issueRef, {
         octokit, correlatedLogger, stateManager, taskId,

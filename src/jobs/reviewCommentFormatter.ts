@@ -116,6 +116,11 @@ function normalizeSuggestionMetadata(response: string): string {
  *   4. A short instruction telling the user about /fix.
  *   5. A hidden HTML marker for machine detection.
  */
+export function reviewAnalysisWithPublicOutcome(analysis: AnalysisResult, publicComment: string): AnalysisResult {
+    if (!analysis.success || parseStructuredReview(publicComment).status !== 'invalid') return analysis;
+    return { ...analysis, success: false, error: 'REVIEW_OUTPUT_INVALID' };
+}
+
 export function buildReviewComment(
     assignment: ReviewAssignment,
     analysisResult: AnalysisResult,

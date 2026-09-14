@@ -209,6 +209,16 @@ export class WorkerStateManager {
         return JSON.parse(stateJson) as TaskStateData;
     }
 
+    /** Retained cancellation is authoritative for this exact task, including late job redelivery. */
+    async getTaskCancellation(taskId: string): Promise<Record<string, unknown> | null> {
+        const current = await this.getTaskState(taskId);
+        if (current?.state === TaskStates.CANCELLED) return { ...current.history.at(-1) };
+        const recorded = await db('task_history').where({ task_id: taskId, state: TaskStates.CANCELLED })
+            .orderBy('timestamp', 'desc').first();
+        if (!recorded) return null;
+        return { ...recorded, metadata: typeof recorded.metadata === 'string' ? JSON.parse(recorded.metadata) : recorded.metadata };
+    }
+
     /**
      * Updates issue reference metadata without changing the task state.
      * @param taskId - Task identifier

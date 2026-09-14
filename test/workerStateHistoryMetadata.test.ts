@@ -200,3 +200,16 @@ test('returns false after the target row remains missing for the bounded attempt
     assert.equal(waitForRetry.mock.callCount(), MAX_TEST_ATTEMPTS - 1);
     assert.deepEqual(JSON.parse(historyRow.metadata), { containerId: CONTAINER_ID });
 });
+
+
+test('retained cancellation remains discoverable after refused retry projection without history writes', async () => {
+    redisState.state = 'failed';
+    historyRow.state = 'cancelled';
+    historyRow.metadata = JSON.stringify({ controlAdmissionId: 'owner-stop-admission', cancellationReason: 'ezer_owner_stop' });
+    const manager = new WorkerStateManager();
+    const cancellation = await manager.getTaskCancellation(TASK_ID);
+    assert.equal(cancellation?.state, 'cancelled');
+    assert.equal((cancellation?.metadata as Record<string, unknown>).controlAdmissionId, 'owner-stop-admission');
+    assert.equal(redisState.state, 'failed', 'readback does not rewrite the late refused-retry history');
+    await manager.close();
+});

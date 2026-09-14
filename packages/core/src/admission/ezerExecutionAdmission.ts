@@ -66,7 +66,33 @@ export function requireTypedArtifactCorrection(value: unknown): TypedArtifactCor
     return {itemId:v.itemId,outputPath:v.outputPath,priorRevision:v.priorRevision,priorDigest:v.priorDigest,deadline:v.deadline};
 }
 
+/** Stop authority targets one already verified execution and one actual owner comment. */
+export interface StopAdmissionBinding {
+    kind: 'stop'; taskId: string; executionAdmissionId: string; executionOperationId: string;
+    containerId: string; unitId: string; ownerAccountId: string; commentId: number; bodyDigest: string;
+}
+function parseStopBinding(value: unknown): StopAdmissionBinding {
+    if (!value || typeof value !== 'object') refuse('invalid-stop-control');
+    const v=value as Record<string,unknown>;
+    if(v.kind!=='stop'||!Number.isSafeInteger(v.commentId)||Number(v.commentId)<1)refuse('invalid-stop-control');
+    return {kind:'stop',taskId:requiredString(v.taskId,'invalid-stop-task'),executionAdmissionId:requiredString(v.executionAdmissionId,'invalid-stop-execution'),
+        executionOperationId:requiredString(v.executionOperationId,'invalid-stop-operation'),containerId:requiredString(v.containerId,'invalid-stop-container'),
+        unitId:requiredString(v.unitId,'invalid-stop-unit'),ownerAccountId:requiredString(v.ownerAccountId,'invalid-stop-owner'),
+        commentId:Number(v.commentId),bodyDigest:requiredString(v.bodyDigest,'invalid-stop-comment')};
+}
+
+export interface ExecutionRouteBinding {selectionId:string;routeId:string;agentId:string;agentAlias:string;provider:string;model:string;attemptOrdinal:number;}
+function requireExecutionRoute(value:unknown):ExecutionRouteBinding {
+ if(!value||typeof value!=='object')throw new Error('INVALID_EXECUTION_ROUTE');
+ const v=value as Record<string,unknown>;
+ for(const key of ['selectionId','routeId','agentId','agentAlias','provider','model'])if(typeof v[key]!=='string'||!v[key]||/\s/.test(String(v[key])))throw new Error('INVALID_EXECUTION_ROUTE');
+ if(!Number.isSafeInteger(v.attemptOrdinal)||Number(v.attemptOrdinal)<1||v.routeId!==`${v.agentAlias}:${v.model}`)throw new Error('INVALID_EXECUTION_ROUTE');
+ return {selectionId:String(v.selectionId),routeId:String(v.routeId),agentId:String(v.agentId),agentAlias:String(v.agentAlias),provider:String(v.provider),model:String(v.model),attemptOrdinal:Number(v.attemptOrdinal)};
+}
+
 export interface ExecutionAdmissionClaims {
+  route?: ExecutionRouteBinding;
+    control?: StopAdmissionBinding;
     artifactCorrection?: TypedArtifactCorrection;
     typedWork?: TypedInvestigationAdmission;
     comment?: CommentAdmissionBinding;
@@ -87,6 +113,7 @@ export interface ExecutionAdmissionClaims {
 }
 
 export interface WorkerAdmissionReceipt {
+    route?: ExecutionRouteBinding;
     admissionId: string;
     operationId: string;
     receiptKey: string;
@@ -132,6 +159,7 @@ export interface AdmissionStore {
 }
 
 interface ExpectedExecution {
+    control?: StopAdmissionBinding;
     comment?: CommentAdmissionBinding;
     repository: string;
     issueNumber: number;
@@ -162,6 +190,8 @@ function parseClaims(encodedPayload: string): ExecutionAdmissionClaims {
     }
     if (!Number.isSafeInteger(candidate.issueNumber) || Number(candidate.issueNumber) < 1) refuse('invalid-issue');
     return {
+        ...(candidate.route === undefined ? {} : {route:requireExecutionRoute(candidate.route)}),
+    ...(candidate.control === undefined ? {} : {control:parseStopBinding(candidate.control)}),
         ...(candidate.artifactCorrection === undefined ? {} : { artifactCorrection: requireTypedArtifactCorrection(candidate.artifactCorrection) }),
         ...(candidate.typedWork === undefined ? {} : { typedWork: requireTypedInvestigation(candidate.typedWork) }),
         ...(candidate.comment === undefined ? {} : { comment: parseCommentBinding(candidate.comment) }),
@@ -207,6 +237,10 @@ function verifySignature(encodedPayload: string, presentedSignature: string, sig
 }
 
 function validateClaims(claims: ExecutionAdmissionClaims, expected: ExpectedExecution, nowMs: number): number {
+    if(JSON.stringify(claims.control)!==JSON.stringify(expected.control===undefined?undefined:parseStopBinding(expected.control)))refuse('wrong-stop-control');
+    if(claims.route&&(claims.control||claims.comment||claims.artifactCorrection))refuse('route-authority-mismatch');
+    if(claims.route&&claims.typedWork&&(claims.typedWork.provider!==claims.route.provider||claims.typedWork.model!==claims.route.model))refuse('route-typed-mismatch');
+    if(claims.control && (claims.typedWork || claims.comment || claims.artifactCorrection || claims.storyId!==claims.control.unitId))refuse('stop-authority-mismatch');
     if (claims.typedWork && (claims.comment || claims.storyId !== `typed-work:${claims.typedWork.itemId}` ||
         claims.scope.length !== 1 || claims.scope[0] !== claims.typedWork.outputPath || Date.parse(claims.expiresAt) > Date.parse(claims.typedWork.deadline))) refuse('typed-authority-mismatch');
     if (claims.repository !== expected.repository) refuse('wrong-repository');
@@ -246,18 +280,21 @@ export async function consumeExecutionAdmission(input: {
         repository: claims.repository,
         issueNumber: claims.issueNumber,
         target: claims.target,
+        ...(claims.route === undefined ? {} : {route:claims.route}),
+        ...(claims.control === undefined ? {} : {control:claims.control}),
         ...(claims.artifactCorrection === undefined ? {} : { artifactCorrection: claims.artifactCorrection }),
         ...(claims.typedWork === undefined ? {} : { typedWork: claims.typedWork }),
         ...(claims.comment === undefined ? {} : { comment: claims.comment }),
     });
     if (!await input.store.consumeAndIssue(consumedKey, receiptKey, receiptValue, ttlSeconds)) refuse('replayed-admission');
-    return { claims, receipt: { admissionId: claims.admissionId, operationId: claims.operationId, receiptKey } };
+    return { claims, receipt: { ...(claims.route ? {route:claims.route} : {}), admissionId: claims.admissionId, operationId: claims.operationId, receiptKey } };
 }
 
 export async function verifyWorkerAdmissionReceipt(input: {
     receipt: WorkerAdmissionReceipt;
     expected: ExpectedExecution & { target: string };
     store: Pick<AdmissionStore, 'take'>;
+    expectedRoute?: {agentId:string;agentAlias:string;provider:string;model:string};
     onArtifactCorrection?: (binding: TypedArtifactCorrection) => void;
 }): Promise<TypedInvestigationAdmission | undefined> {
     const stored = await input.store.take(input.receipt.receiptKey);
@@ -268,11 +305,17 @@ export async function verifyWorkerAdmissionReceipt(input: {
     } catch {
         refuse('malformed-worker-receipt');
     }
+    if(value.control!==undefined)refuse('stop-control-cannot-start-worker');
     if (value.admissionId !== input.receipt.admissionId || value.operationId !== input.receipt.operationId) refuse('mismatched-worker-receipt');
     if (value.repository !== input.expected.repository) refuse('wrong-repository');
     if (value.issueNumber !== input.expected.issueNumber) refuse('wrong-issue');
     if (value.target !== input.expected.target) refuse('wrong-target');
     requireExactComment(value.comment as CommentAdmissionBinding | undefined, input.expected.comment);
+    if(value.route!==undefined){
+      const route=requireExecutionRoute(value.route),actual=input.expectedRoute;
+      if(!actual||actual.agentId!==route.agentId||actual.agentAlias!==route.agentAlias||actual.provider!==route.provider||actual.model!==route.model)refuse('selected-route-mismatch');
+      if(JSON.stringify(input.receipt.route)!==JSON.stringify(route))refuse('selected-route-receipt-changed');
+    } else if(input.receipt.route!==undefined)refuse('unsigned-selected-route');
     const typed = value.typedWork === undefined ? undefined : requireTypedInvestigation(value.typedWork);
     if (typed && Date.parse(typed.deadline) <= Date.now()) refuse('typed-deadline-exceeded');
     if (value.artifactCorrection !== undefined) {

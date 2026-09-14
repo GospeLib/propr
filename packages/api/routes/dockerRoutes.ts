@@ -1,3 +1,7 @@
+import {Redis} from 'ioredis';
+import {stopAdmittedTask} from './ezerStopTask.js';
+import {EZER_INTERNAL_SECRET_HEADER,verifyEzerInternalRequest} from '../ezerInternalAuth.js';
+import {db,getAuthenticatedOctokit,createRedisAdmissionStore} from '@propr/core';
 import type { Response } from 'express';
 import type { FlatRequest } from '../requestTypes.js';
 import { RedisClientType } from 'redis';
@@ -18,6 +22,8 @@ interface TaskStateHistory {
   metadata?: {
     containerId?: string;
     containerName?: string;
+    admissionId?: string;
+    operationId?: string;
   };
 }
 
@@ -50,6 +56,8 @@ export interface StopTaskQueue {
 }
 
 export interface StopTaskExecutionOptions {
+  controlAdmission?: {admissionId:string;operationId:string};
+  expectedExecution?: {admissionId:string;operationId:string;containerId:string};
   redisClient: StopTaskRedisClient;
   /** Who requested the stop (username or e.g. 'system'). Defaults to 'user'. */
   requestedBy?: string;
@@ -242,7 +250,8 @@ async function markTaskCancelledSafely(taskId: string, historyMetadata: Record<s
       ...(options.reason ? { reason: options.reason } : {}),
       historyMetadata: {
         ...(options.cancellationReason ? { cancellationReason: options.cancellationReason } : {}),
-        ...historyMetadata
+        ...historyMetadata,
+        ...(options.controlAdmission?{controlAdmissionId:options.controlAdmission.admissionId,controlOperationId:options.controlAdmission.operationId}:{})
       }
     });
     console.log(`[stop-execution] Task ${taskId} marked as cancelled`);
@@ -277,6 +286,12 @@ export async function stopTaskExecution(taskIdOrJobId: string, options: StopTask
   const stateData = await redisClient.get(`worker:state:${taskId}`);
   const state = parseTaskState(taskId, stateData);
   const currentState = state?.history[state.history.length - 1]?.state;
+  if(options.expectedExecution){
+    const current=state?.history.at(-1);
+    if(current?.state!=='claude_execution'||current.metadata?.admissionId!==options.expectedExecution.admissionId||
+       current.metadata?.operationId!==options.expectedExecution.operationId||current.metadata?.containerId!==options.expectedExecution.containerId)
+      throw new Error('ezer-stop-refused:execution-changed');
+  }
   const isRunning = !!currentState && ACTIVE_TASK_STATES.includes(currentState);
 
   if (!isRunning) {
@@ -492,6 +507,21 @@ export function createDockerRoutes(deps: DockerRoutesDeps) {
         return;
       }
 
+      if(req.headers[EZER_INTERNAL_SECRET_HEADER]!==undefined){
+        if(!verifyEzerInternalRequest(req)||typeof req.body?.signedAdmission!=='string'||!Number.isSafeInteger(req.body?.existingCommentId)){
+          res.status(403).json({error:'A signed exact-execution admission and existing owner comment are required'});return;
+        }
+        const admissionRedis=new Redis({host:process.env.REDIS_HOST||'127.0.0.1',port:Number(process.env.REDIS_PORT||'6379')});
+        try{
+          const result=await stopAdmittedTask({taskId:req.params.taskId,commentId:req.body.existingCommentId,token:req.body.signedAdmission},{
+            store:createRedisAdmissionStore(admissionRedis),signingSecret:process.env.EZER_ADMISSION_HMAC_SECRET||'',
+            readTask:async taskId=>{const row=await db('tasks').where({task_id:taskId}).first();return row?{repository:row.repository,issueNumber:row.issue_number}:undefined;},
+            readComment:async(repository,commentId)=>{const [owner,repo]=repository.split('/');const api=await getAuthenticatedOctokit();const {data}=await api.request('GET /repos/{owner}/{repo}/issues/comments/{comment_id}',{owner,repo,comment_id:commentId});return {...data,body:data.body??'',user:data.user?{id:data.user.id,login:data.user.login}:null};},
+            readState:taskId=>redisClient.get(`worker:state:${taskId}`),
+            stop:(taskId,options)=>executeStopTask(taskId,{...options,redisClient}),
+          });res.json(result);return;
+        } finally{admissionRedis.disconnect();}
+      }
       console.log(`[stop-execution] Attempting to stop task: ${req.params.taskId}`);
       const result = await executeStopTask(req.params.taskId, { redisClient, requestedBy: req.user?.username || 'user' });
 

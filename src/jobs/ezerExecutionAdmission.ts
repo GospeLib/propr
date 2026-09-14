@@ -1,5 +1,6 @@
 import { Redis } from 'ioredis';
 import {
+  AgentRegistry,
   createRedisAdmissionStore,
   requiresEzerExecutionAdmission,
   verifyWorkerAdmissionReceipt,
@@ -25,7 +26,11 @@ export async function verifyConfiguredEzerAdmission(issueRef: IssueJobData, onTy
     enableReadyCheck: false,
   });
   try {
+    const registry=AgentRegistry.getInstance();await registry.ensureInitialized();
+    const agent=issueRef.agentAlias?registry.getAgentByAlias(issueRef.agentAlias):undefined;
+    if(issueRef.executionAdmissionReceipt.route&&(!agent?.config.enabled||!issueRef.modelName||!agent.config.supportedModels?.includes(issueRef.modelName)))throw new Error('ezer-execution-admission-refused:selected-route-unavailable');
     const typed = await verifyWorkerAdmissionReceipt({
+      ...(agent&&issueRef.modelName?{expectedRoute:{agentId:agent.config.id,agentAlias:agent.config.alias,provider:agent.config.type,model:issueRef.modelName}}:{}),
       receipt: issueRef.executionAdmissionReceipt,
       expected: { repository, issueNumber: issueRef.number, target: issueRef.baseBranch ?? '' },
       store: createRedisAdmissionStore(admissionRedis),

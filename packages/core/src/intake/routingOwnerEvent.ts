@@ -1,6 +1,7 @@
 /** Narrow owner-approved relay carriage; no fabricated GitHub signature or direct dispatch. */
 import {createHmac} from 'node:crypto';
 import {makeIdempotent} from '../utils/errorHandler.js';
+import log from '../utils/logger.js';
 import type {PaginatedOctokitInstance} from '../auth/githubAuth.js';
 const OWNER_RELAY_PATH='/webhooks/propr-owner-event';
 const OWNER_RELAY_REPOSITORY='GospeLib/product-hub';
@@ -14,14 +15,26 @@ const RETRY_COMMAND=/^\/ezer retry (EP-[a-zA-Z0-9-]+-S[0-9]+) ([1-9][0-9]*)$/;
 const PAUSE_COMMAND=/^\/ezer pause ([a-zA-Z0-9:_-]+)$/;
 const RESUME_COMMAND=/^\/ezer resume ([a-zA-Z0-9:_-]+) ([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/;
 const ROUTE_COMMAND=/^\/ezer use ([^\s]+) ([a-zA-Z0-9:_-]+)$/;
+const READ_COMMAND=/^\/ezer (help|status)$/;
+const READ_COMMAND_PREFIX=/^\/ezer (?:help|status)(?:\s|$)/i;
 const ROUTE_COMMAND_PREFIX=/^\/ezer use(?:\s|$)/i;
 const PAUSE_COMMAND_PREFIX=/^\/ezer (?:pause|resume)(?:\s|$)/i;
 const PLAN_COMMAND_PREFIX=/^\/ezer (?:approve|retry)(?:\s|$)/;
 const STOP_COMMAND=/^\/ezer stop ([^\s]+)$/;
 const OWNER_COMMAND_PREFIX=/^\/ezer accept-review-stop(?:\s|$)/;
 const COMMENT_PAGE_SIZE=100;
-interface Options{enabled:boolean;stopEnabled?:boolean;planControlEnabled?:boolean;pauseEnabled?:boolean;routeEnabled?:boolean;baseUrl:string;secret:string;fetchImpl?:typeof fetch;now?:()=>Date;replyMalformed?:(event:Record<string,unknown>,deliveryId:string)=>Promise<void>;}
+const READ_SESSION_NAMESPACE='github-issue';
+interface Options{enabled:boolean;stopEnabled?:boolean;planControlEnabled?:boolean;pauseEnabled?:boolean;routeEnabled?:boolean;readEnabled?:boolean;baseUrl:string;secret:string;fetchImpl?:typeof fetch;now?:()=>Date;replyMalformed?:(event:Record<string,unknown>,deliveryId:string)=>Promise<void>;onReadback?:(result:Record<string,unknown>)=>Promise<void>;}
 function object(value:unknown):Record<string,unknown>{return value!==null&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};}
+async function relay(event:Record<string,unknown>,eventType:string,deliveryId:string,installationId:unknown,options:Options):Promise<Record<string,unknown>>{
+ if(options.secret.length<OWNER_RELAY_SECRET_MIN_LENGTH||!options.baseUrl)throw new Error('OWNER_RELAY_CONFIGURATION_MISSING');
+ const raw=JSON.stringify({kind:'propr-relay-owner-event',version:1,deliveryId,eventType,installationId:String(installationId),issuedAt:(options.now?.()??new Date()).toISOString(),payload:event});
+ const response=await(options.fetchImpl??fetch)(`${options.baseUrl.replace(/\/+$/,'')}${OWNER_RELAY_PATH}`,{method:'POST',headers:{'content-type':'application/json','x-ezer-relay-signature':`sha256=${createHmac('sha256',options.secret).update(raw).digest('hex')}`},body:raw,signal:AbortSignal.timeout(OWNER_RELAY_TIMEOUT_MS),redirect:'error'});
+ if(!response.ok)throw new Error(`OWNER_RELAY_HTTP_${response.status}`);
+ const receipt=object(await response.json());
+ if(receipt.accepted!==true)throw new Error('OWNER_RELAY_OPERATION_NOT_ACCEPTED');
+ return receipt;
+}
 /** Ordinary issue feedback, not owner authentication or execution. Never guesses missing binding bytes. */
 export async function replyMalformedOwnerCommand(event:Record<string,unknown>,deliveryId:string,providedApi?:Pick<PaginatedOctokitInstance,'request'|'paginate'>):Promise<void>{
  const comment=object(event.comment),issue=object(event.issue),actor=object(comment.user);
@@ -45,10 +58,20 @@ export async function replyMalformedOwnerCommand(event:Record<string,unknown>,de
  // Failed readback or ambiguous POST propagates to existing delivery retry; no blind POST loop.
  await reply();
 }
-export async function forwardRoutingOwnerEvent(payload:unknown,eventType:string,deliveryId:string,installationId:unknown,options:Options={enabled:process.env.EZER_OWNER_RELAY_ENABLED==='true',stopEnabled:process.env.EZER_OWNER_STOP_ENABLED==='true',planControlEnabled:process.env.EZER_OWNER_PLAN_CONTROL_ENABLED==='true',pauseEnabled:process.env.EZER_OWNER_PAUSE_ENABLED==='true',routeEnabled:process.env.EZER_OWNER_ROUTE_ENABLED==='true',baseUrl:process.env.EZER_OWNER_RELAY_BASE_URL??'',secret:process.env.EZER_INTERNAL_API_SECRET??''}):Promise<boolean>{
+export async function forwardRoutingOwnerEvent(payload:unknown,eventType:string,deliveryId:string,installationId:unknown,options:Options={enabled:process.env.EZER_OWNER_RELAY_ENABLED==='true',stopEnabled:process.env.EZER_OWNER_STOP_ENABLED==='true',planControlEnabled:process.env.EZER_OWNER_PLAN_CONTROL_ENABLED==='true',pauseEnabled:process.env.EZER_OWNER_PAUSE_ENABLED==='true',routeEnabled:process.env.EZER_OWNER_ROUTE_ENABLED==='true',readEnabled:process.env.EZER_OWNER_READ_ENABLED==='true',baseUrl:process.env.EZER_OWNER_RELAY_BASE_URL??'',secret:process.env.EZER_INTERNAL_API_SECRET??''}):Promise<boolean>{
  const event=object(payload),comment=object(event.comment),repository=object(event.repository),installation=object(event.installation);
  if(eventType!=='issue_comment'||typeof comment.body!=='string')return false;
  const body=comment.body.trim(),isStop=STOP_COMMAND.test(body),isManifest=MANIFEST_COMMAND.test(body),isRetry=RETRY_COMMAND.test(body),isPlanControl=PLAN_COMMAND_PREFIX.test(body),isPauseControl=PAUSE_COMMAND_PREFIX.test(body),isRouteControl=ROUTE_COMMAND_PREFIX.test(body);
+ if(READ_COMMAND_PREFIX.test(body)){
+  if(!options.enabled||!options.readEnabled)throw Error('OWNER_READ_RELAY_NOT_ENABLED');
+  const command=READ_COMMAND.exec(body);
+  if(!command||event.action!=='created'||repository.full_name!==STOP_REPOSITORY||object(event.issue).pull_request||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)throw Error('OWNER_READ_DELIVERY_NOT_BOUND');
+  const receipt=await relay(event,eventType,deliveryId,installationId,options),correlation=object(receipt.correlation),result=object(receipt.result),links=object(result.links),issue=object(event.issue);
+  const sessionId=`${READ_SESSION_NAMESPACE}:${repository.id}:${issue.id}`;
+  if(!Number.isSafeInteger(repository.id)||!Number.isSafeInteger(issue.id)||typeof receipt.operationId!=='string'||correlation.operationId!==receipt.operationId||result.operationId!==receipt.operationId||correlation.repository!==STOP_REPOSITORY||correlation.issueNumber!==issue.number||correlation.commentId!==comment.id||correlation.sessionId!==sessionId||links.sessionId!==sessionId||result.state!=='SUCCEEDED'||links.command!==command[1]||typeof links.text!=='string')throw Error('OWNER_READ_REPLY_NOT_BOUND');
+  if(options.onReadback)await options.onReadback(receipt);else log.info({deliveryId,readback:receipt},'Ezer authenticated native read settled');
+  return true;
+ }
  if(!isStop&&!isPlanControl&&!isPauseControl&&!isRouteControl&&!OWNER_COMMAND_PREFIX.test(body))return false;
  if(isRouteControl){
   if(event.action!=='created'||repository.full_name!==STOP_REPOSITORY||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)throw new Error('OWNER_RELAY_DELIVERY_NOT_BOUND');
@@ -67,12 +90,6 @@ export async function forwardRoutingOwnerEvent(payload:unknown,eventType:string,
  if(isManifest&&!object(event.issue).pull_request)throw new Error('OWNER_MANIFEST_CONTRACT_PR_REQUIRED');
  if(isStop&&object(event.issue).pull_request){await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);return true;}
  if(!isStop&&!isPlanControl&&!isPauseControl&&!isRouteControl&&!OWNER_COMMAND.test(body)){await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);return true;}
- if(options.secret.length<OWNER_RELAY_SECRET_MIN_LENGTH||!options.baseUrl)throw new Error('OWNER_RELAY_CONFIGURATION_MISSING');
- const envelope={kind:'propr-relay-owner-event',version:1,deliveryId,eventType,installationId:String(installationId),issuedAt:(options.now?.()??new Date()).toISOString(),payload:event};
- const raw=JSON.stringify(envelope);
- const response=await(options.fetchImpl??fetch)(`${options.baseUrl.replace(/\/+$/,'')}${OWNER_RELAY_PATH}`,{method:'POST',headers:{'content-type':'application/json','x-ezer-relay-signature':`sha256=${createHmac('sha256',options.secret).update(raw).digest('hex')}`},body:raw,signal:AbortSignal.timeout(OWNER_RELAY_TIMEOUT_MS)});
- if(!response.ok)throw new Error(`OWNER_RELAY_HTTP_${response.status}`);
- const receipt=object(await response.json());
- if(receipt.accepted!==true)throw new Error('OWNER_RELAY_OPERATION_NOT_ACCEPTED');
+ await relay(event,eventType,deliveryId,installationId,options);
  return true;
 }

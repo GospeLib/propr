@@ -4,6 +4,20 @@ import {createHmac} from 'node:crypto';
 import {forwardRoutingOwnerEvent,replyMalformedOwnerCommand} from '../src/intake/routingOwnerEvent.js';
 import type {PaginatedOctokitInstance} from '../src/auth/githubAuth.js';
 const secret='owner-relay-test-secret-at-least-32-bytes',deliveryId='real-routing-delivery-1234',installationId='161226896';
+test('native read relay validates correlated settlement and never writes a GitHub reply',async()=>{
+ const payload={...fixture(),repository:{id:10,full_name:'GospeLib/main'},issue:{id:20,number:90},comment:{id:66,body:'/ezer help'}};
+ let writes=0,readbacks=0;
+ const options={enabled:true,readEnabled:true,baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{writes++;},onReadback:async(value:Record<string,unknown>)=>{readbacks++;assert.equal(value.operationId,'read-operation');},fetchImpl:async()=>Response.json({accepted:true,operationId:'read-operation',correlation:{repository:'GospeLib/main',issueNumber:90,commentId:66,operationId:'read-operation',sessionId:'github-issue:10:20'},result:{operationId:'read-operation',state:'SUCCEEDED',links:{command:'help',text:'Commands you can invoke:',sessionId:'github-issue:10:20'}}})};
+ assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),true);
+ assert.equal(writes,0);assert.equal(readbacks,1);
+ await assert.rejects(()=>forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{...options,readEnabled:false}),/OWNER_READ_RELAY_NOT_ENABLED/);
+ await assert.rejects(()=>forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{...options,fetchImpl:async()=>Response.json({accepted:true})}),/OWNER_READ_REPLY_NOT_BOUND/);
+ const good=await(await options.fetchImpl()).json();
+ for(const changes of [{sessionId:'github-issue:10:21'},{commentId:67},{issueNumber:91},{repository:'other/repo'},{operationId:'other-operation'}]){
+  await assert.rejects(()=>forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{...options,fetchImpl:async()=>Response.json({...good,correlation:{...good.correlation,...changes}})}),/OWNER_READ_REPLY_NOT_BOUND/);
+ }
+ assert.equal(writes,0);
+});
 function fixture(){return{action:'created',installation:{id:161226896},repository:{full_name:'GospeLib/product-hub'},comment:{body:`/ezer accept-review-stop stop:abcd ${'a'.repeat(40)} sha256:${'b'.repeat(64)} 55`}};}
 test('forwards original authenticated delivery metadata and exact payload with explicit attestation only',async()=>{
  const payload=fixture();let calls=0;

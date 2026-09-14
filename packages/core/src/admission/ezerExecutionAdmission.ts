@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { Redis } from 'ioredis';
+import { requireStoryExecutionContract, type StoryExecutionContract } from './storyExecutionContract.js';
 
 const TOKEN_PART_COUNT = 2;
 const SIGNATURE_ALGORITHM = 'sha256';
@@ -91,6 +92,7 @@ function requireExecutionRoute(value:unknown):ExecutionRouteBinding {
 }
 
 export interface ExecutionAdmissionClaims {
+    storyExecution?: StoryExecutionContract;
   route?: ExecutionRouteBinding;
     control?: StopAdmissionBinding;
     artifactCorrection?: TypedArtifactCorrection;
@@ -192,6 +194,7 @@ function parseClaims(encodedPayload: string): ExecutionAdmissionClaims {
     return {
         ...(candidate.route === undefined ? {} : {route:requireExecutionRoute(candidate.route)}),
     ...(candidate.control === undefined ? {} : {control:parseStopBinding(candidate.control)}),
+        ...(candidate.storyExecution === undefined ? {} : { storyExecution: requireStoryExecutionContract(candidate.storyExecution) }),
         ...(candidate.artifactCorrection === undefined ? {} : { artifactCorrection: requireTypedArtifactCorrection(candidate.artifactCorrection) }),
         ...(candidate.typedWork === undefined ? {} : { typedWork: requireTypedInvestigation(candidate.typedWork) }),
         ...(candidate.comment === undefined ? {} : { comment: parseCommentBinding(candidate.comment) }),
@@ -237,6 +240,9 @@ function verifySignature(encodedPayload: string, presentedSignature: string, sig
 }
 
 function validateClaims(claims: ExecutionAdmissionClaims, expected: ExpectedExecution, nowMs: number): number {
+    if (claims.storyExecution && (claims.control || claims.comment || claims.typedWork || claims.artifactCorrection ||
+        claims.target !== claims.storyExecution.targetBranch || JSON.stringify(claims.scope) !== JSON.stringify(claims.storyExecution.allowedPaths)))
+        refuse('story-execution-authority-mismatch');
     if(JSON.stringify(claims.control)!==JSON.stringify(expected.control===undefined?undefined:parseStopBinding(expected.control)))refuse('wrong-stop-control');
     if(claims.route&&(claims.control||claims.comment||claims.artifactCorrection))refuse('route-authority-mismatch');
     if(claims.route&&claims.typedWork&&(claims.typedWork.provider!==claims.route.provider||claims.typedWork.model!==claims.route.model))refuse('route-typed-mismatch');
@@ -280,6 +286,7 @@ export async function consumeExecutionAdmission(input: {
         repository: claims.repository,
         issueNumber: claims.issueNumber,
         target: claims.target,
+        ...(claims.storyExecution === undefined ? {} : { storyExecution: claims.storyExecution }),
         ...(claims.storyId === `${claims.epicId}:integration:${claims.authorityDigest}` ? {integrationDigest:claims.authorityDigest} : {}),
         ...(claims.route === undefined ? {} : {route:claims.route}),
         ...(claims.control === undefined ? {} : {control:claims.control}),
@@ -298,6 +305,8 @@ export async function verifyWorkerAdmissionReceipt(input: {
     expectedRoute?: {agentId:string;agentAlias:string;provider:string;model:string};
     expectedIntegrationDigest?: string;
     onArtifactCorrection?: (binding: TypedArtifactCorrection) => void;
+    requireStoryExecution?: boolean;
+    onStoryExecution?: (binding: StoryExecutionContract) => void;
 }): Promise<TypedInvestigationAdmission | undefined> {
     const stored = await input.store.take(input.receipt.receiptKey);
     if (!stored) refuse('missing-worker-receipt');
@@ -320,6 +329,12 @@ export async function verifyWorkerAdmissionReceipt(input: {
       if(JSON.stringify(input.receipt.route)!==JSON.stringify(route))refuse('selected-route-receipt-changed');
     } else if(input.receipt.route!==undefined)refuse('unsigned-selected-route');
     const typed = value.typedWork === undefined ? undefined : requireTypedInvestigation(value.typedWork);
+    if (value.storyExecution !== undefined) {
+        const execution = requireStoryExecutionContract(value.storyExecution);
+        if (typed || value.comment || value.artifactCorrection || value.integrationDigest || execution.targetBranch !== value.target)
+            refuse('story-execution-authority-mismatch');
+        input.onStoryExecution?.(execution);
+    } else if (input.requireStoryExecution && !typed) refuse('story-execution-contract-required');
     if (typed && Date.parse(typed.deadline) <= Date.now()) refuse('typed-deadline-exceeded');
     if (value.artifactCorrection !== undefined) {
         const correction = requireTypedArtifactCorrection(value.artifactCorrection);

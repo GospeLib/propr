@@ -1,6 +1,7 @@
 import type { Logger } from 'pino';
 import { setTimeout } from 'timers/promises';
 import type { ClaudeCodeResponse } from '@propr/core';
+import { verifyStoryPublication, type StoryExecutionContract } from '@propr/core';
 import type { WorktreeInfo, CommitResult, WorkerStateManager } from '@propr/core';
 import { cleanupWorktree, commitChanges, pushBranch, TaskStates, describeAgentTermination, resolveAgentTerminationReason } from '@propr/core';
 import { getAuthenticatedOctokit, linkPRToPlanIssue } from '@propr/core';
@@ -97,6 +98,7 @@ type Octokit = {
 };
 
 export interface PostProcessOptions {
+    execution?: StoryExecutionContract;
     octokit: Octokit;
     issueRef: IssueJobData;
     worktreeInfo: WorktreeInfo;
@@ -178,6 +180,7 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
     const { octokit, issueRef, worktreeInfo, currentIssueData, claudeResult, modelName, repoValidation, repoUrl, githubToken, PR_LABEL, AI_PROCESSING_TAG, AI_DONE_TAG, correlatedLogger, taskId, stateManager } = options;
     let commitResult: CommitResult | null = null;
     let postProcessingResult: PostProcessingResult | null = null;
+    if (options.execution) await verifyStoryPublication(worktreeInfo.worktreePath, options.execution);
 
     try {
         if (!hasPublishableAgentWork(claudeResult)) {
@@ -201,7 +204,7 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
         commitResult = await commitChanges(
             worktreeInfo.worktreePath, commitMessage,
             AI_COMMIT_AUTHOR,
-            { issueNumber: issueRef.number, issueTitle: currentIssueData.data.title }
+            { issueNumber: issueRef.number, issueTitle: currentIssueData.data.title, execution: options.execution }
         );
 
         claudeResult.modifiedFiles = commitResult?.filesChanged || claudeResult.modifiedFiles;
@@ -213,7 +216,7 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
             return { commitResult, postProcessingResult };
         }
 
-        await pushBranch(worktreeInfo.worktreePath, worktreeInfo.branchName, { repoUrl, authToken: githubToken.token });
+        await pushBranch(worktreeInfo.worktreePath, worktreeInfo.branchName, { repoUrl, authToken: githubToken.token, execution: options.execution });
 
         correlatedLogger.debug('Waiting for branch propagation...');
         await setTimeout(3000);
@@ -229,7 +232,7 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
 
         // Self-heal a deleted epic base branch (e.g. after its Epic PR was
         // closed) so the child PR isn't rejected with base "invalid" on rerun.
-        if (issueRef.baseBranch) {
+        if (issueRef.baseBranch && !options.execution) {
             await ensureEpicBaseBranchExists(octokit, {
                 owner: issueRef.repoOwner,
                 repo: issueRef.repoName,
@@ -243,6 +246,19 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
             octokit, issueRef, worktreeInfo,
             { commitResult, claudeResult, modelName, repoValidation, PR_LABEL, correlatedLogger, issueTitle: currentIssueData.data.title }
         );
+        if (options.execution) {
+            const prNumber = postProcessingResult?.pr?.number;
+            if (!prNumber) throw Error('STORY_EXECUTION_PR_REQUIRED');
+            const { data: current } = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+                owner: issueRef.repoOwner, repo: issueRef.repoName, pull_number: prNumber }) as {
+                    data: { head?: { sha?: string; ref?: string; repo?: { full_name?: string } };
+                        base?: { ref?: string; repo?: { full_name?: string } }; merged?: boolean; state?: string } };
+            const repository = `${issueRef.repoOwner}/${issueRef.repoName}`;
+            if (current.head?.sha !== commitResult.commitHash || current.head.ref !== options.execution.featureBranch ||
+                current.head.repo?.full_name !== repository || current.base?.repo?.full_name !== repository ||
+                current.base.ref !== options.execution.targetBranch || current.merged !== false || current.state !== 'open')
+                throw Error('STORY_EXECUTION_PUBLICATION_CHANGED');
+        }
 
         // Update plan issue status to 'under_review' if PR was created successfully
         if (postProcessingResult?.pr?.number) {
@@ -260,6 +276,7 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
         );
 
     } catch (postProcessingError) {
+        if (options.execution) throw postProcessingError;
         // A completed execution or an actual commit can be marked done during
         // fallback. A failed/interrupted run with no commit must remain retryable.
         const canMarkDone = claudeResult.success || commitResult !== null;

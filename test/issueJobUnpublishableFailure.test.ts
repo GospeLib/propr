@@ -13,6 +13,7 @@ await mock.module('@propr/core', {
         cleanupWorktree: mock.fn(async () => undefined),
         commitChanges,
         pushBranch,
+        verifyStoryPublication: mock.fn(async () => []),
         AI_COMMIT_AUTHOR: { name: 'ProPR AI', email: 'ai@propr.dev' },
         TaskStates: { CANCELLED: 'cancelled' },
         describeAgentTermination: mock.fn(() => 'Agent stopped.'),

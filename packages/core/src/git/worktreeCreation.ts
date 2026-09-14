@@ -14,6 +14,7 @@ import {
 import { createHooklessGit } from './hooklessGit.js';
 import { assertRepositoryClonePath } from './repositoryPaths.js';
 import { redactAuthenticatedGitUrl } from './repoBranching.js';
+import { requireStoryExecutionContract, type StoryExecutionContract } from '../admission/storyExecutionContract.js';
 
 const CLONES_BASE_PATH = process.env.GIT_CLONES_BASE_PATH || '/tmp/git-processor/clones';
 
@@ -30,9 +31,17 @@ export async function addWorktreeWithoutTracking(
     options: {
         startPoint: string;
         resetBranch?: boolean;
+        execution?: StoryExecutionContract;
     },
 ): Promise<string> {
     const { startPoint, resetBranch = false } = options;
+    if (options.execution) {
+        const execution = requireStoryExecutionContract(options.execution);
+        if (branchName !== execution.featureBranch || resetBranch) throw Error('STORY_EXECUTION_BRANCH_CHANGED');
+        if (startPoint !== execution.baseSha) throw Error('STORY_EXECUTION_BASE_CHANGED');
+        if ((await git.revparse([`${execution.baseSha}^{commit}`])).trim() !== execution.baseSha)
+            throw Error('STORY_EXECUTION_BASE_CHANGED');
+    }
     return git.raw([
         'worktree',
         'add',

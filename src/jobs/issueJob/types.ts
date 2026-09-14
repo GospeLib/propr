@@ -27,6 +27,7 @@ export interface JobContext {
   /** True only after the signed, single-use Ezer worker receipt was consumed successfully. */
   ezerAdmissionVerified?: boolean;
   typedInvestigation?: import('@propr/core').TypedInvestigationAdmission;
+  storyExecution?: import('@propr/core').StoryExecutionContract;
 }
 
 export interface CurrentIssueData {

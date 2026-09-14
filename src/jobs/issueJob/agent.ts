@@ -131,6 +131,9 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
   });
 
   const typed = context.typedInvestigation;
+  const storyPrompt = context.storyExecution
+    ? `${prompt}\n\nEzer signed story execution contract: ${JSON.stringify(context.storyExecution)}. Only edit the exact allowedPaths. Keep the admitted base and branch unchanged. Run repository checks inside this sandbox and report their actual results; never bypass checks or claim unrun validation. Leave commit, push, and PR publication to ProPR. Do not merge or approve anything.`
+    : prompt;
   if(typed?.provider&&agent.config.type!==typed.provider)throw new Error('TYPED_PROVIDER_ROUTE_MISMATCH');
   if(typed?.model&&modelName!==typed.model)throw new Error('TYPED_MODEL_ROUTE_MISMATCH');
   const remainingMs = typed ? Date.parse(typed.deadline) - Date.now() : undefined;
@@ -146,7 +149,7 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
     agentResult = await agent.executeTask({
       worktreePath: worktreeInfo.worktreePath,
       issueRef: agentIssueRef,
-      prompt: typed ? `${prompt}\n\nEzer signed typed investigation: ${typed.kind}; item ${typed.itemId}. This is NOT implementation authority. Only create ${typed.outputPath}, the ${typed.outputKind}. Use the required artifact sections stated in the admitted issue; recommendations are not owner decisions. Do not change any other file, merge, approve, or claim a unit outcome. Deadline ${typed.deadline}.` : prompt,
+      prompt: typed ? `${prompt}\n\nEzer signed typed investigation: ${typed.kind}; item ${typed.itemId}. This is NOT implementation authority. Only create ${typed.outputPath}, the ${typed.outputKind}. Use the required artifact sections stated in the admitted issue; recommendations are not owner decisions. Do not change any other file, merge, approve, or claim a unit outcome. Deadline ${typed.deadline}.` : storyPrompt,
       timeoutMs: remainingMs,
       disableOptionalStorybookMcp: Boolean(typed) && agent.config.type === 'codex' && process.env.PROPR_TYPED_STORYBOOK_MCP_UNAVAILABLE === 'true',
       model: modelName,

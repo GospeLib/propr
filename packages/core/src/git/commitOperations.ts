@@ -1,4 +1,6 @@
 import { SimpleGit, StatusResult, FileStatusResult } from 'simple-git';
+import type { StoryExecutionContract } from '../admission/storyExecutionContract.js';
+import { verifyStoryPublication } from './storyPublication.js';
 import fs from 'fs-extra';
 import path from 'path';
 import logger from '../utils/logger.js';
@@ -20,6 +22,7 @@ interface CommitMessageObject {
 }
 
 interface CommitOptions {
+    execution?: StoryExecutionContract;
     issueNumber?: number;
     issueTitle?: string;
 }
@@ -111,6 +114,7 @@ export async function commitChanges(worktreePath: string, commitMessage: string 
     }
 
     const git: SimpleGit = createHooklessGit(worktreePath);
+    if (options.execution) await verifyStoryPublication(worktreePath, options.execution);
     logger.debug({ worktreePath, issueNumber }, 'Initializing git operations in worktree');
 
     try {
@@ -144,7 +148,11 @@ export async function commitChanges(worktreePath: string, commitMessage: string 
 
         const finalCommitMessage = resolveCommitMessage(commitMessage, issueNumber, issueTitle);
 
+        const priorHead = options.execution ? (await git.revparse(['HEAD'])).trim() : undefined;
         const result = await git.commit(finalCommitMessage);
+        if (options.execution && (!result.commit || (await git.revparse(['HEAD'])).trim() === priorHead))
+            throw new Error('STORY_EXECUTION_COMMIT_NOT_CREATED');
+        if (options.execution) await verifyStoryPublication(worktreePath, options.execution);
         const commitHash = result.commit.replace(/^HEAD\s+/, '');
 
         logger.info({ worktreePath, commitHash, filesChanged: status.files.length, issueNumber, commitMessage: finalCommitMessage }, 'Changes committed successfully');

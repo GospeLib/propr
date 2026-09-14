@@ -6,9 +6,10 @@ import {
   verifyWorkerAdmissionReceipt,
   type IssueJobData,
   type TypedInvestigationAdmission,
+  type StoryExecutionContract,
 } from '@propr/core';
 
-export async function verifyConfiguredEzerAdmission(issueRef: IssueJobData, onTyped?: (typed: TypedInvestigationAdmission) => void): Promise<boolean> {
+export async function verifyConfiguredEzerAdmission(issueRef: IssueJobData, onTyped?: (typed: TypedInvestigationAdmission) => void, onStoryExecution?: (execution: StoryExecutionContract) => void): Promise<boolean> {
   const repository = `${issueRef.repoOwner}/${issueRef.repoName}`;
   if (!requiresEzerExecutionAdmission({
     repository,
@@ -34,6 +35,8 @@ export async function verifyConfiguredEzerAdmission(issueRef: IssueJobData, onTy
       receipt: issueRef.executionAdmissionReceipt,
       expected: { repository, issueNumber: issueRef.number, target: issueRef.baseBranch ?? '' },
       store: createRedisAdmissionStore(admissionRedis),
+      requireStoryExecution: true,
+      onStoryExecution,
     });
     if (typed) onTyped?.(typed);
     return true;

@@ -1,4 +1,5 @@
 import { SimpleGit } from 'simple-git';
+import { requireStoryExecutionContract, type StoryExecutionContract } from '../admission/storyExecutionContract.js';
 import fs from 'fs-extra';
 import path from 'path';
 import { Octokit } from '@octokit/core';
@@ -210,6 +211,7 @@ interface IssueInfo {
 }
 
 interface CreateWorktreeOptions {
+    execution?: StoryExecutionContract;
     baseBranch?: string | null;
     octokit?: InstanceType<typeof Octokit> | null;
     modelName?: string | null;
@@ -225,6 +227,8 @@ export type WorktreeInfo = WorktreeResult;
 export async function createWorktreeForIssue(localRepoPath: string, issueInfo: IssueInfo, options: CreateWorktreeOptions = {}): Promise<WorktreeResult> {
     const { issueId, issueTitle, owner, repoName } = issueInfo;
     const { baseBranch = null, octokit = null, modelName = null } = options;
+    const execution = options.execution && requireStoryExecutionContract(options.execution);
+    if (execution && baseBranch !== execution.targetBranch) throw Error('STORY_EXECUTION_TARGET_CHANGED');
     assertRepositoryClonePath(localRepoPath, CLONES_BASE_PATH, owner, repoName);
 
     const sanitizedTitle = issueTitle.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').substring(0, 25);
@@ -234,7 +238,7 @@ export async function createWorktreeForIssue(localRepoPath: string, issueInfo: I
 
     const safeModelName = modelName ? sanitizeGeneratedNameComponent(modelName, 'model') : null;
     const branchModelPrefix = safeModelName ? `${safeModelName}-` : '';
-    const branchName = `${issueId}/${branchModelPrefix}${sanitizedTitle}-${shortTimestamp}-${randomString}`;
+    const branchName = execution?.featureBranch ?? `${issueId}/${branchModelPrefix}${sanitizedTitle}-${shortTimestamp}-${randomString}`;
     const modelSuffix = safeModelName ? `-${safeModelName}` : '';
     const worktreeDirName = `issue-${issueId}-${shortTimestamp}${modelSuffix}-${randomString}`;
     const worktreePath = getWorktreePath(owner, repoName, worktreeDirName);
@@ -243,6 +247,7 @@ export async function createWorktreeForIssue(localRepoPath: string, issueInfo: I
         const git: SimpleGit = createHooklessGit(localRepoPath);
 
         if (await fs.pathExists(worktreePath)) {
+            if (execution) throw Error('STORY_EXECUTION_WORKTREE_EXISTS');
             logger.warn({ worktreePath, issueId }, 'Worktree path already exists. Removing existing worktree...');
             await cleanupWorktree(localRepoPath, worktreePath, branchName);
         }
@@ -258,6 +263,7 @@ export async function createWorktreeForIssue(localRepoPath: string, issueInfo: I
                 await git.revparse([`origin/${resolvedBaseBranch}`]);
                 logger.info({ repo: `${owner}/${repoName}`, specifiedBranch: resolvedBaseBranch }, 'Using specified base branch');
             } catch (branchError) {
+                if (execution) throw Error('STORY_EXECUTION_TARGET_MISSING');
                 logger.warn({ repo: `${owner}/${repoName}`, specifiedBranch: resolvedBaseBranch, error: (branchError as Error).message }, 'Specified branch not found, detecting default branch');
                 resolvedBaseBranch = await detectDefaultBranch(git, owner, repoName, octokit);
             }
@@ -270,7 +276,11 @@ export async function createWorktreeForIssue(localRepoPath: string, issueInfo: I
         // delete worktree metadata for actively running tasks. Prune is still
         // called during cleanup in worktreeOperations.ts after task completion.
 
-        await cleanupExistingBranch(git, branchName);
+        if (execution) {
+            if ((await git.branchLocal()).all.includes(branchName) ||
+                (await git.raw(['ls-remote', '--heads', 'origin', `refs/heads/${branchName}`])).trim())
+                throw Error('STORY_EXECUTION_BRANCH_EXISTS');
+        } else await cleanupExistingBranch(git, branchName);
         // Use explicit refspec to ensure remote tracking ref is updated
         // Simple `git fetch origin <branch>` may only update FETCH_HEAD without
         // updating refs/remotes/origin/<branch> in some git configurations
@@ -292,7 +302,7 @@ export async function createWorktreeForIssue(localRepoPath: string, issueInfo: I
             git,
             worktreePath,
             branchName,
-            { startPoint: `origin/${resolvedBaseBranch}` },
+            { startPoint: execution?.baseSha ?? `origin/${resolvedBaseBranch}`, ...(execution ? { execution } : {}) },
         );
         await setupWorktreePermissions(worktreePath, branchName, issueId);
         await addToSafeDirectories(git, worktreePath, localRepoPath, { branchName, issueId });

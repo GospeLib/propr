@@ -429,3 +429,5 @@ export { requireTypedInvestigation, type TypedInvestigationAdmission } from './a
 export { requireTypedArtifactCorrection, type TypedArtifactCorrection } from './admission/ezerExecutionAdmission.js';
 
 export type { StopAdmissionBinding } from './admission/ezerExecutionAdmission.js';
+export { requireStoryExecutionContract, type StoryExecutionContract } from './admission/storyExecutionContract.js';
+export { verifyStoryPublication } from './git/storyPublication.js';

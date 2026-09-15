@@ -91,7 +91,24 @@ function requireExecutionRoute(value:unknown):ExecutionRouteBinding {
  return {selectionId:String(v.selectionId),routeId:String(v.routeId),agentId:String(v.agentId),agentAlias:String(v.agentAlias),provider:String(v.provider),model:String(v.model),attemptOrdinal:Number(v.attemptOrdinal)};
 }
 
+export interface ExecutionDelegation {
+    grantId: string;
+    delegatePrincipalId: string;
+    delegateSessionId: string;
+    approvalPrincipalId: string;
+}
+function parseDelegation(input: unknown): ExecutionDelegation {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) refuse('invalid-execution-delegation');
+    const value = input as Record<string, unknown>;
+    return {
+        grantId: requiredString(value.grantId, 'missing-delegation-grant'),
+        delegatePrincipalId: requiredString(value.delegatePrincipalId, 'missing-delegation-principal'),
+        delegateSessionId: requiredString(value.delegateSessionId, 'missing-delegation-session'),
+        approvalPrincipalId: requiredString(value.approvalPrincipalId, 'missing-delegation-approval-principal'),
+    };
+}
 export interface ExecutionAdmissionClaims {
+    delegatedAuthority?: ExecutionDelegation;
     storyExecution?: StoryExecutionContract;
   route?: ExecutionRouteBinding;
     control?: StopAdmissionBinding;
@@ -115,6 +132,7 @@ export interface ExecutionAdmissionClaims {
 }
 
 export interface WorkerAdmissionReceipt {
+    delegatedAuthority?: ExecutionDelegation;
     route?: ExecutionRouteBinding;
     admissionId: string;
     operationId: string;
@@ -194,6 +212,7 @@ function parseClaims(encodedPayload: string): ExecutionAdmissionClaims {
     }
     if (!Number.isSafeInteger(candidate.issueNumber) || Number(candidate.issueNumber) < 1) refuse('invalid-issue');
     return {
+        ...(candidate.delegatedAuthority === undefined ? {} : { delegatedAuthority: parseDelegation(candidate.delegatedAuthority) }),
         ...(candidate.route === undefined ? {} : {route:requireExecutionRoute(candidate.route)}),
     ...(candidate.control === undefined ? {} : {control:parseStopBinding(candidate.control)}),
         ...(candidate.storyExecution === undefined ? {} : { storyExecution: requireStoryExecutionContract(candidate.storyExecution) }),
@@ -283,6 +302,7 @@ export async function consumeExecutionAdmission(input: {
     const consumedKey = `${CONSUMED_KEY_PREFIX}${claims.admissionId}`;
     const receiptKey = `${RECEIPT_KEY_PREFIX}${claims.admissionId}`;
     const receiptValue = JSON.stringify({
+        ...(claims.delegatedAuthority === undefined ? {} : { delegatedAuthority: claims.delegatedAuthority }),
         admissionId: claims.admissionId,
         operationId: claims.operationId,
         storyId: claims.storyId,
@@ -298,7 +318,7 @@ export async function consumeExecutionAdmission(input: {
         ...(claims.comment === undefined ? {} : { comment: claims.comment }),
     });
     if (!await input.store.consumeAndIssue(consumedKey, receiptKey, receiptValue, ttlSeconds)) refuse('replayed-admission');
-    return { claims, receipt: { ...(claims.route ? {route:claims.route} : {}), admissionId: claims.admissionId, operationId: claims.operationId, storyId: claims.storyId, receiptKey } };
+    return { claims, receipt: { ...(claims.delegatedAuthority ? { delegatedAuthority: claims.delegatedAuthority } : {}), ...(claims.route ? {route:claims.route} : {}), admissionId: claims.admissionId, operationId: claims.operationId, storyId: claims.storyId, receiptKey } };
 }
 
 interface WorkerReceiptVerification {
@@ -334,6 +354,8 @@ function validateWorkerAdmissionReceipt(stored: string | null, input: WorkerRece
         refuse('malformed-worker-receipt');
     }
     if(value.control!==undefined)refuse('stop-control-cannot-start-worker');
+    const delegated = value.delegatedAuthority === undefined ? undefined : parseDelegation(value.delegatedAuthority);
+    if (JSON.stringify(delegated) !== JSON.stringify(input.receipt.delegatedAuthority)) refuse('delegation-receipt-changed');
     if (value.integrationDigest !== input.expectedIntegrationDigest) refuse('integration-worker-binding-changed');
     if (value.admissionId !== input.receipt.admissionId || value.operationId !== input.receipt.operationId ||
         value.storyId !== input.receipt.storyId) refuse('mismatched-worker-receipt');

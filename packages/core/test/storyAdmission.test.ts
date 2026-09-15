@@ -9,6 +9,8 @@ const SECRET = 'story-authority-test-secret-at-least-32-bytes';
 const SHA = 'a'.repeat(40);
 const EXECUTION = { baseSha: SHA, featureBranch: 'task/approved-story', targetBranch: 'stage', allowedPaths: ['docs/approved.md'] };
 const EXPECTED = { repository: 'GospeLib/main', issueNumber: 9001, target: 'stage' };
+const DELEGATION = { grantId: 'exact-grant', delegatePrincipalId: 'bootstrap-agent',
+  delegateSessionId: 'delegated-session', approvalPrincipalId: 'owner' };
 function fixture(overrides: Record<string, unknown> = {}) {
   const values = new Map<string, string>();
   const claims = { version: 1, admissionId: 'admission', operationId: 'operation', storyId: 'EP-story-S01',
@@ -33,6 +35,17 @@ test('ordinary worker receives only the exact signed stored contract, once', asy
   assert.deepEqual(binding, EXECUTION);
   await assert.rejects(verifyWorkerAdmissionReceipt({ receipt, store: f.store, expected: EXPECTED,
     requireStoryExecution: true }), /missing-worker-receipt/);
+});
+test('signed delegated identity survives admission and cannot be substituted on a worker receipt', async () => {
+  const f = fixture({ delegatedAuthority: DELEGATION });
+  const result = await consumeExecutionAdmission({ ...f, signingSecret: SECRET, expected: EXPECTED });
+  assert.deepEqual((result.claims as any).delegatedAuthority, DELEGATION);
+  assert.deepEqual((result.receipt as any).delegatedAuthority, DELEGATION);
+  assert.deepEqual(JSON.parse((await f.store.get(result.receipt.receiptKey))!).delegatedAuthority, DELEGATION);
+  await assert.rejects(admission.inspectWorkerAdmissionReceipt({ receipt: { ...result.receipt,
+    delegatedAuthority: { ...DELEGATION, delegatePrincipalId: 'owner' } } as any, store: f.store, expected: EXPECTED }), /delegation-receipt-changed/);
+  assert.notEqual(await f.store.get(result.receipt.receiptKey), null);
+  await admission.inspectWorkerAdmissionReceipt({ receipt: result.receipt, store: f.store, expected: EXPECTED });
 });
 test('preparation validates the signed contract without spending its single execution receipt', async () => {
   const f = fixture();

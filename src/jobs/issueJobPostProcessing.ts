@@ -17,6 +17,7 @@ import { buildStoryCommitMessage, buildStoryPublicationMetadata } from './public
 import { requireStoryPublicationPolicy } from './storyPublicationPolicy.js';
 import { AI_COMMIT_AUTHOR } from './commitAuthor.js';
 import type { GitHubToken } from './githubTypes.js';
+import { publishSignedStoryCommit } from './signedStoryPublication.js';
 
 type RepoValidation = RepoValidationResult;
 type PRValidation = PRValidationResult;
@@ -44,6 +45,7 @@ function hasPublishableAgentWork(claudeResult: ClaudeCodeResponse | null): boole
 }
 
 async function handleUnpublishableAgentFailure(options: {
+    internalRecovery?: boolean;
     octokit: Octokit;
     issueRef: IssueJobData;
     claudeResult: ClaudeCodeResponse;
@@ -64,6 +66,7 @@ async function handleUnpublishableAgentFailure(options: {
         throw new Error(`Failed to remove the processing label from issue #${issueRef.number}${details}`);
     }
 
+    if (options.internalRecovery) return { success: false, pr: null, updatedLabels: [], error: errorMessage };
     const completionComment = await generateCompletionComment(claudeResult, {
         number: issueRef.number,
         repoOwner: issueRef.repoOwner,
@@ -189,6 +192,7 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
     try {
         if (!hasPublishableAgentWork(claudeResult) || (options.execution !== undefined && !claudeResult.success)) {
             postProcessingResult = await handleUnpublishableAgentFailure({
+                internalRecovery: options.execution !== undefined,
                 octokit,
                 issueRef,
                 claudeResult,
@@ -199,12 +203,13 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
         }
 
         const completionNote = buildImplementationCompletionNote(claudeResult);
-        const signedStoryId = options.execution ? issueRef.executionAdmissionReceipt?.storyId : undefined;
+        const signedStoryId = options.execution ? options.execution.taskAssignment?.taskId ?? issueRef.executionAdmissionReceipt?.storyId : undefined;
         const taskLinkRequired = options.execution
             ? (await requireStoryPublicationPolicy({
                 worktreePath: worktreeInfo.worktreePath,
                 changedPaths: storyChangedPaths,
-                signedStoryId,
+                signedStoryId: issueRef.executionAdmissionReceipt?.storyId,
+                taskAssignment: options.execution?.taskAssignment,
             })).taskLinkRequired
             : false;
         let commitMessage = signedStoryId
@@ -212,7 +217,10 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
             : `fix(ai): Resolve issue #${issueRef.number} - ${currentIssueData.data.title.substring(0, 50)}\n\nImplemented by ProPR AI using ${modelName} model.\n\n${completionNote}`;
         if (!signedStoryId && claudeResult?.commitMessage) commitMessage = claudeResult.commitMessage;
 
-        commitResult = await commitChanges(
+        commitResult = options.execution?.taskAssignment ? await publishSignedStoryCommit({
+            octokit: octokit as never, owner: issueRef.repoOwner, repo: issueRef.repoName,
+            worktreePath: worktreeInfo.worktreePath, execution: options.execution, commitMessage,
+        }) : await commitChanges(
             worktreeInfo.worktreePath, commitMessage,
             AI_COMMIT_AUTHOR,
             { issueNumber: issueRef.number, issueTitle: currentIssueData.data.title, execution: options.execution }
@@ -227,7 +235,7 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
             return { commitResult, postProcessingResult };
         }
 
-        await pushBranch(worktreeInfo.worktreePath, worktreeInfo.branchName, { repoUrl, authToken: githubToken.token, execution: options.execution });
+        if (!options.execution?.taskAssignment) await pushBranch(worktreeInfo.worktreePath, worktreeInfo.branchName, { repoUrl, authToken: githubToken.token, execution: options.execution });
 
         correlatedLogger.debug('Waiting for branch propagation...');
         await setTimeout(3000);

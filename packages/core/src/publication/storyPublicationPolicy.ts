@@ -1,4 +1,5 @@
 import type { PaginatedOctokitInstance } from '../auth/githubAuth.js';
+import { requireTaskAssignment, type TaskAssignment } from '../admission/taskAssignment.js';
 
 const STORY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 export const STORY_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*-T[0-9]+$/;
@@ -15,6 +16,7 @@ const GITHUB_FILE_TYPE = 'file';
 const GITHUB_CONTENT_ENCODING = 'base64';
 
 export interface StoryPublicationPolicyInput {
+    taskAssignment?: TaskAssignment;
     changedPaths: readonly string[];
     signedStoryId: string | undefined;
     readFile: (path: string) => Promise<string | null>;
@@ -55,11 +57,19 @@ export async function requireStoryPublicationPolicyFromReader(
         if (pullRequestTemplate !== null) break;
     }
     const taskLinkRequired = storyPublicationTaskLinkRequired({ specLinkGatePresent, pullRequestTemplate });
-    requireStoryPublicationId(input.signedStoryId, taskLinkRequired);
+    const taskAssignment = input.taskAssignment ? requireTaskAssignment(input.taskAssignment) : undefined;
+    if (taskAssignment && !taskAssignment.taskId.startsWith(`${input.signedStoryId}-T`)) throw Error('STORY_PUBLICATION_TASK_SCOPE_CHANGED');
+    const publicationId = taskAssignment?.taskId ?? input.signedStoryId;
+    requireStoryPublicationId(publicationId, taskLinkRequired);
     if (!taskLinkRequired) return { taskLinkRequired };
 
-    const specLinkPath = storyPublicationSpecLinkPath(input.signedStoryId);
-    if (input.changedPaths.includes(specLinkPath)) throw new Error('STORY_PUBLICATION_SPEC_LINK_CHANGED');
+    const specLinkPath = storyPublicationSpecLinkPath(publicationId);
+    if (input.changedPaths.includes(specLinkPath) && !taskAssignment) throw new Error('STORY_PUBLICATION_SPEC_LINK_CHANGED');
+    if (taskAssignment) {
+        for (const artifact of taskAssignment.artifacts) {
+            if (!input.changedPaths.includes(artifact.path) || await input.readFile(artifact.path) !== artifact.content) throw Error('STORY_PUBLICATION_TASK_ARTIFACT_CHANGED');
+        }
+    }
     if (await input.readFile(specLinkPath) === null) {
         throw new Error('STORY_PUBLICATION_SPEC_LINK_REQUIRED');
     }
@@ -98,6 +108,7 @@ async function readRepositoryFileAtRevision(input: {
 }
 
 export async function requireStoryPublicationPolicyAtRevision(input: {
+    taskAssignment?: TaskAssignment;
     octokit: PaginatedOctokitInstance;
     repository: string;
     baseSha: string;
@@ -117,14 +128,20 @@ export async function requireStoryPublicationPolicyAtRevision(input: {
     if (revision.data.sha !== input.baseSha) throw new Error('STORY_PUBLICATION_BASE_REVISION_MISMATCH');
 
     return requireStoryPublicationPolicyFromReader({
+        ...(input.taskAssignment ? { taskAssignment: input.taskAssignment } : {}),
         changedPaths: input.changedPaths,
         signedStoryId: input.signedStoryId,
-        readFile: path => readRepositoryFileAtRevision({
+        readFile: async path => {
+          const existing = await readRepositoryFileAtRevision({
             octokit: input.octokit,
             owner,
             repo,
             path,
             baseSha: input.baseSha,
-        }),
+          });
+          const assigned = input.taskAssignment?.artifacts.find(artifact => artifact.path === path);
+          if (assigned && existing !== null && existing !== assigned.content) throw Error('STORY_PUBLICATION_EXISTING_TASK_ARTIFACT_CHANGED');
+          return existing ?? assigned?.content ?? null;
+        },
     });
 }

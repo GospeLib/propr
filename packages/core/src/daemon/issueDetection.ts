@@ -315,6 +315,7 @@ export async function processDetectedIssue(issue: DetectedIssue, correlationId: 
                         baseSha: claims.storyExecution.baseSha,
                         changedPaths: claims.storyExecution.allowedPaths,
                         signedStoryId: claims.storyId,
+                        taskAssignment: claims.storyExecution.taskAssignment,
                     });
                 },
             });

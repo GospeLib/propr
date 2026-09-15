@@ -11,6 +11,13 @@ const EXECUTION = { baseSha: SHA, featureBranch: 'task/approved-story', targetBr
 const EXPECTED = { repository: 'GospeLib/main', issueNumber: 9001, target: 'stage' };
 const DELEGATION = { grantId: 'exact-grant', delegatePrincipalId: 'bootstrap-agent',
   delegateSessionId: 'delegated-session', approvalPrincipalId: 'owner' };
+test('canonical task metadata is preserved as exact signed execution authority', () => {
+  const taskAssignment = { taskId: 'EP-story-S01-T01', artifacts: [
+    { path: 'specs/EP-story-S01/tasks.md', content: '# Tasks\n\n## T01: Complete docs\n', digest: 'sha256:1' },
+    { path: 'specs/EP-story-S01/link.md', content: '# Link\n', digest: 'sha256:2' },
+  ] };
+  assert.throws(() => requireStoryExecutionContract({ ...EXECUTION, taskAssignment }), /TASK_ASSIGNMENT_DIGEST/);
+});
 function fixture(overrides: Record<string, unknown> = {}) {
   const values = new Map<string, string>();
   const claims = { version: 1, admissionId: 'admission', operationId: 'operation', storyId: 'EP-story-S01',

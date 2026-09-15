@@ -292,12 +292,16 @@ export async function consumeExecutionAdmission(input: {
     expected: ExpectedExecution;
     store: AdmissionStore;
     nowMs?: number;
+    /** Runs only after signature and claim validation; rejection preserves the single-use admission. */
+    preConsumePolicy?: (claims: ExecutionAdmissionClaims) => Promise<void>;
 }): Promise<{ claims: ExecutionAdmissionClaims; receipt: WorkerAdmissionReceipt }> {
     const tokenParts = input.token.split('.');
     if (tokenParts.length !== TOKEN_PART_COUNT) refuse('malformed-admission');
     const [encodedPayload, signature] = tokenParts;
     verifySignature(encodedPayload, signature, input.signingSecret);
     const claims = parseClaims(encodedPayload);
+    validateClaims(claims, input.expected, input.nowMs ?? Date.now());
+    await input.preConsumePolicy?.(claims);
     const ttlSeconds = validateClaims(claims, input.expected, input.nowMs ?? Date.now());
     const consumedKey = `${CONSUMED_KEY_PREFIX}${claims.admissionId}`;
     const receiptKey = `${RECEIPT_KEY_PREFIX}${claims.admissionId}`;

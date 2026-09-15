@@ -13,7 +13,7 @@ const ensureDir = mock.fn(async () => undefined);
 const writeFile = mock.fn(async () => undefined);
 
 await mock.module('@propr/core', {
-    namedExports: { TaskStates: TASK_STATES },
+    namedExports: { ...publicationPolicy, TaskStates: TASK_STATES },
 });
 
 await mock.module('fs-extra', {
@@ -192,3 +192,4 @@ test('file observation cannot overlap and settlement aborts its live scan', asyn
     await Promise.resolve();
     assert.equal(scans, 1);
 });
+import * as publicationPolicy from '../packages/core/src/publication/index.js';

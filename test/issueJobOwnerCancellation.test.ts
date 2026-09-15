@@ -13,7 +13,7 @@ const createTaskState=mock.fn(async()=>undefined);
 const getTaskCancellation=mock.fn(async()=>({state:'cancelled',metadata:{controlAdmissionId:'actual-stop'}}));
 const stateManager={createTaskState,getTaskCancellation,getTaskState:async()=>({state:'cancelled'}),updateTaskState:mock.fn()};
 const context={taskId:'same-stopped-task',agentAlias:'default',modelName:'claude-test',stateManager,correlatedLogger:log,correlationId:'correlation',issueRef:{repoOwner:'owner',repoName:'repo',number:1},typedInvestigation:{provider:'claude',deadline:new Date(Date.now()+60_000).toISOString(),outputPath:'report.md'},ezerAdmissionVerified:true};
-await mock.module('@propr/core',{namedExports:{
+await mock.module('@propr/core',{namedExports:{ ...publicationPolicy,
  logger:log,TaskStates:states,AgentRegistry:{getInstance:()=>({getAgentByAlias:()=>agent})},generateClaudePrompt:()=>'',updateFileChangesFromWorktree:noOp,recordLLMMetrics:noOp,resolveAgentTerminationReason:noOp,
  ensureRepoCloned:noOp,getRepoUrl:noOp,safeAddLabel:noOp,safeRemoveLabel:noOp,ensureGitRepository:noOp,UsageLimitError:class extends Error{},validateRepositoryInfo:noOp,addModelSpecificDelay:noOp,withRetry:noOp,retryConfigs:{},updatePlanIssueTaskId:noOp,
 }});
@@ -58,3 +58,4 @@ test('a receipt consumed by another worker cannot reach the agent after preparat
  await assert.rejects(executeAgentAndRecordMetrics({worktreeInfo:{worktreePath:'/unused',branchName:'branch'},issueRef:{repoOwner:'owner',repoName:'repo',number:1},githubToken:{token:'test'},currentIssueData:{data:{body:'',title:'',labels:[]}},issueComments:[]} as never,prepared as never),/missing-worker-receipt/);
  assert.equal(executeTask.mock.callCount(),calls);
 });
+import * as publicationPolicy from '../packages/core/src/publication/index.js';

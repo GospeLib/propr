@@ -13,7 +13,7 @@ const updateTaskState = mock.fn(async () => undefined);
 const patchComment = mock.fn(async () => ({ data: { html_url: 'https://example.test/comment/1', body: 'completion' } }));
 
 await mock.module('@propr/core', {
-    namedExports: {
+    namedExports: { ...publicationPolicy,
         commitChanges,
         AI_COMMIT_AUTHOR: { name: 'ProPR AI', email: 'ai@propr.dev' },
         db: mock.fn(() => ({ where: mock.fn(() => ({ update: mock.fn(async () => undefined) })) })),
@@ -145,3 +145,4 @@ test('legacy unsigned follow-up semantics still publish explicitly partial work'
     assert.equal(patchComment.mock.callCount(), 1);
     assert.equal(updateTaskState.mock.callCount(), 1);
 });
+import * as publicationPolicy from '../packages/core/src/publication/index.js';

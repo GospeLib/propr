@@ -11,7 +11,7 @@ const context = { jobId: 'job', taskId: 'task', agentAlias: 'default', modelName
     executionAdmissionReceipt: { admissionId: 'admission', operationId: 'operation', receiptKey: 'receipt' },
     issuePayload: { title: 'story', labels: [] }, repoPayload: { defaultBranch: 'stage' } },
   stateManager: { getTaskCancellation: async () => undefined, createTaskState: noOp, updateTaskState: noOp } };
-await mock.module('@propr/core', { namedExports: { logger: log, TaskStates: { PROCESSING: 'processing', FAILED: 'failed' },
+await mock.module('@propr/core', { namedExports: { ...publicationPolicy, logger: log, TaskStates: { PROCESSING: 'processing', FAILED: 'failed' },
   ensureRepoCloned: async () => '/unused', getRepoUrl: () => 'https://example.invalid/repo', safeAddLabel: noOp,
   safeRemoveLabel: noOp, ensureGitRepository: noOp, UsageLimitError: class extends Error {},
   validateRepositoryInfo: noOp, addModelSpecificDelay: noOp, withRetry: noOp, retryConfigs: {}, updatePlanIssueTaskId: noOp } });
@@ -35,3 +35,4 @@ test('infrastructure failure before agent startup leaves receipt unspent and sup
   assert.equal(inspected.mock.callCount(), 1, 'the exact receipt must still authorize preparation');
   assert.equal(discard.mock.callCount(), 1, 'protected execution must not silently consume queue retry attempts');
 });
+import * as publicationPolicy from '../packages/core/src/publication/index.js';

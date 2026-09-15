@@ -12,6 +12,8 @@ import { isAuthorizedIssueTriggerActor } from './issueTriggerAuthorization.js';
 import type { DetectedIssue } from '../webhook/webhookHandler.js';
 import type { DeliveryDisposition } from '../intake/routingWebSocketProtocol.js';
 import { consumeExecutionAdmission, createRedisAdmissionStore, pendingExecutionAdmissionKey, requiresEzerExecutionAdmission } from '../admission/ezerExecutionAdmission.js';
+import { getAuthenticatedOctokit } from '../auth/githubAuth.js';
+import { requireStoryPublicationPolicyAtRevision } from '../publication/index.js';
 
 export type { DetectedIssue };
 
@@ -304,6 +306,17 @@ export async function processDetectedIssue(issue: DetectedIssue, correlationId: 
                 signingSecret,
                 expected: { repository: repoFullName, issueNumber: issue.number },
                 store: admissionStore,
+                preConsumePolicy: async claims => {
+                    if (!claims.storyExecution) return;
+                    const octokit = await getAuthenticatedOctokit();
+                    await requireStoryPublicationPolicyAtRevision({
+                        octokit,
+                        repository: claims.repository,
+                        baseSha: claims.storyExecution.baseSha,
+                        changedPaths: claims.storyExecution.allowedPaths,
+                        signedStoryId: claims.storyId,
+                    });
+                },
             });
             executionAdmissionReceipt = admission.receipt;
             admittedBaseBranch = admission.claims.target;

@@ -16,7 +16,7 @@ await mock.module('timers/promises', {
 });
 
 await mock.module('@propr/core', {
-    namedExports: {
+    namedExports: { ...publicationPolicy,
         cleanupWorktree: mock.fn(async () => undefined),
         commitChanges,
         pushBranch,
@@ -396,3 +396,4 @@ test('a repository task-link policy refuses a task whose story spec link is abse
         /STORY_PUBLICATION_SPEC_LINK_REQUIRED/,
     );
 });
+import * as publicationPolicy from '../packages/core/src/publication/index.js';

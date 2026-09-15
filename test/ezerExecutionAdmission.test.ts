@@ -129,6 +129,78 @@ describe('Ezer execution admission', () => {
     await assert.rejects(() => consumeExecutionAdmission(input), /replayed-admission/);
   });
 
+  test('runs an awaited policy against verified claims before atomic admission consumption', async () => {
+    const sharedStore = store();
+    let consumeCalls = 0;
+    const originalConsume = sharedStore.consumeAndIssue;
+    sharedStore.consumeAndIssue = async (...args) => {
+      consumeCalls++;
+      return originalConsume(...args);
+    };
+    const execution = {
+      baseSha: 'a'.repeat(40),
+      featureBranch: 'task/signed-story',
+      targetBranch: 'stage',
+      allowedPaths: ['src/complete.ts'],
+    };
+    let observedClaims: ExecutionAdmissionClaims | undefined;
+
+    await assert.rejects(() => consumeExecutionAdmission({
+      token: sign(claims({
+        storyId: 'EP-publication-policy-S01-T02',
+        target: execution.targetBranch,
+        scope: execution.allowedPaths,
+        storyExecution: execution,
+      })),
+      signingSecret: SIGNING_SECRET,
+      expected: { repository: 'GospeLib/main', issueNumber: 2260 },
+      store: sharedStore,
+      nowMs: NOW_MS,
+      preConsumePolicy: async verifiedClaims => {
+        observedClaims = verifiedClaims;
+        throw new Error('STORY_PUBLICATION_SPEC_LINK_REQUIRED');
+      },
+    }), /STORY_PUBLICATION_SPEC_LINK_REQUIRED/);
+
+    assert.equal(observedClaims?.repository, 'GospeLib/main');
+    assert.equal(observedClaims?.storyExecution?.baseSha, execution.baseSha);
+    assert.equal(consumeCalls, 0, 'policy refusal must preserve the single-use admission');
+  });
+
+  test('does not expose unsigned claims to policy and revalidates expiry after asynchronous policy work', async t => {
+    let policyCalls = 0;
+    let consumeCalls = 0;
+    const rejectingStore = store();
+    rejectingStore.consumeAndIssue = async () => {
+      consumeCalls++;
+      return true;
+    };
+    await assert.rejects(() => consumeExecutionAdmission({
+      token: sign(claims(), 'wrong-secret-with-at-least-thirty-two-bytes'),
+      signingSecret: SIGNING_SECRET,
+      expected: { repository: 'GospeLib/main', issueNumber: 2260 },
+      store: rejectingStore,
+      nowMs: NOW_MS,
+      preConsumePolicy: async () => { policyCalls++; },
+    }), /bad-signature/);
+    assert.equal(policyCalls, 0);
+
+    let currentTimeMs = NOW_MS;
+    t.mock.method(Date, 'now', () => currentTimeMs);
+    await assert.rejects(() => consumeExecutionAdmission({
+      token: sign(claims()),
+      signingSecret: SIGNING_SECRET,
+      expected: { repository: 'GospeLib/main', issueNumber: 2260 },
+      store: rejectingStore,
+      preConsumePolicy: async () => {
+        policyCalls++;
+        currentTimeMs = NOW_MS + 60_001;
+      },
+    }), /expired/);
+    assert.equal(policyCalls, 1);
+    assert.equal(consumeCalls, 0, 'expired admission must not be consumed after asynchronous preflight');
+  });
+
   for (const [name, mutation] of [
     ['bad-signature', () => sign(claims(), 'wrong-secret-with-at-least-thirty-two-bytes')],
     ['expired', () => sign(claims({ expiresAt: new Date(NOW_MS - 1).toISOString() }))],

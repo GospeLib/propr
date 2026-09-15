@@ -10,7 +10,7 @@ const verifyStoryPublication = mock.fn(async () => []);
 const pushBranch = mock.fn(async () => ({ rebased: false }));
 
 await mock.module('@propr/core', {
-    namedExports: {
+    namedExports: { ...publicationPolicy,
         createWorktreeForIssue: mock.fn(async (_repo: string, _issue: unknown, options: { execution?: unknown }) => {
             assert.ok(options.execution, 'the exact signed execution must create the worktree');
             return { worktreePath: policyWorktree, branchName: 'task/signed-story' };
@@ -90,3 +90,4 @@ test('missing signed story spec link refuses exact-base preparation before agent
 test('story-only authority cannot reach the agent when exact-base policy requires a signed task', async () => {
     await expectPreAgentPolicyRefusal('EP-publication-policy-S01', /STORY_PUBLICATION_TASK_ID_REQUIRED/);
 });
+import * as publicationPolicy from '../packages/core/src/publication/index.js';

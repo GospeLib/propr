@@ -135,7 +135,6 @@ const OPENCODE_CURRENT_MODELS = OPENCODE_MODELS.map(model => model.id);
 const RETIRED_OPENCODE_DEFAULT_MODELS = new Set([
     'opencode-minimax-m3-free'
 ]);
-const MANAGED_AGENT_IMAGE_PREFIX = 'propr/agent:';
 
 function migrateCliVersion(agent: AgentConfig): boolean {
     if (agent.cliVersionType) {

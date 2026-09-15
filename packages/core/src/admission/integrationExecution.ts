@@ -32,7 +32,7 @@ export async function validateCurrentIntegration(data: Pick<IntegrationJobData,'
     headers:{'content-type':'application/json',[SIGNATURE]:`sha256=${createHmac('sha256',secret).update(body).digest('hex')}`},
     body, signal:AbortSignal.timeout(TIMEOUT_MS) });
   if (!response.ok) throw Error(`INTEGRATION_AUTHORITY_REVALIDATION_${response.status}`);
-  const result = await response.json() as any;
+  const result = await response.json() as {valid?:unknown;executionDigest?:unknown;operationId?:unknown};
   if (result.valid !== true || result.executionDigest !== data.executionDigest || result.operationId !== data.operationId)
     throw Error('INTEGRATION_AUTHORITY_REVALIDATION_CHANGED');
 }
@@ -77,7 +77,7 @@ export async function executeIntegration(data: IntegrationJobData) {
     return {status:'complete',repository:p.repository,headSha,prNumber:pr.number,url:pr.html_url,executionDigest:data.executionDigest,
       operationId:data.operationId,admissionId:data.admissionId,stageMerge:false,worktree};
   } catch(error) {
-    const message = (error as Error).message.replace(/https:\/\/x-access-token:[^@\s'\"]+@/g,'https://x-access-token:[REDACTED]@').replace(/\b(?:ghs|ghp|github_pat)_[A-Za-z0-9_]+/g,'[REDACTED]');
+    const message = (error as Error).message.replace(/https:\/\/x-access-token:[^@\s'"]+@/g,'https://x-access-token:[REDACTED]@').replace(/\b(?:ghs|ghp|github_pat)_[A-Za-z0-9_]+/g,'[REDACTED]');
     throw Error(message);
   } finally { redis.disconnect(); }
 }

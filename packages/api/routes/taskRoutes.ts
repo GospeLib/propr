@@ -82,6 +82,7 @@ export function createTaskRoutes(deps: TaskRoutesDeps) {
       if (repository !== 'all' && issueNumberValidation.value !== undefined) {
         if (!taskQueue) throw new Error('Task queue unavailable for authoritative issue activity');
         const jobs = await taskQueue.getJobs(LIVE_ISSUE_JOB_STATES);
+        const globalLiveJobs = jobs.length;
         const liveJobs = jobs.filter(job => {
           const data = job.data;
           if (!data || typeof data.repoOwner !== 'string' || typeof data.repoName !== 'string') {
@@ -91,7 +92,7 @@ export function createTaskRoutes(deps: TaskRoutesDeps) {
             Number(data.number ?? data.prNumber) === issueNumberValidation.value;
         }).length;
         res.json({ ...result, queueActivity: { repository, issueNumber: issueNumberValidation.value,
-          observedAt: new Date().toISOString(), liveJobs } });
+          observedAt: new Date().toISOString(), liveJobs, globalLiveJobs } });
         return;
       }
       res.json(result);

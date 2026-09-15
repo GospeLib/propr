@@ -59,6 +59,7 @@ interface PostExecutionParams {
     redisClient: Redis;
     prProcessingLockKey: string;
     prProcessingLockToken: string;
+    ezerAdmissionVerified?: boolean;
 }
 
 interface UndoContextParams {
@@ -142,8 +143,12 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
     const { repoOwner, repoName, pullRequestNumber, correlatedLogger } = context;
 
     requirePostExecutionState(state);
-    const disposition = getPostExecutionDisposition(state.claudeResult);
     const terminationReason = resolveAgentTerminationReason(state.claudeResult);
+    if (params.ezerAdmissionVerified === true &&
+        (state.claudeResult.success !== true || terminationReason !== undefined)) {
+        throw new Error('ezer-comment-refused:incomplete-execution');
+    }
+    const disposition = getPostExecutionDisposition(state.claudeResult);
     const partial = disposition === 'partial';
     if (disposition === 'failed') {
         throw new Error(`Agent execution failed: ${state.claudeResult.error || 'Unknown error'}`);

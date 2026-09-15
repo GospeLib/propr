@@ -7,6 +7,7 @@ import type { ExecuteWorktreeParams, ExecuteWorktreeResult } from './types.js';
 import { fetchIssueComments } from './github.js';
 import { executeAgentAndRecordMetrics } from './agent.js';
 import { performPostProcessing } from '../issueJobPostProcessing.js';
+import { requireStoryPublicationPolicy } from '../storyPublicationPolicy.js';
 
 export async function executeWorktreeOperations(params: ExecuteWorktreeParams): Promise<ExecuteWorktreeResult> {
   const { job, context, octokit, currentIssueData, repoValidation, githubToken, repoUrl, localRepoPath } = params;
@@ -19,7 +20,14 @@ export async function executeWorktreeOperations(params: ExecuteWorktreeParams): 
     if (prior.data.length) throw Error('STORY_EXECUTION_PR_EXISTS');
   }
   const worktreeInfo = await createWorktreeForIssue(localRepoPath, { issueId: issueRef.number, issueTitle: currentIssueData.data.title, owner: issueRef.repoOwner, repoName: issueRef.repoName }, { baseBranch: issueRef.baseBranch || null, octokit, modelName, execution });
-  if (execution) await verifyStoryPublication(worktreeInfo.worktreePath, execution);
+  if (execution) {
+    const changedPaths = await verifyStoryPublication(worktreeInfo.worktreePath, execution);
+    await requireStoryPublicationPolicy({
+      worktreePath: worktreeInfo.worktreePath,
+      changedPaths,
+      signedStoryId: issueRef.executionAdmissionReceipt?.storyId,
+    });
+  }
   await job.updateProgress(75);
 
   // Construct the task dashboard URL

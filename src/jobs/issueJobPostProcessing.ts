@@ -1,7 +1,5 @@
 import type { Logger } from 'pino';
 import { setTimeout } from 'timers/promises';
-import { access, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import type { ClaudeCodeResponse } from '@propr/core';
 import { verifyStoryPublication, type StoryExecutionContract } from '@propr/core';
 import type { WorktreeInfo, CommitResult, WorkerStateManager } from '@propr/core';
@@ -15,39 +13,13 @@ import type { RepoValidationResult, PRValidationResult } from '@propr/core';
 import type { IssueJobData } from '@propr/core';
 import { createPullRequest, ensureEpicBaseBranchExists, type PostProcessingResult } from './issueJobHelpers.js';
 import { handleCreatedPlanIssuePR, handleNoCodeChanges } from './issueJobPostProcessingHelpers.js';
-import { buildStoryCommitMessage, buildStoryPublicationMetadata, storyPublicationSpecLinkPath, storyPublicationTaskLinkRequired } from './publicationMetadata.js';
+import { buildStoryCommitMessage, buildStoryPublicationMetadata } from './publicationMetadata.js';
+import { requireStoryPublicationPolicy } from './storyPublicationPolicy.js';
 import { AI_COMMIT_AUTHOR } from './commitAuthor.js';
 import type { GitHubToken } from './githubTypes.js';
 
 type RepoValidation = RepoValidationResult;
 type PRValidation = PRValidationResult;
-
-const SPEC_LINK_GATE_PATH = 'checks/spec-link.sh';
-const PULL_REQUEST_TEMPLATE_PATHS = ['.github/PULL_REQUEST_TEMPLATE.md', '.github/pull_request_template.md'] as const;
-
-async function pathExists(filePath: string): Promise<boolean> {
-    try {
-        await access(filePath);
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-async function repositoryRequiresTaskLink(worktreePath: string, changedPaths: readonly string[]): Promise<boolean> {
-    if ([SPEC_LINK_GATE_PATH, ...PULL_REQUEST_TEMPLATE_PATHS].some(policyPath => changedPaths.includes(policyPath))) {
-        throw new Error('STORY_PUBLICATION_POLICY_CHANGED');
-    }
-    const specLinkGatePresent = await pathExists(join(worktreePath, SPEC_LINK_GATE_PATH));
-    let pullRequestTemplate: string | null = null;
-    for (const templatePath of PULL_REQUEST_TEMPLATE_PATHS) {
-        const absolutePath = join(worktreePath, templatePath);
-        if (!await pathExists(absolutePath)) continue;
-        pullRequestTemplate = await readFile(absolutePath, 'utf8');
-        break;
-    }
-    return storyPublicationTaskLinkRequired({ specLinkGatePresent, pullRequestTemplate });
-}
 
 function formatErrorBlock(title: string, message: string): string {
     const redacted = redactSecrets(message || 'Unknown error').slice(0, 4000);
@@ -228,21 +200,16 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
 
         const completionNote = buildImplementationCompletionNote(claudeResult);
         const signedStoryId = options.execution ? issueRef.executionAdmissionReceipt?.storyId : undefined;
-        if (options.execution && !signedStoryId) throw new Error('STORY_PUBLICATION_SIGNED_STORY_ID_REQUIRED');
-        const taskLinkRequired = signedStoryId
-            ? await repositoryRequiresTaskLink(worktreeInfo.worktreePath, storyChangedPaths)
+        const taskLinkRequired = options.execution
+            ? (await requireStoryPublicationPolicy({
+                worktreePath: worktreeInfo.worktreePath,
+                changedPaths: storyChangedPaths,
+                signedStoryId,
+            })).taskLinkRequired
             : false;
         let commitMessage = signedStoryId
             ? buildStoryCommitMessage(signedStoryId, taskLinkRequired)
             : `fix(ai): Resolve issue #${issueRef.number} - ${currentIssueData.data.title.substring(0, 50)}\n\nImplemented by ProPR AI using ${modelName} model.\n\n${completionNote}`;
-        if (signedStoryId && taskLinkRequired) {
-            const specLinkPath = storyPublicationSpecLinkPath(signedStoryId);
-            if (storyChangedPaths.includes(specLinkPath)) throw new Error('STORY_PUBLICATION_SPEC_LINK_CHANGED');
-            if (!await pathExists(join(worktreeInfo.worktreePath, specLinkPath))) {
-                throw new Error('STORY_PUBLICATION_SPEC_LINK_REQUIRED');
-            }
-        }
-
         if (!signedStoryId && claudeResult?.commitMessage) commitMessage = claudeResult.commitMessage;
 
         commitResult = await commitChanges(

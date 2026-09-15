@@ -21,6 +21,7 @@ export {
     type GenericErrorOptions
 } from './errorHandlers.js';
 import type { ClaudeCodeResponse, IssueJobData, JobResult, WorkerStateManager, WorktreeInfo, CommitResult, RepoValidationResult } from '@propr/core';
+import type { StoryPublicationMetadata } from './publicationMetadata.js';
 
 export type RepoValidation = RepoValidationResult;
 
@@ -53,6 +54,7 @@ interface CreatePROptions {
     PR_LABEL: string;
     correlatedLogger: Logger;
     issueTitle: string;
+    publicationMetadata?: StoryPublicationMetadata;
 }
 
 export function buildIssueReference(
@@ -171,14 +173,14 @@ export async function createPullRequest(
     worktreeInfo: WorktreeInfo,
     options: CreatePROptions
 ): Promise<PostProcessingResult> {
-    const { commitResult, claudeResult, modelName, repoValidation, PR_LABEL, correlatedLogger, issueTitle } = options;
+    const { commitResult, claudeResult, modelName, repoValidation, PR_LABEL, correlatedLogger, issueTitle, publicationMetadata } = options;
     const jobId = `${issueRef.repoOwner}-${issueRef.repoName}-${issueRef.number}`;
 
     const modelShortName = getModelShortName(modelName);
-    const prTitle = '[' + issueRef.number + ' by ' + modelShortName + '] ' + issueTitle;
+    const prTitle = publicationMetadata?.prTitle ?? '[' + issueRef.number + ' by ' + modelShortName + '] ' + issueTitle;
 
     const completionComment = await generateCompletionComment(claudeResult, { number: issueRef.number, repoOwner: issueRef.repoOwner, repoName: issueRef.repoName });
-    const prBody = `## AI Implementation Summary
+    const prBody = publicationMetadata?.prBody ?? `## AI Implementation Summary
 
 ${buildIssueReference(issueRef.number, commitResult !== null, claudeResult)}
 

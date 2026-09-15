@@ -118,6 +118,8 @@ export interface WorkerAdmissionReceipt {
     route?: ExecutionRouteBinding;
     admissionId: string;
     operationId: string;
+    /** Exact signed story identity. Older persisted receipts may omit it and fail closed at publication. */
+    storyId?: string;
     receiptKey: string;
 }
 
@@ -283,6 +285,7 @@ export async function consumeExecutionAdmission(input: {
     const receiptValue = JSON.stringify({
         admissionId: claims.admissionId,
         operationId: claims.operationId,
+        storyId: claims.storyId,
         repository: claims.repository,
         issueNumber: claims.issueNumber,
         target: claims.target,
@@ -295,7 +298,7 @@ export async function consumeExecutionAdmission(input: {
         ...(claims.comment === undefined ? {} : { comment: claims.comment }),
     });
     if (!await input.store.consumeAndIssue(consumedKey, receiptKey, receiptValue, ttlSeconds)) refuse('replayed-admission');
-    return { claims, receipt: { ...(claims.route ? {route:claims.route} : {}), admissionId: claims.admissionId, operationId: claims.operationId, receiptKey } };
+    return { claims, receipt: { ...(claims.route ? {route:claims.route} : {}), admissionId: claims.admissionId, operationId: claims.operationId, storyId: claims.storyId, receiptKey } };
 }
 
 interface WorkerReceiptVerification {
@@ -332,7 +335,8 @@ function validateWorkerAdmissionReceipt(stored: string | null, input: WorkerRece
     }
     if(value.control!==undefined)refuse('stop-control-cannot-start-worker');
     if (value.integrationDigest !== input.expectedIntegrationDigest) refuse('integration-worker-binding-changed');
-    if (value.admissionId !== input.receipt.admissionId || value.operationId !== input.receipt.operationId) refuse('mismatched-worker-receipt');
+    if (value.admissionId !== input.receipt.admissionId || value.operationId !== input.receipt.operationId ||
+        value.storyId !== input.receipt.storyId) refuse('mismatched-worker-receipt');
     if (value.repository !== input.expected.repository) refuse('wrong-repository');
     if (value.issueNumber !== input.expected.issueNumber) refuse('wrong-issue');
     if (value.target !== input.expected.target) refuse('wrong-target');
@@ -345,7 +349,8 @@ function validateWorkerAdmissionReceipt(stored: string | null, input: WorkerRece
     const typed = value.typedWork === undefined ? undefined : requireTypedInvestigation(value.typedWork);
     if (value.storyExecution !== undefined) {
         const execution = requireStoryExecutionContract(value.storyExecution);
-        if (typed || value.comment || value.artifactCorrection || value.integrationDigest || execution.targetBranch !== value.target)
+        if (typed || value.comment || value.artifactCorrection || value.integrationDigest ||
+            typeof value.storyId !== 'string' || value.storyId.trim() === '' || execution.targetBranch !== value.target)
             refuse('story-execution-authority-mismatch');
         if (typeof value.executionDeadline !== 'string' || !Number.isFinite(Date.parse(value.executionDeadline)))
             refuse('story-execution-deadline-required');

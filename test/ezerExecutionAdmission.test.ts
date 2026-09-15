@@ -89,6 +89,7 @@ describe('Ezer execution admission', () => {
 
     assert.equal(result.claims.operationId, 'op-2260-1');
     assert.equal(result.receipt.admissionId, 'adm-2260-1');
+    assert.equal(result.receipt.storyId, 'EP-ezer-runtime-cutover-S01');
     await assert.doesNotReject(() => verifyWorkerAdmissionReceipt({
       receipt: result.receipt,
       expected: { repository: 'GospeLib/main', issueNumber: 2260, target: 'stage' },
@@ -99,6 +100,22 @@ describe('Ezer execution admission', () => {
       expected: { repository: 'GospeLib/main', issueNumber: 2260, target: 'stage' },
       store: sharedStore,
     }), /missing-worker-receipt/);
+  });
+
+  test('refuses a receipt whose signed story identity was changed before worker use', async () => {
+    const sharedStore = store();
+    const result = await consumeExecutionAdmission({
+      token: sign(claims()),
+      signingSecret: SIGNING_SECRET,
+      expected: { repository: 'GospeLib/main', issueNumber: 2260 },
+      store: sharedStore,
+      nowMs: NOW_MS,
+    });
+    await assert.rejects(() => verifyWorkerAdmissionReceipt({
+      receipt: { ...result.receipt, storyId: 'EP-changed-S01' },
+      expected: { repository: 'GospeLib/main', issueNumber: 2260, target: 'stage' },
+      store: sharedStore,
+    }), /mismatched-worker-receipt/);
   });
 
   test('refuses a replay of the same single-use admission', async () => {

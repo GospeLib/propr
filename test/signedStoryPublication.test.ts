@@ -64,6 +64,7 @@ interface Fixture {
 }
 
 interface ApiOptions {
+    priorRef?: string;
     commitMessage?: string;
     blobSha?: string;
     createdTreeSha?: string;
@@ -141,7 +142,7 @@ function createApi(fixture: Fixture, options: ApiOptions = {}) {
         ...baseTree,
         { path: CHANGED_PATH, mode: '100644', type: 'blob', sha: changedBlobSha },
     ];
-    let refSha = fixture.baseSha;
+    let refSha = options.priorRef ?? fixture.baseSha;
     let refReads = 0;
     let beforeUpdateRan = false;
     const request = async (endpoint: string, requestOptions: Record<string, unknown>) => {
@@ -223,6 +224,24 @@ async function runPublication(options: ApiOptions = {}, commitMessage = COMMIT_M
         throw error;
     }
 }
+
+test('resumes an exact verified published ref without creating objects or changing remote history', async () => {
+    const { result, calls, fixture } = await runPublication({ priorRef: COMMIT_SHA });
+    try {
+        assert.equal(result?.commitHash, COMMIT_SHA);
+        assert.equal(calls.some(call => !call.endpoint.startsWith('GET ')), false);
+    } finally { await rm(fixture.directory, { recursive: true, force: true }); }
+});
+
+test('rejects a resumed ref with different bytes, parent, message, signature, or a racing ref', async () => {
+    for (const options of [
+        { createdTreeEntries: [] },
+        { fetchedCommitParentSha: RACING_REF_SHA },
+        { commitMessage: 'unauthorized' },
+        { fetchedVerification: { ...VERIFIED_SIGNATURE, verified: false } },
+        { raceBeforeUpdate: true },
+    ]) await assert.rejects(runPublication({ priorRef: COMMIT_SHA, ...options }));
+});
 
 test('publishes the exact authorized bytes with a verified GitHub commit and non-force ref update', async () => {
     const { result, calls, fixture } = await runPublication();

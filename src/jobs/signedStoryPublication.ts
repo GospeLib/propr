@@ -56,7 +56,6 @@ const RECURSIVE_TREE_VALUE = '1';
 
 const ERROR_COMMIT_MESSAGE = 'STORY_SIGNED_PUBLICATION_COMMIT_MESSAGE';
 const ERROR_LOCAL_HISTORY = 'STORY_SIGNED_PUBLICATION_LOCAL_HISTORY_CHANGED';
-const ERROR_REMOTE_HISTORY = 'STORY_SIGNED_PUBLICATION_REMOTE_HISTORY_CHANGED';
 const ERROR_BASE_CHANGED = 'STORY_SIGNED_PUBLICATION_BASE_CHANGED';
 const ERROR_FILE_TYPE = 'STORY_SIGNED_PUBLICATION_FILE_TYPE';
 const ERROR_BLOB_MISMATCH = 'STORY_SIGNED_PUBLICATION_BLOB_MISMATCH';
@@ -264,7 +263,6 @@ export async function publishSignedStoryCommit(options: {
 
     const refInput = { octokit, owner, repo, featureBranch: execution.featureBranch };
     const priorRef = await readRef(refInput);
-    if (priorRef !== undefined && priorRef !== execution.baseSha) throw new Error(ERROR_REMOTE_HISTORY);
 
     const baseCommit = record((await octokit.request(GET_COMMIT_ENDPOINT, {
         owner,
@@ -274,6 +272,23 @@ export async function publishSignedStoryCommit(options: {
     if (baseCommit.sha !== execution.baseSha) throw new Error(ERROR_BASE_CHANGED);
     const baseTreeSha = sha(record(baseCommit.tree).sha, ERROR_BASE_CHANGED);
     const snapshots = await Promise.all(paths.map(path => readSnapshot(worktreePath, path)));
+    if (priorRef !== undefined && priorRef !== execution.baseSha) {
+        const existing = record((await octokit.request(GET_COMMIT_ENDPOINT, {
+            owner, repo, commit_sha: priorRef,
+        })).data);
+        const existingTreeSha = sha(record(existing.tree).sha, ERROR_TREE_MISMATCH);
+        assertCommit(existing, {
+            commitSha: priorRef, baseSha: execution.baseSha, treeSha: existingTreeSha, message: commitMessage,
+        });
+        const [baseTree, existingTree] = await Promise.all([
+            fetchLeafTree({ octokit, owner, repo, treeSha: baseTreeSha }),
+            fetchLeafTree({ octokit, owner, repo, treeSha: existingTreeSha }),
+        ]);
+        assertExactTreeDelta(baseTree, existingTree, snapshots);
+        await assertStableWorktree({ git, worktreePath, execution, paths, snapshots });
+        if (await readRef(refInput) !== priorRef) throw new Error(ERROR_REF_CHANGED);
+        return { commitHash: priorRef, commitMessage, filesChanged: paths };
+    }
     const tree = [];
     for (const snapshot of snapshots) {
         let blobSha: string | null = null;

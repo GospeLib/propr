@@ -8,6 +8,10 @@ import { EZER_REVIEW_REQUEST } from './reviewRequest.js';
 
 const COMMENT_JOB_PREFIX = 'pr-comments-batch-ezer-';
 
+export function admittedCommentJobId(admissionId: string): string {
+  return `${COMMENT_JOB_PREFIX}${admissionId}`;
+}
+
 /** Reuses an existing GitHub comment; never posts or impersonates its author. */
 export async function enqueueAdmittedComment(input: {
   repository: string; prNumber: number; commentId: number; body: string; admissionId: string; review?: boolean;
@@ -29,7 +33,7 @@ export async function enqueueAdmittedComment(input: {
   }
   const binding = { commentId: comment.id, bodyDigest: `sha256:${createHash('sha256').update(input.body).digest('hex')}`,
     headSha: pr.head.sha, headBranch: pr.head.ref };
-  const jobId = `${COMMENT_JOB_PREFIX}${input.admissionId}`;
+  const jobId = admittedCommentJobId(input.admissionId);
   const existing = await issueQueue.getJob(jobId);
   if (existing) {
     if (!('commandMode' in existing.data) || existing.data.commandMode !== (review ? 'review' : 'default') || existing.data.executionAdmissionReceipt?.admissionId !== input.admissionId ||

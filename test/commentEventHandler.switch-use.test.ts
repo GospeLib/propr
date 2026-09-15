@@ -42,6 +42,7 @@ await mock.module('ioredis', {
 
 // Mock bullmq — allow tests to inject active/waiting/delayed jobs
 const mockQueueAdd = mock.fn(async () => {});
+const mockQueueGetJob = mock.fn(async (_jobId: string) => null as unknown);
 let mockActiveJobs: unknown[] = [];
 let mockWaitingJobs: unknown[] = [];
 let mockDelayedJobs: unknown[] = [];
@@ -50,6 +51,7 @@ await mock.module('bullmq', {
         Queue: function Queue() {
             return {
                 add: mockQueueAdd,
+                getJob: mockQueueGetJob,
                 close: mock.fn(),
                 on: mock.fn(),
                 getActive: mock.fn(async () => mockActiveJobs),
@@ -1184,6 +1186,9 @@ describe('commentEventHandler — slash command batching/concurrency guard', () 
 describe('commentEventHandler — comment revision cancellation', () => {
     beforeEach(() => {
         mockLoggerInstance.info.mock.resetCalls();
+        mockQueueAdd.mock.resetCalls();
+        mockQueueGetJob.mock.resetCalls();
+        mockOctokit.request.mock.resetCalls();
         mockActiveJobs = [];
         mockWaitingJobs = [];
         mockDelayedJobs = [];
@@ -1241,6 +1246,125 @@ describe('commentEventHandler — comment revision cancellation', () => {
         assert.strictEqual(remove.mock.callCount(), 1);
         assert.strictEqual(config.redisClient.set.mock.calls[0].arguments[0], 'worker:abort:pr-comments-batch-testowner-testrepo-42-123-2026-08-09T10-00-00Z');
         assert.strictEqual(config.redisClient.del.mock.calls[0].arguments[0], 'pr-comment-processed:testowner:testrepo:42:123');
+    });
+
+    test('an identical edited delivery for the exact active signed Ezer review is a no-op', async () => {
+        const admissionId = '91aa9fda-a9d7-4830-8702-ddb9d5da09b3';
+        const body = `/ezer review ${admissionId}\nModel: gpt-5.6-sol\nReview the exact artifact.`;
+        const commentId = 123;
+        const binding = {
+            commentId,
+            bodyDigest: `sha256:${createHash('sha256').update(body).digest('hex')}`,
+            headSha: 'exact-head',
+            headBranch: 'feature-branch',
+        };
+        const remove = mock.fn(async () => {});
+        const job = {
+            id: `pr-comments-batch-ezer-${admissionId}`,
+            name: 'processPullRequestComment',
+            data: {
+                pullRequestNumber: 42,
+                repoOwner: 'testowner',
+                repoName: 'testrepo',
+                branchName: 'feature-branch',
+                commandMode: 'review',
+                comments: [{ id: commentId, body, author: 'integry', type: 'issue' }],
+                executionAdmissionReceipt: { admissionId },
+                executionAdmissionComment: binding,
+            },
+            remove,
+        };
+        mockActiveJobs = [job];
+        mockQueueGetJob.mock.mockImplementation(async () => job);
+        mockOctokit.request.mock.mockImplementation(async (route: string) => {
+            if (route.includes('/issues/comments/')) return {
+                data: {
+                    id: commentId,
+                    body,
+                    issue_url: 'https://api.github.com/repos/testowner/testrepo/issues/42',
+                    created_at: '2026-09-15T23:16:51Z',
+                    user: { login: 'integry' },
+                },
+            };
+            return {
+                data: {
+                    state: 'open',
+                    head: { sha: 'exact-head', ref: 'feature-branch', repo: { full_name: 'testowner/testrepo' } },
+                    base: { ref: 'main', repo: { full_name: 'testowner/testrepo' } },
+                    labels: [],
+                },
+            };
+        });
+        const event = createPRCommentEvent(body);
+        event.comment.id = commentId;
+        const reprocess = mock.fn(async () => {});
+        const config = createTestConfig({ processCommentEvent: reprocess });
+
+        await handleCommentEdited(event, 'issue_comment', 'corr-ezer-identical-edit', config);
+
+        assert.strictEqual(remove.mock.callCount(), 0);
+        assert.strictEqual(config.redisClient.set.mock.callCount(), 0);
+        assert.strictEqual(config.redisClient.del.mock.callCount(), 0);
+        assert.strictEqual(reprocess.mock.callCount(), 0);
+        assert.strictEqual(mockQueueAdd.mock.callCount(), 0);
+    });
+
+    test('a changed head cannot use the signed Ezer duplicate-delivery exception', async () => {
+        const admissionId = '91aa9fda-a9d7-4830-8702-ddb9d5da09b3';
+        const body = `/ezer review ${admissionId}\nModel: gpt-5.6-sol\nReview the exact artifact.`;
+        const commentId = 123;
+        const remove = mock.fn(async () => {});
+        const job = {
+            id: `pr-comments-batch-ezer-${admissionId}`,
+            name: 'processPullRequestComment',
+            data: {
+                pullRequestNumber: 42,
+                repoOwner: 'testowner',
+                repoName: 'testrepo',
+                commandMode: 'review',
+                comments: [{ id: commentId, body, author: 'integry', type: 'issue' }],
+                executionAdmissionReceipt: { admissionId },
+                executionAdmissionComment: {
+                    commentId,
+                    bodyDigest: `sha256:${createHash('sha256').update(body).digest('hex')}`,
+                    headSha: 'original-head',
+                    headBranch: 'feature-branch',
+                },
+            },
+            remove,
+        };
+        mockActiveJobs = [job];
+        mockQueueGetJob.mock.mockImplementation(async () => job);
+        mockOctokit.request.mock.mockImplementation(async (route: string) => {
+            if (route.includes('/issues/comments/')) return {
+                data: {
+                    id: commentId,
+                    body,
+                    issue_url: 'https://api.github.com/repos/testowner/testrepo/issues/42',
+                    created_at: '2026-09-15T23:16:51Z',
+                    user: { login: 'integry' },
+                },
+            };
+            return {
+                data: {
+                    state: 'open',
+                    head: { sha: 'changed-head', ref: 'feature-branch', repo: { full_name: 'testowner/testrepo' } },
+                    base: { ref: 'main', repo: { full_name: 'testowner/testrepo' } },
+                    labels: [],
+                },
+            };
+        });
+        const event = createPRCommentEvent(body);
+        event.comment.id = commentId;
+        const reprocess = mock.fn(async () => {});
+        const config = createTestConfig({ processCommentEvent: reprocess });
+
+        await handleCommentEdited(event, 'issue_comment', 'corr-ezer-head-changed', config);
+
+        assert.strictEqual(remove.mock.callCount(), 1);
+        assert.strictEqual(config.redisClient.set.mock.callCount(), 1);
+        assert.strictEqual(config.redisClient.del.mock.callCount(), 1);
+        assert.strictEqual(reprocess.mock.callCount(), 1);
     });
 });
 

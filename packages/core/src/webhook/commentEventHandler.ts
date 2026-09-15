@@ -1,4 +1,4 @@
-import { enqueueAdmittedComment } from '../admission/admittedComment.js';
+import { admittedCommentJobId, enqueueAdmittedComment } from '../admission/admittedComment.js';
 import { EZER_REVIEW_REQUEST } from '../admission/reviewRequest.js';
 import { requiresEzerExecutionAdmission } from '../admission/ezerExecutionAdmission.js';
 /* eslint-disable max-lines */
@@ -186,16 +186,18 @@ export async function handleCommentEdited(payload: IssueCommentEvent | PullReque
     const repo = payload.repository.name;
     const repoFullName = `${owner}/${repo}`;
 
-    let prNumber: number, commentId: number;
+    let prNumber: number, commentId: number, commentBody: string | null;
     if (eventType === 'issue_comment') {
         const issuePayload = payload as IssueCommentEvent;
         if (!issuePayload.issue.pull_request) { correlatedLogger.debug({ repository: repoFullName }, 'Issue comment is not on a PR, skipping'); return; }
         prNumber = issuePayload.issue.number;
         commentId = issuePayload.comment.id;
+        commentBody = issuePayload.comment.body;
     } else if (eventType === 'pull_request_review_comment') {
         const prPayload = payload as PullRequestReviewCommentEvent;
         prNumber = prPayload.pull_request.number;
         commentId = prPayload.comment.id;
+        commentBody = prPayload.comment.body;
     } else { correlatedLogger.warn({ eventType }, 'Unknown event type for comment edit'); return; }
 
     correlatedLogger.info({ repository: repoFullName, pullRequestNumber: prNumber, commentId }, 'Comment edited, restarting any active jobs for this PR');
@@ -208,6 +210,33 @@ export async function handleCommentEdited(payload: IssueCommentEvent | PullReque
     }
 
     if (foundJob) {
+        const ezerReview = eventType === 'issue_comment'
+            ? EZER_REVIEW_REQUEST.exec(commentBody || '')
+            : null;
+        if (ezerReview && foundJob.id === admittedCommentJobId(ezerReview[1]!)) {
+            try {
+                const replay = await enqueueAdmittedComment({
+                    repository: repoFullName,
+                    prNumber,
+                    commentId,
+                    body: commentBody!,
+                    admissionId: ezerReview[1]!,
+                    review: true,
+                });
+                if (replay.jobId === foundJob.id) {
+                    correlatedLogger.info(
+                        { jobId: foundJob.id, pullRequestNumber: prNumber, repository: repoFullName, commentId },
+                        'Ignoring identical edit delivery for the active signed Ezer review',
+                    );
+                    return;
+                }
+            } catch {
+                correlatedLogger.info(
+                    { jobId: foundJob.id, pullRequestNumber: prNumber, repository: repoFullName, commentId },
+                    'Signed Ezer review edit changed its validated admission binding; retaining cancellation path',
+                );
+            }
+        }
         correlatedLogger.info({ jobId: foundJob.id, pullRequestNumber: prNumber, repository: repoFullName }, 'Aborting existing job due to comment edit');
         const taskId = foundJob.id ?? `${owner}-${repo}-${prNumber}`;
         await redisClient.set(`worker:abort:${taskId}`, JSON.stringify({ timestamp: new Date().toISOString(), reason: 'comment_edited', commentId }), 'EX', 3600);

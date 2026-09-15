@@ -1,4 +1,4 @@
-import { requireStoryPublicationId, STORY_PUBLICATION_TASK_ID_PATTERN as STORY_TASK_ID_PATTERN,
+import { requireAuthorizedPublicationMetadata, type StoryExecutionContract, requireStoryPublicationId, STORY_PUBLICATION_TASK_ID_PATTERN as STORY_TASK_ID_PATTERN,
     STORY_PUBLICATION_TASK_SUFFIX_PATTERN as STORY_TASK_SUFFIX_PATTERN,
     STORY_PUBLICATION_SPEC_DIRECTORY_PREFIX as SPEC_DIRECTORY_PREFIX } from '@propr/core';
 export { requireStoryPublicationId, storyPublicationSpecLinkPath, storyPublicationTaskLinkRequired } from '@propr/core';
@@ -13,6 +13,7 @@ export interface StoryPublicationMetadata {
 }
 
 export interface StoryPublicationMetadataInput {
+    execution?: StoryExecutionContract;
     storyId: string;
     issueNumber: number;
     repository: string;
@@ -24,13 +25,22 @@ function buildPublicationSubject(storyId: string, taskLinkRequired: boolean): st
     return `${PUBLICATION_COMMIT_PREFIX}${requireStoryPublicationId(storyId, taskLinkRequired)}`;
 }
 
-export function buildStoryCommitMessage(storyId: string, taskLinkRequired = false): string {
+export function buildStoryCommitMessage(storyId: string, taskLinkRequired = false, execution?: StoryExecutionContract): string {
+    if (execution?.publicationMetadata) {
+        if (execution.taskAssignment?.taskId !== storyId) throw Error('STORY_PUBLICATION_METADATA_TASK');
+        return requireAuthorizedPublicationMetadata(execution.publicationMetadata, execution.taskAssignment).commitMessage;
+    }
     const publicationId = requireStoryPublicationId(storyId, taskLinkRequired);
     const subject = buildPublicationSubject(publicationId, taskLinkRequired);
     return STORY_TASK_ID_PATTERN.test(publicationId) ? `${subject}\n\nTask: ${publicationId}` : subject;
 }
 
 export function buildStoryPublicationMetadata(input: StoryPublicationMetadataInput): StoryPublicationMetadata {
+    if (input.execution?.publicationMetadata) {
+        if (input.execution.taskAssignment?.taskId !== input.storyId) throw Error('STORY_PUBLICATION_METADATA_TASK');
+        const { commitMessage, prTitle, prBody } = requireAuthorizedPublicationMetadata(input.execution.publicationMetadata, input.execution.taskAssignment);
+        return { commitMessage, prTitle, prBody };
+    }
     const publicationId = requireStoryPublicationId(input.storyId, input.taskLinkRequired);
     const storyId = publicationId.replace(STORY_TASK_SUFFIX_PATTERN, '');
     const specLine = input.taskLinkRequired ? `- Spec: \`${SPEC_DIRECTORY_PREFIX}${storyId}/\`` : '';

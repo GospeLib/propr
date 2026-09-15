@@ -213,7 +213,7 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
             })).taskLinkRequired
             : false;
         let commitMessage = signedStoryId
-            ? buildStoryCommitMessage(signedStoryId, taskLinkRequired)
+            ? buildStoryCommitMessage(signedStoryId, taskLinkRequired, options.execution)
             : `fix(ai): Resolve issue #${issueRef.number} - ${currentIssueData.data.title.substring(0, 50)}\n\nImplemented by ProPR AI using ${modelName} model.\n\n${completionNote}`;
         if (!signedStoryId && claudeResult?.commitMessage) commitMessage = claudeResult.commitMessage;
 
@@ -262,6 +262,7 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
         }
 
         const publicationMetadata = signedStoryId ? buildStoryPublicationMetadata({
+            execution: options.execution,
             storyId: signedStoryId,
             issueNumber: issueRef.number,
             repository: `${issueRef.repoOwner}/${issueRef.repoName}`,
@@ -279,12 +280,16 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
             const { data: current } = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
                 owner: issueRef.repoOwner, repo: issueRef.repoName, pull_number: prNumber }) as {
                     data: { head?: { sha?: string; ref?: string; repo?: { full_name?: string } };
-                        base?: { ref?: string; repo?: { full_name?: string } }; merged?: boolean; state?: string } };
+                        base?: { ref?: string; repo?: { full_name?: string } }; merged?: boolean; state?: string;
+                        title?: string; body?: string; auto_merge?: unknown } };
             const repository = `${issueRef.repoOwner}/${issueRef.repoName}`;
             if (current.head?.sha !== commitResult.commitHash || current.head.ref !== options.execution.featureBranch ||
                 current.head.repo?.full_name !== repository || current.base?.repo?.full_name !== repository ||
                 current.base.ref !== options.execution.targetBranch || current.merged !== false || current.state !== 'open')
                 throw Error('STORY_EXECUTION_PUBLICATION_CHANGED');
+            if (options.execution.publicationMetadata && (current.title !== publicationMetadata?.prTitle ||
+                current.body !== publicationMetadata?.prBody || current.auto_merge != null))
+                throw Error('STORY_EXECUTION_PUBLICATION_METADATA_CHANGED');
         }
 
         // Update plan issue status to 'under_review' if PR was created successfully

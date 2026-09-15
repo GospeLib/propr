@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHmac } from 'node:crypto';
+import { createHmac, createHash } from 'node:crypto';
 import { consumeExecutionAdmission, verifyWorkerAdmissionReceipt } from '../src/admission/ezerExecutionAdmission.js';
 import { requireStoryExecutionContract } from '../src/admission/storyExecutionContract.js';
 import * as admission from '../src/admission/ezerExecutionAdmission.js';
@@ -11,6 +11,30 @@ const EXECUTION = { baseSha: SHA, featureBranch: 'task/approved-story', targetBr
 const EXPECTED = { repository: 'GospeLib/main', issueNumber: 9001, target: 'stage' };
 const DELEGATION = { grantId: 'exact-grant', delegatePrincipalId: 'bootstrap-agent',
   delegateSessionId: 'delegated-session', approvalPrincipalId: 'owner' };
+test('preserves exact authorized conventional publication metadata across signed admission and worker receipt', async () => {
+  const taskId = 'EP-story-S01-T01';
+  const artifacts = ['tasks.md', 'link.md'].map(name => {
+    const content = `# ${name}\n\n${taskId}\n`;
+    return { path: `specs/EP-story-S01/${name}`, content, digest: `sha256:${createHash('sha256').update(content).digest('hex')}` };
+  });
+  const text = { commitMessage: `docs(ezer): publish replacement fixture\n\nTask: ${taskId}\n`,
+    prTitle: 'docs(ezer): publish replacement fixture',
+    prBody: `## Summary\n\nPublish fixture.\n\n## Story / task\n\n- Story / task: \`${taskId}\`\n- Spec: \`specs/EP-story-S01/\`\n\n## Impact & Risk\n\n- **Domains / repos touched:** docs\n- **Contract surface touched:** no\n- **Risk level:** low\n- **Rollback plan:** close PR\n\n## Testing\n\nRun checks.\n\n## Checklist\n\n- [ ] Checks pass\n` };
+  const digest = `sha256:${createHash('sha256').update(JSON.stringify({ taskId,
+    artifacts: artifacts.map(({path, digest}) => ({path, digest})).sort((a,b) => a.path.localeCompare(b.path)), ...text })).digest('hex')}`;
+  const storyExecution = { ...EXECUTION, taskAssignment: { taskId, artifacts }, publicationMetadata: { ...text, digest } };
+  assert.deepEqual(requireStoryExecutionContract(storyExecution), storyExecution);
+  const f = fixture({ storyExecution });
+  const { receipt } = await consumeExecutionAdmission({ ...f, signingSecret: SECRET, expected: EXPECTED });
+  let binding: unknown;
+  await verifyWorkerAdmissionReceipt({ receipt, store: f.store, expected: EXPECTED, onStoryExecution: value => { binding = value; } });
+  assert.deepEqual(binding, storyExecution);
+  for (const field of ['commitMessage', 'prTitle', 'prBody'] as const) {
+    assert.throws(() => requireStoryExecutionContract({ ...storyExecution,
+      publicationMetadata: { ...storyExecution.publicationMetadata, [field]: `${text[field]}tampered` } }), /PUBLICATION_METADATA/);
+  }
+  assert.throws(() => requireStoryExecutionContract({ ...storyExecution, taskAssignment: undefined }), /PUBLICATION_METADATA/);
+});
 test('canonical task metadata is preserved as exact signed execution authority', () => {
   const taskAssignment = { taskId: 'EP-story-S01-T01', artifacts: [
     { path: 'specs/EP-story-S01/tasks.md', content: '# Tasks\n\n## T01: Complete docs\n', digest: 'sha256:1' },

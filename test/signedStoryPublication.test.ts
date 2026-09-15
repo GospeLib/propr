@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { mock, test } from 'node:test';
 import type { StoryExecutionContract } from '@propr/core';
 import { simpleGit, type SimpleGit } from 'simple-git';
+import { publicationMetadataDigest, requireAuthorizedPublicationMetadata } from '../packages/core/src/admission/authorizedPublicationMetadata.js';
 
 const FEATURE_BRANCH = 'task/signed-publication';
 const TASK_ID = 'EP-signed-publication-S01-T02';
@@ -37,6 +38,7 @@ const verifyStoryPublication = mock.fn(async (worktree: string, execution: Story
 });
 
 await mock.module('@propr/core', { namedExports: {
+    requireAuthorizedPublicationMetadata,
     verifyStoryPublication,
     requireStoryPublicationId: (storyId: string) => storyId,
     storyPublicationSpecLinkPath: (taskId: string) => `specs/${taskId}/link.md`,
@@ -62,6 +64,7 @@ interface Fixture {
 }
 
 interface ApiOptions {
+    commitMessage?: string;
     blobSha?: string;
     createdTreeSha?: string;
     createdTreeEntries?: GitTreeEntry[];
@@ -117,14 +120,14 @@ async function createFixture(): Promise<Fixture> {
     return { directory, git, baseSha, execution };
 }
 
-function commitData(baseSha: string, treeSha: string, verification = VERIFIED_SIGNATURE, commitSha = COMMIT_SHA) {
+function commitData(baseSha: string, treeSha: string, verification = VERIFIED_SIGNATURE, commitSha = COMMIT_SHA, message = COMMIT_MESSAGE) {
     return {
         sha: commitSha,
-        message: COMMIT_MESSAGE,
+        message,
         tree: { sha: treeSha },
         parents: [{ sha: baseSha }],
         verification,
-        commit: { message: COMMIT_MESSAGE, tree: { sha: treeSha }, verification },
+        commit: { message, tree: { sha: treeSha }, verification },
     };
 }
 
@@ -157,6 +160,7 @@ function createApi(fixture: Fixture, options: ApiOptions = {}) {
                 options.fetchedCommitTreeSha ?? CREATED_TREE_SHA,
                 options.fetchedVerification,
                 options.fetchedCommitSha,
+                options.commitMessage,
             ) };
         }
         if (endpoint === 'GET /repos/{owner}/{repo}/commits/{ref}') {
@@ -165,6 +169,7 @@ function createApi(fixture: Fixture, options: ApiOptions = {}) {
                 options.fetchedCommitTreeSha ?? CREATED_TREE_SHA,
                 options.fetchedVerification,
                 options.fetchedCommitSha,
+                options.commitMessage,
             ) };
         }
         if (endpoint === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') {
@@ -186,6 +191,8 @@ function createApi(fixture: Fixture, options: ApiOptions = {}) {
                 options.createdCommitParentSha ?? fixture.baseSha,
                 options.createdCommitTreeSha ?? CREATED_TREE_SHA,
                 options.createdVerification,
+                COMMIT_SHA,
+                options.commitMessage,
             ) };
         }
         if (endpoint === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}') {
@@ -234,6 +241,41 @@ test('publishes the exact authorized bytes with a verified GitHub commit and non
 
 test('refuses caller-controlled commit prose that omits exact conventional task metadata', async () => {
     await assert.rejects(() => runPublication({}, 'Implementation complete'), /STORY_SIGNED_PUBLICATION_COMMIT_MESSAGE/);
+});
+
+test('publishes exact authorized metadata and refuses substituted caller text before GitHub writes', async () => {
+    const fixture = await createFixture();
+    const task = fixture.execution.taskAssignment!;
+    const metadata = {
+        commitMessage: `docs(ezer): publish replacement fixture\n\nTask: ${TASK_ID}\n`,
+        prTitle: 'docs(ezer): publish replacement fixture',
+        prBody: `## Summary\n\nReplacement.\n\n## Story / task\n\n- Story / task: \`${TASK_ID}\`\n- Spec: \`specs/EP-signed-publication-S01/\`\n\n## Impact & Risk\n\n- **Domains / repos touched:** docs\n- **Contract surface touched:** no\n- **Risk level:** low\n- **Rollback plan:** close PR\n\n## Testing\n\nRun checks.\n\n## Checklist\n\n- [ ] Checks pass\n`,
+    };
+    fixture.execution.publicationMetadata = { ...metadata, digest: publicationMetadataDigest(task, metadata) };
+    const api = createApi(fixture, { commitMessage: metadata.commitMessage });
+    try {
+        await assert.rejects(publishSignedStoryCommit({ octokit: api.octokit, owner: 'example', repo: 'code',
+            worktreePath: fixture.directory, execution: fixture.execution, commitMessage: COMMIT_MESSAGE }), /STORY_SIGNED_PUBLICATION_COMMIT_MESSAGE/);
+        assert.equal(api.calls.length, 0);
+        const result = await publishSignedStoryCommit({ octokit: api.octokit, owner: 'example', repo: 'code',
+            worktreePath: fixture.directory, execution: fixture.execution, commitMessage: metadata.commitMessage });
+        assert.equal(result?.commitMessage, metadata.commitMessage);
+        assert.equal(api.calls.find(call => call.endpoint === 'POST /repos/{owner}/{repo}/git/commits')?.request.message, metadata.commitMessage);
+        for (const edit of [
+            { prTitle: 'Unconventional prose' }, { commitMessage: metadata.commitMessage.replace(TASK_ID, 'EP-other-S01-T01') },
+            { prBody: metadata.prBody.replace('## Testing', '## Omitted') },
+            { prBody: metadata.prBody.replace(TASK_ID, 'EP-other-S01-T01') },
+        ]) {
+            const changed = { ...metadata, ...edit };
+            assert.throws(() => requireAuthorizedPublicationMetadata({ ...changed,
+                digest: publicationMetadataDigest(task, changed) }, task), /STORY_PUBLICATION_METADATA/);
+        }
+        assert.throws(() => requireAuthorizedPublicationMetadata({ ...fixture.execution.publicationMetadata, extra: true }, task), /STORY_PUBLICATION_METADATA/);
+        const changedTask = { ...task, artifacts: task.artifacts.map(a => artifact(a.path, a.content + '\n')) };
+        assert.throws(() => requireAuthorizedPublicationMetadata(fixture.execution.publicationMetadata, changedTask), /STORY_PUBLICATION_METADATA_DIGEST/);
+    } finally {
+        await rm(fixture.directory, { recursive: true, force: true });
+    }
 });
 
 test('refuses a blob response that does not identify the exact authorized bytes', async () => {

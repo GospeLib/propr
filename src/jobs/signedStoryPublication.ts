@@ -255,7 +255,7 @@ export async function publishSignedStoryCommit(options: {
 }): Promise<CommitResult | null> {
     const { octokit, owner, repo, worktreePath, execution, commitMessage } = options;
     const taskId = execution.taskAssignment?.taskId;
-    if (!taskId || commitMessage !== buildStoryCommitMessage(taskId, true)) throw new Error(ERROR_COMMIT_MESSAGE);
+    if (!taskId || commitMessage !== buildStoryCommitMessage(taskId, true, execution)) throw new Error(ERROR_COMMIT_MESSAGE);
 
     const git = simpleGit(worktreePath);
     const paths = await verifyStoryPublication(worktreePath, execution);

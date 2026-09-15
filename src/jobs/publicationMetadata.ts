@@ -1,11 +1,10 @@
-import { requireStoryPublicationId } from '@propr/core';
+import { requireStoryPublicationId, STORY_PUBLICATION_TASK_ID_PATTERN as STORY_TASK_ID_PATTERN,
+    STORY_PUBLICATION_TASK_SUFFIX_PATTERN as STORY_TASK_SUFFIX_PATTERN,
+    STORY_PUBLICATION_SPEC_DIRECTORY_PREFIX as SPEC_DIRECTORY_PREFIX } from '@propr/core';
 export { requireStoryPublicationId, storyPublicationSpecLinkPath, storyPublicationTaskLinkRequired } from '@propr/core';
 
-const STORY_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*-T[0-9]+$/;
-const STORY_TASK_SUFFIX_PATTERN = /-T[0-9]+$/;
 const PUBLICATION_COMMIT_PREFIX = 'fix(ai): Implement ';
 const CONSERVATIVE_RISK_LEVEL = 'high';
-const SPEC_DIRECTORY_PREFIX = 'specs/';
 
 export interface StoryPublicationMetadata {
     commitMessage: string;

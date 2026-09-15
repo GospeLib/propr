@@ -35,7 +35,7 @@ export type { PaginatedOctokitInstance } from './auth/githubAuth.js';
 export { buildAuthPayload, generateAuthToken, verifyAuthToken, AUTH_TOKEN_MAX_AGE_MS, AUTH_TOKEN_MAX_CLOCK_SKEW_MS } from './auth/systemTaskAuth.js';
 export { consumeExecutionAdmission, createRedisAdmissionStore, pendingExecutionAdmissionKey, requiresEzerExecutionAdmission, inspectWorkerAdmissionReceipt, verifyWorkerAdmissionReceipt } from './admission/ezerExecutionAdmission.js';
 export type { CommentAdmissionBinding, AdmissionStore, ExecutionAdmissionClaims, WorkerAdmissionReceipt } from './admission/ezerExecutionAdmission.js';
-export { requireStoryPublicationId, requireStoryPublicationPolicyAtRevision, requireStoryPublicationPolicyFromReader, storyPublicationSpecLinkPath, storyPublicationTaskLinkRequired } from './publication/index.js';
+export { requireStoryPublicationId, requireStoryPublicationPolicyAtRevision, requireStoryPublicationPolicyFromReader, storyPublicationSpecLinkPath, storyPublicationTaskLinkRequired, STORY_PUBLICATION_TASK_ID_PATTERN, STORY_PUBLICATION_TASK_SUFFIX_PATTERN, STORY_PUBLICATION_SPEC_DIRECTORY_PREFIX } from './publication/index.js';
 export type { StoryPublicationPolicyInput } from './publication/index.js';
 
 export * from './config/configManager.js';

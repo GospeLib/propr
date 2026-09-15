@@ -1,12 +1,12 @@
 import type { PaginatedOctokitInstance } from '../auth/githubAuth.js';
 
 const STORY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-const STORY_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*-T[0-9]+$/;
-const STORY_TASK_SUFFIX_PATTERN = /-T[0-9]+$/;
+export const STORY_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*-T[0-9]+$/;
+export const STORY_TASK_SUFFIX_PATTERN = /-T[0-9]+$/;
 const TASK_POLICY_DECLARATION = 'Task: <story>-<task>';
 const SPEC_LINK_GATE_PATH = 'checks/spec-link.sh';
 const PULL_REQUEST_TEMPLATE_PATHS = ['.github/PULL_REQUEST_TEMPLATE.md', '.github/pull_request_template.md'] as const;
-const SPEC_DIRECTORY_PREFIX = 'specs/';
+export const SPEC_DIRECTORY_PREFIX = 'specs/';
 const SPEC_LINK_FILENAME = 'link.md';
 const GITHUB_NOT_FOUND_STATUS = 404;
 const REPOSITORY_PART_COUNT = 2;

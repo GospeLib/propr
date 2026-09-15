@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
+import { after, describe, test } from 'node:test';
+import { closeConnection } from '@propr/core';
 
 import { buildStoryPublicationMetadata, storyPublicationSpecLinkPath, storyPublicationTaskLinkRequired } from '../src/jobs/publicationMetadata.js';
 
 const SIGNED_TASK_ID = 'EP-publication-policy-S01-T02';
+after(async () => { await closeConnection(); });
 
 describe('signed story publication metadata', () => {
     test('replaces model prose with deterministic conventional commit and PR subjects', () => {

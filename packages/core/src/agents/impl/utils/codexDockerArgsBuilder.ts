@@ -1,7 +1,11 @@
 import logger from '../../../utils/logger.js';
 import type { AgentConfig } from '../../types.js';
 import { resolveConfigPath, type CodexRuntimeReasoningLevel } from '../../../config/configManager.js';
-import { wrapDockerRunArgsWithRepoSetup } from '../../../claude/docker/repoSetupWrapper.js';
+import {
+    wrapDockerRunArgsWithRepoSetup,
+    CODEX_SKILLS_SOURCE_PATH,
+    CODEX_SKILLS_TMPFS_OPTIONS,
+} from '../../../claude/docker/repoSetupWrapper.js';
 import { createContainerExecutionId } from './containerExecutionId.js';
 import {
     buildCodexRepositoryScoutArgs,
@@ -76,6 +80,8 @@ export function buildCodexDockerArgs(config: AgentConfig, params: CodexDockerArg
         '-v', `${worktreePath}:${workspaceTarget}:${readOnlyWorkspace ? 'ro' : 'rw'}`,
         ...(repositoryInspection ? [] : ['-v', `/tmp/git-processor:/tmp/git-processor:${readOnlyWorkspace ? 'ro' : 'rw'}`]),
         '-v', `${configPath}:${CONTAINER_CONFIG_PATH}:rw`,
+        '--mount', `type=bind,source=${configPath}/skills,target=${CODEX_SKILLS_SOURCE_PATH},readonly`,
+        '--tmpfs', CODEX_SKILLS_TMPFS_OPTIONS,
         ...(repositoryInspection ? [] : ['-e', `GH_TOKEN=${githubToken}`, '-e', `GITHUB_TOKEN=${githubToken}`]),
         ...(readOnlyWorkspace ? ['-e', 'PROPR_REPO_SETUP=0'] : []),
         ...envVars,
@@ -102,5 +108,5 @@ export function buildCodexDockerArgs(config: AgentConfig, params: CodexDockerArg
         logger.debug({ issueNumber, agentAlias: config.alias }, 'No model specified, Codex agent will use default');
     }
     logger.info({ issueNumber, agentAlias: config.alias }, 'Docker args built for Codex agent');
-    return wrapDockerRunArgsWithRepoSetup(dockerArgs, dockerImage, 'codex');
+    return wrapDockerRunArgsWithRepoSetup(dockerArgs, dockerImage, 'codex', true);
 }

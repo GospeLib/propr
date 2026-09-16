@@ -2,6 +2,7 @@ import { after, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createContainerExecutionId } from '../packages/core/src/agents/impl/utils/containerExecutionId.js';
 import { buildCodexDockerArgs } from '../packages/core/src/agents/impl/utils/codexDockerArgsBuilder.js';
+import { wrapDockerRunArgsWithRepoSetup } from '../packages/core/src/claude/docker/repoSetupWrapper.js';
 import { closeConnection } from '../packages/core/src/db/connection.js';
 import {
   DEFAULT_CONTEXT_ANALYSIS_TIMEOUT_MS,
@@ -13,6 +14,39 @@ after(async () => {
 });
 
 describe('context analysis runtime safeguards', () => {
+  test('rejects skills seeding without both isolated mounts and for a different agent', () => {
+    const image = 'propr/agent:test';
+    assert.throws(() => wrapDockerRunArgsWithRepoSetup(['run', image, 'codex'], image, 'codex', true), /read-only source and execution-local tmpfs/);
+    assert.throws(() => wrapDockerRunArgsWithRepoSetup(['run', image, 'claude'], image, 'claude', true), /Only Codex/);
+  });
+
+  test('seeds every Codex skill into an execution-local Linux mount without changing config or security', () => {
+    const configPath = '/tmp/codex-config';
+    const skillsPath = '/home/node/.codex/skills';
+    const skillsSourcePath = '/tmp/propr-codex-skills-source';
+    const config = {
+      id: 'codex-test', type: 'codex' as const, alias: 'codex', enabled: true,
+      dockerImage: 'propr/agent:test', configPath, supportedModels: ['gpt-5.6-sol'],
+    };
+    const args = buildCodexDockerArgs(config, {
+      worktreePath: '/tmp/review-worktree', githubToken: '', issueNumber: 0,
+      executionType: 'pr-review', modelName: 'gpt-5.6-sol', readOnlyWorkspace: true,
+    });
+    assert.ok(args.includes(`type=bind,source=${configPath}/skills,target=${skillsSourcePath},readonly`));
+    assert.ok(args.some((value, index) => args[index - 1] === '--tmpfs' && value.startsWith(`${skillsPath}:`)));
+    assert.ok(args.includes(`${configPath}:/home/node/.codex:rw`));
+    assert.ok(args.includes('/tmp/review-worktree:/home/node/workspace:ro'));
+    assert.ok(args.includes('no-new-privileges'));
+    assert.ok(args.includes('features.multi_agent=false'));
+    assert.ok(!args.includes('--ignore-rules'));
+    assert.ok(!args.includes('--ignore-user-config'));
+    assert.ok(!args.some((value) => /skills.*enabled=false|plugins=false/.test(value)));
+    const imageIndex = args.indexOf(config.dockerImage);
+    const wrapper = args[imageIndex + 2];
+    assert.match(wrapper, /cp -a/);
+    assert.ok(wrapper.indexOf('cp -a') < wrapper.indexOf('exec "$entrypoint" "$@"'));
+  });
+
   test('creates distinct fallback container IDs for parallel calls in the same millisecond', (t) => {
     t.mock.method(Date, 'now', () => 1_785_825_895_919);
 

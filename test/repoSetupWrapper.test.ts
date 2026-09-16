@@ -117,7 +117,15 @@ describe('wrapDockerRunArgsWithRepoSetup', () => {
                 .filter(line => !line.trim().startsWith('#'))
                 .join('\n');
             assert.doesNotMatch(executableLines, /\bsudo\b/, `${scriptPath} should not invoke sudo`);
-            assert.match(script, /exec su-exec node env HOME=\/home\/node USER=node LOGNAME=node "\$@"/);
+            if (scriptPath === 'scripts/codex-entrypoint.sh') {
+                assert.match(script, /CODEX_RUNTIME_UID=\$\(stat -c '%u' \/home\/node\/\.codex\)/);
+                assert.match(script, /CODEX_RUNTIME_GID=\$\(stat -c '%g' \/home\/node\/\.codex\)/);
+                assert.match(script, /if \[ "\$CODEX_RUNTIME_UID" = "0" \][\s\S]*exit 1/);
+                assert.match(script, /exec su-exec "\$\{CODEX_RUNTIME_UID:-1000\}:\$\{CODEX_RUNTIME_GID:-1000\}" env HOME=\/home\/node USER=node LOGNAME=node "\$@"/);
+                assert.doesNotMatch(executableLines, /chown\s+-R/);
+            } else {
+                assert.match(script, /exec su-exec node env HOME=\/home\/node USER=node LOGNAME=node "\$@"/);
+            }
         }
     });
 

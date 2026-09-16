@@ -23,7 +23,7 @@ const WORKSPACE_PATH = '/home/node/workspace';
 const DEFAULT_CACHE_ROOT = '/tmp/git-processor/propr-cache';
 export const CODEX_SKILLS_RUNTIME_PATH = '/home/node/.codex/skills';
 export const CODEX_SKILLS_SOURCE_PATH = '/tmp/propr-codex-skills-source';
-export const CODEX_SKILLS_TMPFS_OPTIONS = `${CODEX_SKILLS_RUNTIME_PATH}:rw,nosuid,nodev,size=64m`;
+export const CODEX_SKILLS_TMPFS_OPTIONS = `${CODEX_SKILLS_RUNTIME_PATH}:rw,exec,nosuid,nodev,size=64m`;
 
 const CODEX_SKILLS_SEED_SCRIPT = `
 if [ ! -d "${CODEX_SKILLS_SOURCE_PATH}" ]; then

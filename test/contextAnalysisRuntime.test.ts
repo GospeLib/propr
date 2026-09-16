@@ -23,6 +23,7 @@ describe('context analysis runtime safeguards', () => {
   test('seeds every Codex skill into an execution-local Linux mount without changing config or security', () => {
     const configPath = '/tmp/codex-config';
     const skillsPath = '/home/node/.codex/skills';
+    const skillsTmpfsOptions = `${skillsPath}:rw,exec,nosuid,nodev,size=64m`;
     const skillsSourcePath = '/tmp/propr-codex-skills-source';
     const config = {
       id: 'codex-test', type: 'codex' as const, alias: 'codex', enabled: true,
@@ -33,7 +34,7 @@ describe('context analysis runtime safeguards', () => {
       executionType: 'pr-review', modelName: 'gpt-5.6-sol', readOnlyWorkspace: true,
     });
     assert.ok(args.includes(`type=bind,source=${configPath}/skills,target=${skillsSourcePath},readonly`));
-    assert.ok(args.some((value, index) => args[index - 1] === '--tmpfs' && value.startsWith(`${skillsPath}:`)));
+    assert.ok(args.some((value, index) => args[index - 1] === '--tmpfs' && value === skillsTmpfsOptions));
     assert.ok(args.includes(`${configPath}:/home/node/.codex:rw`));
     assert.ok(args.includes('/tmp/review-worktree:/home/node/workspace:ro'));
     assert.ok(args.includes('no-new-privileges'));

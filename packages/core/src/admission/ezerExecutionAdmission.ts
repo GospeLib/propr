@@ -180,6 +180,15 @@ export interface AdmissionStore {
     take(key: string): Promise<string | null>;
 }
 
+/** Metadata-only observation; never returns an admission or worker credential. */
+export async function readExecutionAdmissionConsumption(store: Pick<AdmissionStore, 'get'>, admissionId: string) {
+    const [consumed, receipt] = await Promise.all([
+        store.get(`${CONSUMED_KEY_PREFIX}${admissionId}`),
+        store.get(`${RECEIPT_KEY_PREFIX}${admissionId}`),
+    ]);
+    return { admissionConsumed: consumed !== null, workerReceiptPresent: receipt !== null };
+}
+
 interface ExpectedExecution {
     control?: StopAdmissionBinding;
     comment?: CommentAdmissionBinding;

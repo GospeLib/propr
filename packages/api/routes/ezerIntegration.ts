@@ -1,9 +1,11 @@
 import type { Request, Response } from 'express';
 import { Redis } from 'ioredis';
-import { issueQueue, requireIntegrationPayload, consumeExecutionAdmission, createRedisAdmissionStore, pendingExecutionAdmissionKey, validateCurrentIntegration } from '@propr/core';
+import { issueQueue, requireIntegrationPayload, consumeExecutionAdmission, createRedisAdmissionStore, readExecutionAdmissionConsumption, pendingExecutionAdmissionKey, validateCurrentIntegration } from '@propr/core';
 import { verifyEzerInternalRequest } from '../ezerInternalAuth.js';
 const PREFIX = 'ezer-integration-';
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
+const OPERATION = /^[a-f0-9-]{36}$/;
+type IntegrationTaskIdentity = { operationId?: unknown; executionDigest?: unknown };
 const id = (digest:string) => `${PREFIX}${digest.slice('sha256:'.length)}`;
 export async function postEzerIntegration(req:Request,res:Response) {
   if (!verifyEzerInternalRequest(req)) { res.status(403).json({error:'INTEGRATION_INTERNAL_AUTH_REQUIRED'}); return; }
@@ -14,7 +16,8 @@ export async function postEzerIntegration(req:Request,res:Response) {
       throw Error('INTEGRATION_REQUEST_INVALID');
     const prior = await issueQueue.getJob(id(input.executionDigest));
     if (prior) {
-      if ((prior.data as any).operationId !== input.operationId || (prior.data as any).executionDigest !== input.executionDigest) throw Error('INTEGRATION_REPLAY_CHANGED');
+      const identity = prior.data as IntegrationTaskIdentity;
+      if (identity.operationId !== input.operationId || identity.executionDigest !== input.executionDigest) throw Error('INTEGRATION_REPLAY_CHANGED');
       res.json({taskId:prior.id,operationId:input.operationId,executionDigest:input.executionDigest}); return;
     }
     await validateCurrentIntegration(input);
@@ -36,7 +39,23 @@ export async function getEzerIntegration(req:Request,res:Response) {
   const digest = `sha256:${req.params.digest}`;
   if (!DIGEST.test(digest)) { res.status(400).json({error:'INTEGRATION_DIGEST_INVALID'}); return; }
   const job = await issueQueue.getJob(id(digest));
-  if (!job) { res.status(404).json({error:'INTEGRATION_TASK_NOT_FOUND'}); return; }
-  const data = job.data as any;
+  if (!job) {
+    const operationId = req.query.operationId;
+    if (operationId === undefined) { res.status(404).json({error:'INTEGRATION_TASK_NOT_FOUND'}); return; }
+    if (typeof operationId !== 'string' || !OPERATION.test(operationId)) {
+      res.status(400).json({error:'INTEGRATION_OPERATION_REQUIRED'}); return;
+    }
+    const redis = new Redis({host:process.env.REDIS_HOST || '127.0.0.1',port:Number(process.env.REDIS_PORT || '6379')});
+    try {
+      const consumption = await readExecutionAdmissionConsumption(createRedisAdmissionStore(redis), operationId);
+      // Jobs are retained on success AND failure. Recheck after the admission observation.
+      if (await issueQueue.getJob(id(digest))) { res.status(409).json({error:'INTEGRATION_DISPATCH_STATE_CHANGED'}); return; }
+      res.status(404).json({error:'INTEGRATION_TASK_NOT_FOUND',operationId,executionDigest:digest,
+        dispatchState:{jobAbsent:true,...consumption}});
+    } catch { res.status(503).json({error:'INTEGRATION_DISPATCH_STATE_UNKNOWN'}); }
+    finally { redis.disconnect(); }
+    return;
+  }
+  const data = job.data as IntegrationTaskIdentity;
   res.json({taskId:job.id,executionDigest:digest,operationId:data.operationId,state:await job.getState(),result:job.returnvalue,failedReason:job.failedReason});
 }

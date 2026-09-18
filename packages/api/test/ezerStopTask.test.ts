@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {db,consumeExecutionAdmission,verifyWorkerAdmissionReceipt} from '@propr/core';
 import {stopAdmittedTask} from '../routes/ezerStopTask.js';
 import {isEzerInternalEligibleRoute} from '../ezerInternalAuth.js';
+import type {AdmittedStopPorts} from '../routes/index.js';
 after(async()=>db.destroy());
 const SECRET='test-only-stop-signing-secret-longer-than32';
 function fixture(){
@@ -13,8 +14,8 @@ function fixture(){
  const encoded=Buffer.from(JSON.stringify(claims)).toString('base64url'),token=encoded+'.'+createHmac('sha256',SECRET).update(encoded).digest('base64url');
  const values=new Map<string,string>();
  const store={consumeAndIssue:async(a:string,b:string,v:string)=>{if(values.has(a))return false;values.set(a,v);values.set(b,v);return true;},get:async(k:string)=>values.get(k)??null,take:async(k:string)=>{const v=values.get(k)??null;values.delete(k);return v;}};
- const stops:any[]=[];let userId=123,started=true;
- const ports={store,signingSecret:SECRET,readTask:async()=>({repository:'GospeLib/main',issueNumber:7}),readComment:async()=>({id:42,body,issue_url:'https://api.github.com/repos/GospeLib/main/issues/7',created_at:new Date(now-1000).toISOString(),updated_at:new Date(now-1000).toISOString(),user:{id:userId,login:'owner'}}),readState:async()=>JSON.stringify({history:[{state:started?'claude_execution':'processing',metadata:{admissionId:'execution-a',operationId:'operation-a',containerId:'container-a'}}]}),stop:async(taskId:string,options:any)=>{stops.push({taskId,options});return {success:true,taskId,containerStopped:true,removedQueuedJobs:0,message:'stopped'};}};
+ const stops:Array<{taskId:string;options:Parameters<AdmittedStopPorts['stop']>[1]}>=[];let userId=123,started=true;
+ const ports={store,signingSecret:SECRET,readTask:async()=>({repository:'GospeLib/main',issueNumber:7}),readComment:async()=>({id:42,body,issue_url:'https://api.github.com/repos/GospeLib/main/issues/7',created_at:new Date(now-1000).toISOString(),updated_at:new Date(now-1000).toISOString(),user:{id:userId,login:'owner'}}),readState:async()=>JSON.stringify({history:[{state:started?'claude_execution':'processing',metadata:{admissionId:'execution-a',operationId:'operation-a',containerId:'container-a'}}]}),stop:async(taskId:string,options:Parameters<AdmittedStopPorts['stop']>[1])=>{stops.push({taskId,options});return {success:true,taskId,containerStopped:true,removedQueuedJobs:0,message:'stopped'};}};
  return {token,ports,control,stops,setUser:(v:number)=>userId=v,setStarted:(v:boolean)=>started=v};
 }
 test('requires exact actual owner comment and current execution before existing stop helper',async()=>{

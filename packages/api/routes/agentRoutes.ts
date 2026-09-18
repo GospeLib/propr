@@ -7,19 +7,27 @@ import {
   getAgentRegistry,
   loadAgents,
   resolveConfigPath,
+  ExecutionAbortedError,
+  PLANNING_ARTIFACT_PROFILE,
+  PLANNING_ARTIFACT_TIMEOUT_MS,
   toProprOpenCodeExternalModelId,
   toProprOpenCodeModelId,
   type Agent,
   type AgentRegistry,
+  type AnalyzeOptions,
 } from '@propr/core';
 import { AGENT_DEFAULTS, isManagedAgentConfigPath } from '@propr/shared';
 import { requireManageAgents } from '../permissionGuards.js';
+import { nativeAnalysis, nativeAnalysisFailureExecution, type NativeAnalysisBinding, type NativeAnalysisDependencies } from './nativeAnalysis.js';
 
 const execFileAsync = promisify(execFile);
 
 interface AgentChatQuery {
+  responseSchema?: AnalyzeOptions['responseSchema'];
   agentId: string;
   model?: string;
+  analysisProfile?: typeof PLANNING_ARTIFACT_PROFILE;
+  execution?: NativeAnalysisBinding;
 }
 
 interface AgentChatRequest {
@@ -29,6 +37,7 @@ interface AgentChatRequest {
 }
 
 interface AgentChatResult {
+  execution?: Record<string, unknown>;
   agentId: string;
   agentAlias?: string;
   model: string;
@@ -129,8 +138,34 @@ function canonicalChatModel(agent: Agent, model: string | undefined): string {
     ? toProprOpenCodeModelId(fallbackModel)
     : fallbackModel;
 }
+function supportedAnalysisProfiles(queries: AgentChatQuery[]): boolean {
+  return queries.every(query => query.analysisProfile === undefined || query.analysisProfile === PLANNING_ARTIFACT_PROFILE);
+}
+function validQueries(queries: unknown): queries is AgentChatQuery[] {
+  return Array.isArray(queries) && queries.length > 0;
+}
+function validPrompt(prompt: unknown): prompt is string {
+  return typeof prompt === 'string' && Boolean(prompt);
+}
+function chatAnalysisOptions(query: AgentChatQuery, context?: string): AnalyzeOptions {
+  return {
+    context, model: query.model,
+    ...(query.analysisProfile === PLANNING_ARTIFACT_PROFILE ? {
+      analysisProfile: PLANNING_ARTIFACT_PROFILE, timeoutMs: PLANNING_ARTIFACT_TIMEOUT_MS,
+      reasoningLevel: 'low' as const, responseFormat: 'json' as const,
+      ...(query.responseSchema === undefined ? {} : { responseSchema: query.responseSchema }),
+    } : {}),
+  };
+}
 
-export function createAgentRoutes() {
+function canStartChatAnalysis(signal: AbortSignal, disconnected: boolean): boolean {
+  return !signal.aborted && !disconnected;
+}
+function canPublishChatResult(signal: AbortSignal, disconnected: boolean, response: Response): boolean {
+  return canStartChatAnalysis(signal, disconnected) && !response.destroyed;
+}
+
+export function createAgentRoutes(options: NativeAnalysisDependencies = {}) {
   const router = Router();
 
   router.get('/opencode/models', requireManageAgents, async (req: Request, res: Response): Promise<void> => {
@@ -148,17 +183,32 @@ export function createAgentRoutes() {
   // Chat executes an already-configured agent; it does not mutate installation
   // agent configuration, so authenticated members may use it.
   router.post('/chat', async (req: Request, res: Response): Promise<void> => {
+    const execution = new AbortController();
+    let nativeRunning = false;
+    let clientDisconnected = false;
+    const disconnected = () => {
+      if (!res.writableEnded) {
+        clientDisconnected = true;
+        if (nativeRunning) execution.abort(new ExecutionAbortedError('Native analysis client disconnected'));
+      }
+    };
+    req.once('aborted', disconnected);
+    res.once('close', disconnected);
     try {
       const { queries, prompt, context } = req.body as AgentChatRequest;
 
       // Validate input
-      if (!queries || !Array.isArray(queries) || queries.length === 0) {
+      if (!validQueries(queries)) {
         res.status(400).json({ error: 'Invalid queries array' });
         return;
       }
 
-      if (!prompt || typeof prompt !== 'string') {
+      if (!validPrompt(prompt)) {
         res.status(400).json({ error: 'prompt is required and must be a string' });
+        return;
+      }
+      if (!supportedAnalysisProfiles(queries)) {
+        res.status(400).json({ error: 'Unsupported analysis profile' });
         return;
       }
 
@@ -171,7 +221,9 @@ export function createAgentRoutes() {
       // use the same agent credentials concurrently.
       const results: AgentChatResult[] = [];
       for (const query of queries) {
+          if (!canStartChatAnalysis(execution.signal, clientDisconnected)) break;
           const agent = await resolveChatAgent(registry, query.agentId);
+          if (!canStartChatAnalysis(execution.signal, clientDisconnected)) break;
 
           if (!agent) {
             results.push({
@@ -185,14 +237,20 @@ export function createAgentRoutes() {
 
           const start = Date.now();
           try {
-            const analysisResult = await agent.analyze(prompt, { context, model: query.model });
+            const analysisOptions = chatAnalysisOptions(query, context);
+            nativeRunning = query.analysisProfile === PLANNING_ARTIFACT_PROFILE;
+            const analysisResult = query.analysisProfile === PLANNING_ARTIFACT_PROFILE
+              ? await nativeAnalysis(agent, prompt, { options: analysisOptions, signal: execution.signal, binding: query.execution, dependencies: options })
+              : await agent.analyze(prompt, analysisOptions);
+            if (execution.signal.aborted) break;
             results.push({
               agentId: query.agentId,
               agentAlias: agent.config.alias,
               model: canonicalChatModel(agent, analysisResult.modelUsed || query.model),
               response: analysisResult.response,
               error: analysisResult.success === false ? (analysisResult.error || 'Analysis failed') : undefined,
-              durationMs: Date.now() - start
+              durationMs: Date.now() - start,
+              ...('execution' in analysisResult ? { execution: analysisResult.execution } : {})
             });
           } catch (err) {
             results.push({
@@ -200,15 +258,19 @@ export function createAgentRoutes() {
               agentAlias: agent.config.alias,
               model: canonicalChatModel(agent, query.model),
               error: (err as Error).message,
-              durationMs: Date.now() - start
+              durationMs: Date.now() - start,
+              ...nativeAnalysisFailureExecution(err),
             });
           }
       }
 
-      res.json({ results });
+      if (canPublishChatResult(execution.signal, clientDisconnected, res)) res.json({ results });
     } catch (error) {
       console.error('Error in /api/agents/chat:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      if (canPublishChatResult(execution.signal, clientDisconnected, res)) res.status(500).json({ error: 'Internal server error' });
+    } finally {
+      req.off('aborted', disconnected);
+      res.off('close', disconnected);
     }
   });
 

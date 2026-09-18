@@ -1,7 +1,7 @@
 import type { Request, Response } from 'express';
 import type { Knex } from 'knex';
 import { Redis } from 'ioredis';
-import { buildPlannerAbortSignalKey } from '@propr/core';
+import { buildPlannerAbortSignalKey, buildPlannerAbortRedisOptions } from '@propr/core';
 import { checkDbAndAuth, sendCheckError } from './plannerHelpers/index.js';
 
 export interface AbortRedisClient {
@@ -18,11 +18,8 @@ export interface PlannerAbortHandlerDependencies {
   setAbortSignal: (draftId: string, runId?: string) => Promise<void>;
 }
 
-function createAbortRedis(): AbortRedisClient {
-  return new Redis({
-    host: process.env.REDIS_HOST || 'redis',
-    port: parseInt(process.env.REDIS_PORT || '6379', 10)
-  });
+export function createAbortRedis(): AbortRedisClient {
+  return new Redis(buildPlannerAbortRedisOptions());
 }
 
 async function closeAbortRedis(redis: AbortRedisClient): Promise<void> {

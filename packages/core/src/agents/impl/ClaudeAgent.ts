@@ -30,9 +30,9 @@ import {
     type ModelReasoningLevel
 } from '../../config/configManager.js';
 import { AGENT_DEFAULT_VERSIONS } from '../version/types.js';
-import { DEFAULT_AGENT_EXECUTION_TIMEOUT_MS } from '../constants.js';
+import { DEFAULT_AGENT_EXECUTION_TIMEOUT_MS, PLANNING_ARTIFACT_PROFILE } from '../constants.js';
 import { persistLlmLog, createLlmLogFromAnalysis, buildTaskWorkRef, buildAnalysisWorkRef, formatUsageMetrics } from '../../utils/llmLogger.js';
-import { processDockerResult, buildDockerArgs, resolveClaudeRuntimeOwner, getCorrectedTokenUsage, ensurePromptInConversationLog, executeWithUsageTracking, getClaudeAnalysisText, buildAnalysisSafetySuffix, type PersistLogsParams } from './utils/index.js';
+import { processDockerResult, buildDockerArgs, resolveClaudeRuntimeOwner, getCorrectedTokenUsage, ensurePromptInConversationLog, executeWithUsageTracking, getClaudeAnalysisText, buildAnalysisSafetySuffix, resolveAnalysisPolicy, checkpointAnalysisInput, nativeAnalysisExecutorOptions, planningAnalysisAuthFailure, ANALYSIS_SYSTEM_PROMPT, type PersistLogsParams } from './utils/index.js';
 import type { ExecutionType } from '../../utils/llmMetrics.types.js';
 
 export { UsageLimitError };
@@ -65,7 +65,9 @@ type AnalysisOutcome = { isSuccess: true } | { isSuccess: false; errorDetail: st
  * can act, instead of handing the error string back as a "successful" analysis that
  * downstream JSON parsing then silently rejects.
  */
-export function resolveAnalysisOutcome(claudeOutput: ClaudeOutput, stderr: string): AnalysisOutcome {
+export function resolveAnalysisOutcome(claudeOutput: ClaudeOutput, stderr: string, closedPlanningProfile = false): AnalysisOutcome {
+    const authFailure = closedPlanningProfile ? planningAnalysisAuthFailure(claudeOutput.rawOutput) : undefined;
+    if (authFailure) return { isSuccess: false, errorDetail: authFailure };
     const finalResult = claudeOutput.finalResult;
     if (finalResult?.is_error !== true && (finalResult?.result || claudeOutput.success)) {
         return { isSuccess: true };
@@ -177,7 +179,9 @@ export class ClaudeAgent implements Agent {
 
     /** Runs a lightweight, read-only analysis for planning, summarization, and PR reviews. */
     async analyze(prompt: string, options?: AnalyzeOptions): Promise<AnalysisResult> {
-        const { context, model, taskId, taskNumber, prNumber, executionType, correlationId, repository, metadata, timeoutMs, responseFormat = 'text', reasoningLevel, useConfiguredReasoningLevel = false, suppressLlmLog, readOnlyWorkspacePath, allowReadOnlyCommands = false } = options || {};
+        const { context, model, taskId, taskNumber, prNumber, executionType, correlationId, repository, metadata, responseFormat = 'text', useConfiguredReasoningLevel = false, suppressLlmLog, readOnlyWorkspacePath, allowReadOnlyCommands = false, executionCallbacks, analysisProfile } = options || {};
+        const policy = resolveAnalysisPolicy(options);
+        const responseSchema = policy.responseSchema;
         const startTime = Date.now();
 
         logger.info({
@@ -193,23 +197,30 @@ export class ClaudeAgent implements Agent {
 
         try {
             const effectiveReasoningLevel = await this.resolveEffectiveReasoningLevel(
-                reasoningLevel,
+                policy.reasoningLevel,
                 effectiveModel,
                 useConfiguredReasoningLevel
             );
             const dockerArgs = buildDockerArgs(this.config, this.maxTurns, {
                 worktreePath: analysisWorkspace.path, githubToken: process.env.GITHUB_TOKEN || '',
-                modelName: effectiveModel, issueNumber: 0, systemPrompt: 'You are a helpful assistant.',
+                modelName: effectiveModel, issueNumber: 0, systemPrompt: ANALYSIS_SYSTEM_PROMPT,
                 tools: analysisWorkspace.tools, taskId, executionType,
                 readOnlyWorkspace: analysisWorkspace.readOnly,
                 repositoryInspection: analysisWorkspace.repositoryInspection,
-                reasoningLevel: effectiveReasoningLevel
+                reasoningLevel: effectiveReasoningLevel,
+                environment: policy.environment,
+                preserveTerminalEvidence: Boolean(executionCallbacks),
+                analysisProfile,
+                responseSchema,
             });
-
+            await checkpointAnalysisInput(executionCallbacks, analysisPrompt, responseSchema);
             const { result, usageMetrics } = await executeWithUsageTracking(
                 'claude',
                 async () => executeDockerCommand('docker', dockerArgs, {
-                    timeout: timeoutMs ?? 1800000, stdinData: analysisPrompt, taskId
+                    timeout: policy.timeoutMs,
+                    timeoutScope: policy.timeoutScope,
+                    stdinData: analysisPrompt, taskId,
+                    ...nativeAnalysisExecutorOptions(executionCallbacks, analysisWorkspace.path, taskId),
                 }),
                 ANALYSIS_AGENT_TANK_TIMEOUT_MS
             );
@@ -227,9 +238,9 @@ export class ClaudeAgent implements Agent {
                 };
             }
 
-            const outcome = resolveAnalysisOutcome(claudeOutput, result.stderr);
+            const outcome = resolveAnalysisOutcome(claudeOutput, result.stderr, analysisProfile === PLANNING_ARTIFACT_PROFILE);
             if (outcome.isSuccess) {
-                const analysisText = getClaudeAnalysisText(claudeOutput);
+                const analysisText = getClaudeAnalysisText(claudeOutput, responseFormat, responseSchema);
                 logger.info({
                     agentAlias: this.config.alias, responseLength: analysisText.length, model: effectiveModel,
                     executionTimeMs, reportedTokens: claudeOutput.tokenUsage, correctedTokens: correctedTokenUsage,

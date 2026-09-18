@@ -12,6 +12,7 @@ import { AgentConfig } from '../../types.js';
 import { resolveConfigPath, type ClaudeRuntimeReasoningLevel } from '../../../config/configManager.js';
 import { wrapDockerRunArgsWithRepoSetup } from '../../../claude/docker/repoSetupWrapper.js';
 import { createContainerExecutionId } from './containerExecutionId.js';
+import { PLANNING_ARTIFACT_PROFILE, PLANNING_ARTIFACT_MAX_OUTPUT_TOKENS } from '../../constants.js';
 import {
     buildRepositoryScoutMcpConfig,
     REPOSITORY_SCOUT_CONTAINER_ROOT,
@@ -21,6 +22,7 @@ import {
 const GITHUB_CREDENTIAL_ENV_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_ACCESS_TOKEN']);
 const GITHUB_CREDENTIAL_ENV_PATTERN = /^(?:GH|GITHUB)_.*(?:TOKEN|KEY|SECRET|PASSWORD|PAT|PRIVATE_KEY)$/;
 const CLAUDE_RUNTIME_HOME = '/home/node/runtime-home';
+const EMPTY_MCP_CONFIG = '{"mcpServers":{}}';
 const DEFAULT_CONTAINER_OWNER = Object.freeze({ uid: 1000, gid: 1000 });
 
 /** Match the entrypoint's unprivileged mounted-config owner without changing credentials. */
@@ -56,6 +58,9 @@ function buildEnvironmentVariableArgs(
  * Parameters for building Docker arguments.
  */
 export interface DockerArgsParams {
+    responseSchema?: Readonly<Record<string, unknown>>;
+    analysisProfile?: typeof PLANNING_ARTIFACT_PROFILE;
+    preserveTerminalEvidence?: boolean;
     /** Path to the git worktree */
     worktreePath: string;
     /** GitHub token for API access */
@@ -82,12 +87,12 @@ export interface DockerArgsParams {
     repositoryInspection?: boolean;
 }
 
-function repositoryInspectionArgs(enabled: boolean): string[] {
-    if (!enabled) return [];
+function repositoryInspectionArgs(enabled: boolean, nativeArtifact = false): string[] {
+    if (!enabled && !nativeArtifact) return [];
     return [
-        '--mcp-config', buildRepositoryScoutMcpConfig(),
+        '--mcp-config', nativeArtifact ? EMPTY_MCP_CONFIG : buildRepositoryScoutMcpConfig(),
         '--strict-mcp-config',
-        '--allowedTools', REPOSITORY_SCOUT_MCP_TOOLS.join(','),
+        ...(nativeArtifact ? [] : ['--allowedTools', REPOSITORY_SCOUT_MCP_TOOLS.join(',')]),
         '--setting-sources', '',
         '--disable-slash-commands',
     ];
@@ -117,6 +122,7 @@ function buildClaudeContainerName(
 }
 
 function buildBaseDockerArgs(options: {
+    preserveTerminalEvidence?: boolean;
     config: AgentConfig;
     maxTurns: number;
     worktreePath: string;
@@ -135,7 +141,7 @@ function buildBaseDockerArgs(options: {
         githubToken, envVars, claudeJsonMount, inspectionArgs, reasoningLevel, readOnlyWorkspace,
     } = options;
     return [
-        'run', '--rm', '-i',
+        'run', ...(options.preserveTerminalEvidence ? [] : ['--rm']), '-i',
         '--name', containerName,
         '--security-opt', 'no-new-privileges',
         '--cap-add', 'CHOWN',
@@ -183,19 +189,25 @@ export function buildDockerArgs(
 ): string[] {
     const {
         worktreePath, githubToken, modelName, issueNumber, systemPrompt, tools, environment,
-        taskId, executionType, reasoningLevel, readOnlyWorkspace = false, repositoryInspection = false,
+        taskId, executionType, reasoningLevel, repositoryInspection = false,
     } = params;
+    const nativeArtifact = params.analysisProfile === PLANNING_ARTIFACT_PROFILE;
+    const readOnlyWorkspace = nativeArtifact || Boolean(params.readOnlyWorkspace);
     const configPath = resolveConfigPath(config.configPath);
     if (repositoryInspection && !readOnlyWorkspace) {
         throw new Error('Repository inspection requires a read-only workspace');
     }
     // Native file tools can read mounted provider configuration, so read-only runs disable them.
     const effectiveTools = readOnlyWorkspace ? '' : tools;
-    const inspectionArgs = repositoryInspectionArgs(repositoryInspection);
+    const inspectionArgs = repositoryInspectionArgs(repositoryInspection, nativeArtifact);
     const workspaceMountTarget = repositoryInspection
         ? REPOSITORY_SCOUT_CONTAINER_ROOT
         : '/home/node/workspace';
-    const envVars = buildEnvironmentVariableArgs([config.envVars, environment], readOnlyWorkspace);
+    // This closed profile uses mounted subscription authentication only. Never
+    // admit arbitrary environment configuration that can reroute provider auth.
+    const envVars = nativeArtifact
+        ? ['-e', `CLAUDE_CODE_MAX_OUTPUT_TOKENS=${PLANNING_ARTIFACT_MAX_OUTPUT_TOKENS}`]
+        : buildEnvironmentVariableArgs([config.envVars, environment], readOnlyWorkspace);
     const dockerArgs = buildBaseDockerArgs({
         config,
         maxTurns,
@@ -209,6 +221,7 @@ export function buildDockerArgs(
         inspectionArgs,
         reasoningLevel,
         readOnlyWorkspace,
+        preserveTerminalEvidence: params.preserveTerminalEvidence,
     });
 
     // Add model parameter if specified
@@ -228,6 +241,8 @@ export function buildDockerArgs(
             agentAlias: config.alias
         }, 'No model specified, Claude agent will use default');
     }
+
+    if (params.responseSchema !== undefined) dockerArgs.push('--json-schema', JSON.stringify(params.responseSchema));
 
     // Add optional system prompt
     if (systemPrompt !== undefined) {

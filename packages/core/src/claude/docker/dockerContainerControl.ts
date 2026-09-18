@@ -4,10 +4,32 @@ import logger from '../../utils/logger.js';
 const DOCKER_PATH = '/usr/bin/docker';
 const CONTAINER_IDENTIFIER_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
 const MAX_STOP_TIMEOUT_SECONDS = 300;
+const RETAINED_CONTAINER_STOP_TIMEOUT = '0';
 const DEFAULT_CREATION_RACE_ATTEMPTS = 10;
 const DEFAULT_CREATION_RACE_RETRY_MS = 250;
 const DEFAULT_TEARDOWN_DEADLINE_MS = 4000;
 const MAX_TEARDOWN_DEADLINE_MS = 10000;
+const STOPPED_CONTAINER_STATUSES = new Set(['exited', 'dead']);
+const STOP_INSPECTION_FORMAT = '{"id":{{json .Id}},"autoRemove":{{json .HostConfig.AutoRemove}},"state":{{json .State}}}';
+const STOP_COMMAND_SLACK_SECONDS = 5;
+const MILLISECONDS_PER_SECOND = 1000;
+
+export interface DockerStopResult {
+    success: boolean;
+    error?: string;
+    cessation?: DockerExecutionCessation;
+}
+interface DockerStopInspection { id: string; autoRemove: boolean; state: DockerContainerTerminalState }
+
+function validateStopInspection(before: DockerStopInspection): void {
+    if (!CONTAINER_IDENTIFIER_PATTERN.test(before.id) || typeof before.autoRemove !== 'boolean' ||
+        typeof before.state?.Running !== 'boolean' || typeof before.state?.Status !== 'string')
+        throw Error('Incomplete Docker stop inspection');
+}
+
+export function isStoppedDockerContainerState(state: Pick<DockerContainerTerminalState, 'Running' | 'Status'>): boolean {
+    return !state.Running && STOPPED_CONTAINER_STATUSES.has(state.Status);
+}
 
 function validateStopRequest(containerId: string, timeoutSeconds: number): string | undefined {
     if (!containerId) return 'No container ID provided';
@@ -79,6 +101,7 @@ async function forceRemoveContainer(containerId: string): Promise<{ success: boo
 }
 
 export interface DockerExecutionTeardownOptions {
+    preserveTerminalEvidence?: boolean;
     taskId?: string;
     attemptGeneration?: string;
     containerId?: string | null;
@@ -86,6 +109,65 @@ export interface DockerExecutionTeardownOptions {
     attempts?: number;
     retryDelayMs?: number;
     deadlineMs?: number;
+}
+export type DockerExecutionCessation = 'stopped' | 'running' | 'absent' | 'unavailable' | 'not-applicable';
+export interface DockerContainerTerminalState {
+    Running: boolean;
+    Status: string;
+    ExitCode: number;
+    OOMKilled: boolean;
+    Error: string;
+    FinishedAt: string;
+}
+
+export async function inspectDockerTerminalState(identifier: string): Promise<DockerContainerTerminalState> {
+    if (!CONTAINER_IDENTIFIER_PATTERN.test(identifier)) throw new Error('Invalid Docker container identifier');
+    const output = await runDocker(['inspect', '--format', '{{json .State}}', identifier], DEFAULT_TEARDOWN_DEADLINE_MS);
+    const state = JSON.parse(output) as DockerContainerTerminalState;
+    if (typeof state.Running !== 'boolean' || typeof state.Status !== 'string'
+        || !Number.isInteger(state.ExitCode) || typeof state.OOMKilled !== 'boolean'
+        || typeof state.Error !== 'string' || typeof state.FinishedAt !== 'string')
+        throw new Error('Docker terminal state is incomplete');
+    return state;
+}
+
+/** Remove only after the caller has durably checkpointed observed terminal state. */
+export async function removeDockerTerminalContainer(identifier: string): Promise<void> {
+    if (!CONTAINER_IDENTIFIER_PATTERN.test(identifier)) throw new Error('Invalid Docker container identifier');
+    await runDocker(['rm', identifier], DEFAULT_TEARDOWN_DEADLINE_MS);
+}
+
+/** Absence is evidence only when the daemon query itself succeeds. */
+async function observeContainer(identifier: string): Promise<DockerExecutionCessation | 'removing'> {
+    try {
+        const state = await inspectDockerTerminalState(identifier);
+        return state.Running ? 'running' : isStoppedDockerContainerState(state) ? 'stopped'
+            : state.Status === 'removing' ? 'removing' : 'unavailable';
+    } catch (error) {
+        return /No such (container|object)/.test((error as Error).message) ? 'absent' : 'unavailable';
+    }
+}
+
+export async function observeDockerExecutionCessation(options: DockerExecutionTeardownOptions): Promise<DockerExecutionCessation> {
+    if (!options.containerName && !options.containerId) return 'not-applicable';
+    try {
+        if (options.taskId && options.attemptGeneration) {
+            const output = await runDocker(['ps', '-aq',
+                '--filter', `label=propr.task.id=${options.taskId}`,
+                '--filter', `label=propr.task.attempt-generation=${options.attemptGeneration}`,
+            ], DEFAULT_TEARDOWN_DEADLINE_MS);
+            const identifiers = output.trim().split('\n').filter(Boolean);
+            if (!identifiers.length) return 'absent';
+            const observations = await Promise.all(identifiers.map(observeContainer));
+            if (observations.includes('running')) return 'running';
+            if (observations.includes('unavailable') || observations.includes('removing')) return 'unavailable';
+            return observations.includes('stopped') ? 'stopped' : 'absent';
+        }
+        const observed = await observeContainer(options.containerId ?? options.containerName!);
+        return observed === 'removing' ? 'unavailable' : observed;
+    } catch {
+        return 'unavailable';
+    }
 }
 
 async function findExecutionContainers(
@@ -138,7 +220,7 @@ function hasCompletedContainerRemoval(
         || !removal.notFound.has(options.containerName);
 }
 
-async function removeExecutionContainers(containers: Set<string>, deadline: number): Promise<ContainerRemovalResult> {
+async function removeExecutionContainers(containers: Set<string>, deadline: number, preserveTerminalEvidence = false): Promise<ContainerRemovalResult> {
     const failed = new Set<string>();
     const notFound = new Set<string>();
     for (const container of containers) {
@@ -149,7 +231,7 @@ async function removeExecutionContainers(containers: Set<string>, deadline: numb
             continue;
         }
         try {
-            await runDocker(['rm', '-f', container], removalBudgetMs);
+            await runDocker(preserveTerminalEvidence ? ['stop', '-t', RETAINED_CONTAINER_STOP_TIMEOUT, container] : ['rm', '-f', container], removalBudgetMs);
         } catch (error) {
             const message = (error as Error).message;
             if (message.includes('No such container') || message.includes('No such object')) {
@@ -186,7 +268,7 @@ async function retryExecutionContainerRemoval(
         }
 
         if (containers.size > 0) {
-            const removal = await removeExecutionContainers(containers, deadline);
+            const removal = await removeExecutionContainers(containers, deadline, options.preserveTerminalEvidence);
             failedRemovals = removal.failed;
             if (hasCompletedContainerRemoval(options, removal)) return;
         }
@@ -231,13 +313,67 @@ export async function teardownDockerExecution(
     await retryExecutionContainerRemoval(options, attempts, retryDelayMs, deadline);
 }
 
-/** Gracefully stops a Docker container, then force-kills it when necessary. */
+/** Reclamation cannot negate a terminal observation or claim an unstarted run executed. */
+async function reclaimObservedContainer(identifier: string, cessation: 'stopped' | 'absent'): Promise<DockerStopResult> {
+    try {
+        await removeDockerTerminalContainer(identifier);
+        return { success: true, cessation };
+    } catch (error) {
+        const message = (error as Error).message;
+        if (/No such (container|object)/.test(message)) return { success: true, cessation };
+        if (cessation === 'stopped') return { success: true, cessation,
+            ...(/removal .*already in progress/.test(message) ? {} : { error: message }) };
+        return { success: false, cessation: 'unavailable', error: message };
+    }
+}
+
+function acknowledgedAutoRemoval(before: DockerStopInspection,
+    observed: DockerExecutionCessation | 'removing', stopAcknowledged: boolean): boolean {
+    return before.autoRemove && before.state.Running && stopAcknowledged && (observed === 'absent' || observed === 'removing');
+}
+
+/** Observe the exact execution separately from its later non-force reclamation. */
+async function stopObservedContainer(containerId: string, timeoutSeconds: number, preserveTerminalEvidence: boolean): Promise<DockerStopResult> {
+    let before: DockerStopInspection;
+    try {
+        before = JSON.parse(await runDocker(['inspect', '--format', STOP_INSPECTION_FORMAT, containerId], DEFAULT_TEARDOWN_DEADLINE_MS));
+        validateStopInspection(before);
+    } catch (error) {
+        const absent = /No such (container|object)/.test((error as Error).message);
+        return { success: absent && !preserveTerminalEvidence, cessation: absent ? 'absent' : 'unavailable', error: (error as Error).message };
+    }
+    if (!preserveTerminalEvidence && !before.state.Running && before.state.Status === 'created')
+        return reclaimObservedContainer(before.id, 'absent');
+    if (!before.state.Running && !isStoppedDockerContainerState(before.state))
+        return { success: false, cessation: 'unavailable', error: `Container has not reached a running or terminal state: ${before.state.Status}` };
+    let stopAcknowledged = false;
+    if (before.state.Running) {
+        try {
+            await runDocker(['stop', '-t', String(timeoutSeconds), before.id],
+                (timeoutSeconds + STOP_COMMAND_SLACK_SECONDS) * MILLISECONDS_PER_SECOND);
+            stopAcknowledged = true;
+        } catch (error) { logger.warn({ containerId: before.id, error: (error as Error).message }, 'Docker stop command did not acknowledge cessation'); }
+    }
+    const observed = await observeContainer(before.id);
+    // Auto-remove destroys State. Only a pre-observed running exact ID plus the
+    // daemon's successful stop acknowledgement proves we stopped that execution.
+    const stopped = observed === 'stopped' || (!preserveTerminalEvidence && acknowledgedAutoRemoval(before, observed, stopAcknowledged));
+    if (!stopped) return { success: observed === 'absent' && !preserveTerminalEvidence,
+        cessation: observed === 'removing' ? 'unavailable' : observed, error: `Observed container cessation is ${observed}` };
+    if (!preserveTerminalEvidence && observed === 'stopped') return reclaimObservedContainer(before.id, 'stopped');
+    return { success: true, cessation: 'stopped' };
+}
+
 export async function stopDockerContainer(
     containerId: string,
     timeoutSeconds: number = 10,
-): Promise<{ success: boolean; error?: string }> {
+    options: Pick<DockerExecutionTeardownOptions, 'preserveTerminalEvidence'> & { requireObservedCessation?: boolean } = {},
+): Promise<DockerStopResult> {
     const validationError = validateStopRequest(containerId, timeoutSeconds);
     if (validationError) return { success: false, error: validationError };
+    if (options.preserveTerminalEvidence || options.requireObservedCessation) {
+        return stopObservedContainer(containerId, timeoutSeconds, options.preserveTerminalEvidence === true);
+    }
 
     logger.info({ containerId, timeoutSeconds }, 'Attempting to stop Docker container');
     try {

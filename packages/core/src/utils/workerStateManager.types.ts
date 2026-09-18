@@ -95,6 +95,8 @@ export interface CancellationMetadata {
 }
 
 export interface UpdateMetadata {
+    /** Refuse execution/settlement when its authoritative database history was not persisted. */
+    requireDurableHistory?: boolean;
     isRetry?: boolean;
     error?: {
         message: string;

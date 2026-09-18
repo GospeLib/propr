@@ -54,3 +54,4 @@ export {
     type AntigravityTerminalStatus,
     type AntigravityTranscriptEvent
 } from './antigravityOutputParser.js';
+export { resolveAnalysisPolicy, checkpointAnalysisInput, nativeAnalysisExecutorOptions, planningAnalysisAuthFailure, ANALYSIS_SYSTEM_PROMPT } from './analysisPolicy.js';

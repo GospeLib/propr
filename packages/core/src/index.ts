@@ -11,7 +11,7 @@ export { persistLlmLog, createLlmLogFromAnalysis, createLlmLogFromAgentExecution
 export type { LlmLogEntry, WorkReference, WorkType } from './utils/llmLogger.js';
 export type { LLMMetricsSummary, LLMMetricsData, RecordMetricsOptions, ClaudeResult as LLMClaudeResult, IssueRef as LLMIssueRef, ModelPricing, ExtractedMetrics, AggregatedMetrics, CostCheckMetrics, PersistMetrics, ConversationDetail, LLMMetricsSummaryResult, ModelMetrics, DailyMetric, HighCostAlert, ConversationStep, TokenUsage, ExecutionType } from './utils/llmMetrics.types.js';
 export { WorkerStateManager, getStateManager, closeStateManager, TaskStates } from './utils/workerStateManager.js';
-export { taskStateExpectation } from './utils/workerStateTransition.js';
+export { taskStateExpectation, MAX_ATOMIC_UPDATE_ATTEMPTS, waitForAtomicUpdateRetry } from './utils/workerStateTransition.js';
 export { hashTaskAttemptToken } from './utils/taskAttemptGeneration.js';
 export { getEventPublisher, closeEventPublisher, EventPublisher } from './utils/eventPublisher.js';
 export type { TaskState, IssueRef, HistoryEntry, LastError, ClaudeResultSummary, PRResult, TaskStateData, TaskStateExpectation, TaskStatePublicationResult, TaskStateUpdateResult, UpdateMetadata, TaskResult, ResumableTaskInfo, NonTerminalTaskScanResult, WorkerStateManagerOptions } from './utils/workerStateManager.types.js';
@@ -217,7 +217,7 @@ export {
     runLightweightLLMAnalysis,
     UsageLimitError
 } from './claude/claudeService.js';
-export { AGENT_TYPES, AGENT_IMAGE_NAME, DEFAULT_AGENT_DOCKER_IMAGES, validateAgentType } from './agents/constants.js';
+export { AGENT_TYPES, AGENT_IMAGE_NAME, DEFAULT_AGENT_DOCKER_IMAGES, validateAgentType, PLANNING_ARTIFACT_PROFILE, PLANNING_ARTIFACT_TIMEOUT_MS, PLANNING_ARTIFACT_MAX_OUTPUT_TOKENS } from './agents/constants.js';
 export type { AgentTypeValidationResult } from './agents/constants.js';
 export type {
     ExecuteClaudeCodeOptions,
@@ -237,7 +237,9 @@ export {
     buildClaudePrompt
 } from './claude/claudeHelpers.js';
 export type { ClaudeOutput, ConversationLogEntry, ClaudeOutputResult, BuildClaudePromptOptions, DockerArgsParams, StorePromptOptions } from './claude/claudeHelpers.js';
-export { buildPlannerAbortSignalKey, executeDockerCommand, findRunningDockerContainerForTask, findTaskContainer, inspectLegacyDockerContainerLivenessForTask, runWithExecutionAbortSignal, runWithPlannerAbortContext, stopDockerContainer, ExecutionAbortedError, ensureAgentBundleImage } from './claude/docker/dockerExecutor.js';
+export { buildPlannerAbortSignalKey, executeDockerCommand, findRunningDockerContainerForTask, findTaskContainer, inspectLegacyDockerContainerLivenessForTask, runWithExecutionAbortSignal, runWithPlannerAbortContext, stopDockerContainer, clearWorkerAbortSignalWithClient, ExecutionAbortedError, ensureAgentBundleImage } from './claude/docker/dockerExecutor.js';
+export { buildPlannerAbortRedisOptions } from './claude/docker/dockerAbortController.js';
+export type { ExecutionChildIdentity, ExecutionTerminal } from './claude/docker/index.js';
 export type { RunningTaskContainer } from './claude/docker/dockerExecutor.js';
 export { cleanupUnusedAgentImages, listAgentImages } from './claude/docker/dockerImageManager.js';
 export type { VersionedImageBuildResult } from './claude/docker/dockerExecutor.js';

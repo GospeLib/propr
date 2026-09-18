@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
-import { db } from '@propr/core';
-import { stopTaskExecution, type StopTaskQueue, type StopTaskRedisClient } from '../routes/dockerRoutes.js';
+import { db, buildPlannerAbortSignalKey } from '@propr/core';
+import { stopTaskExecution } from '../routes/dockerRoutes.js';
+import { makeFakeRedis, makeFakeQueue } from './stopTaskFixtures.js';
 
 const REPOSITORY = 'acme/widgets';
 const PR_NUMBER = 42;
@@ -12,53 +13,6 @@ after(async () => {
   await db.destroy();
 });
 
-interface FakeRedisCall { method: string; key: string; value?: string }
-
-function makeFakeRedis(initial: Record<string, string> = {}): StopTaskRedisClient & { store: Map<string, string>; calls: FakeRedisCall[] } {
-  const store = new Map(Object.entries(initial));
-  const calls: FakeRedisCall[] = [];
-  return {
-    store,
-    calls,
-    async get(key) {
-      calls.push({ method: 'get', key });
-      return store.get(key) ?? null;
-    },
-    async set(key, value) {
-      calls.push({ method: 'set', key, value });
-      store.set(key, value);
-      return 'OK';
-    },
-    async rPush(key, value) {
-      calls.push({ method: 'rPush', key, value });
-      return 1;
-    },
-    async del(key) {
-      calls.push({ method: 'del', key });
-      store.delete(key);
-      return 1;
-    },
-  };
-}
-
-function makeFakeQueue(
-  pendingJobs: Array<{ id: string; data?: Record<string, unknown> }>,
-  activeJobs: Array<{ id: string; data?: Record<string, unknown> }> = [],
-): StopTaskQueue & { removed: string[] } {
-  const removed: string[] = [];
-  return {
-    removed,
-    async getJobs(states) {
-      const jobs = states.includes('active') ? activeJobs : pendingJobs;
-      return jobs.map(job => ({
-        id: job.id,
-        data: 'data' in job ? job.data : undefined,
-        remove: async () => { removed.push(job.id); },
-      }));
-    },
-  };
-}
-
 function runningTaskState(containerId?: string): string {
   return JSON.stringify({
     history: [
@@ -67,6 +21,84 @@ function runningTaskState(containerId?: string): string {
     ],
   });
 }
+
+test('native planning stop keeps exact terminal evidence for executor settlement', async () => {
+  const redis = makeFakeRedis({ 'worker:state:native-task': JSON.stringify({ history: [
+    { state: 'claude_execution', metadata: { containerId: 'native-container', preserveTerminalEvidence: true } },
+  ] }) });
+  let stopOptions: unknown;
+  await stopTaskExecution('native-task', { redisClient: redis, getQueue: async () => makeFakeQueue([]),
+    stopContainer: async (...args: unknown[]) => { stopOptions = args[2]; return { success: true }; },
+    markCancelled: async () => undefined });
+  assert.deepEqual(stopOptions, { preserveTerminalEvidence: true, requireObservedCessation: true });
+});
+
+const RETRIED_TASK = 'retried-task';
+const OLD_CONTAINER = 'old-container';
+const CURRENT_EXECUTION = { admissionId: 'current-admission', operationId: 'current-operation', containerId: 'current-container' };
+const REPLACEMENT_EXECUTION = { admissionId: 'replacement-admission', operationId: 'replacement-operation', containerId: 'replacement-container' };
+const retriedState = (current: Record<string, unknown> = CURRENT_EXECUTION) => JSON.stringify({
+  history: [
+    { state: 'claude_execution', metadata: { containerId: OLD_CONTAINER } },
+    { state: 'processing' },
+    { state: 'claude_execution', metadata: { ...current, preserveTerminalEvidence: true } },
+  ],
+});
+
+for (const admitted of [false, true]) {
+  test(`retry stop binds the current execution and its retention policy (admitted=${admitted})`, async () => {
+    const redis = makeFakeRedis({ [`worker:state:${RETRIED_TASK}`]: retriedState() });
+    const stopped: unknown[][] = [];
+    const result = await stopTaskExecution(RETRIED_TASK, {
+      redisClient: redis, getQueue: async () => makeFakeQueue([]),
+      ...(admitted ? { expectedExecution: CURRENT_EXECUTION } : {}),
+      stopContainer: async (...args) => { stopped.push(args); return { success: true }; },
+      markCancelled: async () => undefined,
+    });
+    assert.equal(result.containerStopped, true);
+    assert.deepEqual(stopped, [[CURRENT_EXECUTION.containerId, 10, { preserveTerminalEvidence: true, requireObservedCessation: true }]]);
+  });
+}
+
+test('admitted stop marker targets its execution and remains for the owned child to acknowledge', async () => {
+  const redis = makeFakeRedis({ [`worker:state:${RETRIED_TASK}`]: retriedState() });
+  await stopTaskExecution(RETRIED_TASK, {
+    redisClient: redis, expectedExecution: CURRENT_EXECUTION, getQueue: async () => makeFakeQueue([]),
+    stopContainer: async () => ({ success: true }), markCancelled: async () => undefined,
+  });
+  const signal = redis.store.get(buildPlannerAbortSignalKey(RETRIED_TASK, CURRENT_EXECUTION.containerId));
+  assert.ok(signal, 'container cessation is not acknowledgement from the owned executor child');
+  assert.equal(JSON.parse(signal).containerId, CURRENT_EXECUTION.containerId);
+});
+
+test('admitted stop never settles a replacement that starts while the bound container is stopping', async () => {
+  const redis = makeFakeRedis({ [`worker:state:${RETRIED_TASK}`]: retriedState() });
+  const cancelled: string[] = [];
+  const result = await stopTaskExecution(RETRIED_TASK, {
+    redisClient: redis, expectedExecution: CURRENT_EXECUTION, getQueue: async () => makeFakeQueue([]),
+    stopContainer: async () => {
+      redis.store.set(`worker:state:${RETRIED_TASK}`, retriedState(REPLACEMENT_EXECUTION));
+      return { success: true };
+    },
+    markCancelled: async id => { cancelled.push(id); },
+  });
+  assert.equal(result.cancellationRecorded, false);
+  assert.deepEqual(cancelled, []);
+  assert.equal(JSON.parse(redis.store.get(`worker:state:${RETRIED_TASK}`)!).history.at(-1).metadata.containerId,
+    REPLACEMENT_EXECUTION.containerId);
+});
+
+test('a current execution without a container never falls back to a previous attempt container', async () => {
+  const redis = makeFakeRedis({ [`worker:state:${RETRIED_TASK}`]: retriedState({}) });
+  const stopped: string[] = [];
+  const result = await stopTaskExecution(RETRIED_TASK, {
+    redisClient: redis, getQueue: async () => makeFakeQueue([]),
+    stopContainer: async id => { stopped.push(id); return { success: true }; },
+    markCancelled: async () => undefined,
+  });
+  assert.deepEqual(stopped, []);
+  assert.equal(result.containerStopped, false);
+});
 
 test('stopTaskExecution stops the container and marks the task cancelled with the merge reason', async () => {
   const redis = makeFakeRedis({ 'worker:state:task-a': runningTaskState('container-1') });
@@ -379,7 +411,7 @@ test('signed stop refuses changed execution before abort, queue removal or conta
 
 test('exact owner stop records original execution and signed control identity only after the bound container stops',async()=>{
  const expectedExecution={admissionId:'original',operationId:'original-op',containerId:'bound-container'};
- const redis=makeFakeRedis({'worker:state:task-owner':JSON.stringify({history:[{state:'claude_execution',metadata:expectedExecution}]})});let metadata:any;const stopped:string[]=[];
- const result=await stopTaskExecution('task-owner',{redisClient:redis,expectedExecution,controlAdmission:{admissionId:'stop-admission',operationId:'stop-operation'},requestedBy:'owner',cancellationReason:'ezer_owner_stop',getQueue:async()=>makeFakeQueue([]),stopContainer:async id=>{stopped.push(id);return{success:true};},markCancelled:async(_id,_by,value)=>{metadata=value.historyMetadata;}});
+ const redis=makeFakeRedis({'worker:state:task-owner':JSON.stringify({history:[{state:'claude_execution',metadata:expectedExecution}]})});let metadata:Record<string,unknown>={};const stopped:string[]=[];
+ const result=await stopTaskExecution('task-owner',{redisClient:redis,expectedExecution,controlAdmission:{admissionId:'stop-admission',operationId:'stop-operation'},requestedBy:'owner',cancellationReason:'ezer_owner_stop',getQueue:async()=>makeFakeQueue([]),stopContainer:async id=>{stopped.push(id);return{success:true};},markCancelled:async(_id,_by,value)=>{metadata=value.historyMetadata??{};}});
  assert.equal(result.containerStopped,true);assert.equal(result.cancellationRecorded,true);assert.deepEqual(stopped,['bound-container']);assert.equal(metadata.controlAdmissionId,'stop-admission');assert.equal(metadata.controlOperationId,'stop-operation');assert.equal(metadata.containerId,'bound-container');
 });

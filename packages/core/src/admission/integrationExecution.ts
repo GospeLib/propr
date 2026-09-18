@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { simpleGit } from 'simple-git';
 import { Redis } from 'ioredis';
-import { getAuthenticatedOctokit, ensureRepoCloned, getRepoUrl, AI_COMMIT_AUTHOR } from '../index.js';
+import { getAuthenticatedOctokit, ensureRepoCloned, getRepoUrl, AI_COMMIT_AUTHOR, redactAuthenticatedGitUrl } from '../index.js';
 import { createRedisAdmissionStore, verifyWorkerAdmissionReceipt } from './ezerExecutionAdmission.js';
 import { requireIntegrationPayload, type IntegrationJobData, type IntegrationPayload } from './integrationPayload.js';
 const CALLBACK_PATH = '/internal/integration-authority';
@@ -77,7 +77,6 @@ export async function executeIntegration(data: IntegrationJobData) {
     return {status:'complete',repository:p.repository,headSha,prNumber:pr.number,url:pr.html_url,executionDigest:data.executionDigest,
       operationId:data.operationId,admissionId:data.admissionId,stageMerge:false,worktree};
   } catch(error) {
-    const message = (error as Error).message.replace(/https:\/\/x-access-token:[^@\s'"]+@/g,'https://x-access-token:[REDACTED]@').replace(/\b(?:ghs|ghp|github_pat)_[A-Za-z0-9_]+/g,'[REDACTED]');
-    throw Error(message);
+    throw Error(redactAuthenticatedGitUrl((error as Error).message));
   } finally { redis.disconnect(); }
 }

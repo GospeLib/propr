@@ -11,9 +11,14 @@ interface InstallationAuth {
     token: string;
 }
 
+// Consume the credential span without requiring a trailing delimiter: requiring
+// @ after an unbounded span rescans every repeated prefix on malformed errors.
+const AUTHENTICATED_GIT_CREDENTIAL = /https:\/\/x-access-token:[^@\s'"]*/g;
+const REDACTED_GIT_CREDENTIAL = 'https://x-access-token:[REDACTED]';
+
 export function redactAuthenticatedGitUrl(message: string): string {
     return message
-        .replace(/https:\/\/x-access-token:[^@\s'"]+@github\.com\//g, 'https://x-access-token:[REDACTED]@github.com/')
+        .replace(AUTHENTICATED_GIT_CREDENTIAL, REDACTED_GIT_CREDENTIAL)
         .replace(/\b(?:ghs|ghp|gho|ghu|ghr|github_pat)_[A-Za-z0-9_.-]+/g, '[REDACTED_GITHUB_TOKEN]');
 }
 

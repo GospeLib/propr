@@ -1,27 +1,16 @@
+import type { ClaudeOutput } from './claudeOutputParser.js';
+export { parseStreamJsonOutput, UsageLimitError } from './claudeOutputParser.js';
+export type { ClaudeOutput, ClaudeOutputResult, ConversationLogEntry, TokenUsage } from './claudeOutputParser.js';
 import path from 'path';
-import os from 'os';
 import fs from 'fs';
 import { Redis } from 'ioredis';
 import logger from '../utils/logger.js';
 import { generateClaudePrompt, IssueRef, IssueDetails } from './prompts/promptGenerator.js';
-import { executeDockerCommand, ExecutionResult } from './docker/dockerExecutor.js';
+import { executeDockerCommand } from './docker/dockerExecutor.js';
 import { wrapDockerRunArgsWithRepoSetup } from './docker/repoSetupWrapper.js';
-import { parseResetTimeFromMessage, calculateNextRoundHourPlus2Minutes } from '../utils/scheduling.js';
 import { createContainerExecutionId } from '../agents/impl/utils/containerExecutionId.js';
 
-export class UsageLimitError extends Error {
-    resetTimestamp: number;
-    retryable: boolean;
-    rawErrorMessage?: string;
-
-    constructor(message: string, resetTimestamp: number, rawErrorMessage?: string) {
-        super(message);
-        this.name = 'UsageLimitError';
-        this.resetTimestamp = resetTimestamp;
-        this.retryable = true;
-        this.rawErrorMessage = rawErrorMessage;
-    }
-}
+const CLAUDE_RUNTIME_HOME = '/home/node/runtime-home';
 
 export interface BuildClaudePromptOptions {
     customPrompt?: string;
@@ -50,48 +39,6 @@ export interface DockerArgsParams {
     agentAlias?: string;
 }
 
-export interface ConversationLogEntry {
-    type?: string;
-    message?: {
-        id?: string;
-        model?: string;
-    };
-    timestamp?: string;
-    [key: string]: unknown;
-}
-
-export interface TokenUsage {
-    input_tokens?: number;
-    output_tokens?: number;
-    cache_creation_input_tokens?: number;
-    cache_read_input_tokens?: number;
-}
-
-export interface ClaudeOutputResult {
-    type: string;
-    subtype?: string;
-    is_error?: boolean;
-    result?: string;
-    num_turns?: number;
-    total_cost_usd?: number;
-    cost_usd?: number;
-    model?: string;
-    conversation_id?: string;
-    usage?: TokenUsage;
-}
-
-export interface ClaudeOutput {
-    success: boolean;
-    rawOutput: string;
-    error: string;
-    conversationLog: ConversationLogEntry[];
-    sessionId: string | null;
-    conversationId?: string;
-    finalResult: ClaudeOutputResult | null;
-    model?: string;
-    tokenUsage?: TokenUsage;
-}
-
 export interface StorePromptOptions {
     claudeOutput: ClaudeOutput;
     prompt: string;
@@ -99,26 +46,6 @@ export interface StorePromptOptions {
     model: string;
     isRetry?: boolean;
     retryReason?: string;
-}
-
-interface JsonLineMessage {
-    type?: string;
-    subtype?: string;
-    message?: {
-        id?: string;
-        model?: string;
-        content?: Array<{ type: string; text?: string }>;
-    };
-    session_id?: string;
-    conversation_id?: string;
-    model?: string;
-    result?: string;
-    num_turns?: number;
-    is_error?: boolean;
-    total_cost_usd?: number;
-    cost_usd?: number;
-    usage?: TokenUsage;
-    error?: string;
 }
 
 export function buildClaudePrompt(options: BuildClaudePromptOptions): string {
@@ -156,10 +83,13 @@ export function buildClaudePrompt(options: BuildClaudePromptOptions): string {
     return prompt;
 }
 
-export async function setWorktreeOwnership(worktreePath: string, issueNumber: number): Promise<void> {
+export async function setWorktreeOwnership(
+    worktreePath: string, issueNumber: number,
+    owner: { uid: number; gid: number } = { uid: 1000, gid: 1000 },
+): Promise<void> {
     try {
-        await executeDockerCommand('sudo', ['chown', '-R', '1000:1000', worktreePath], { timeout: 10000 });
-        logger.debug({ issueNumber, worktreePath }, 'Set worktree ownership to UID 1000 for container compatibility');
+        await executeDockerCommand('sudo', ['chown', '-R', `${owner.uid}:${owner.gid}`, worktreePath], { timeout: 10000 });
+        logger.debug({ issueNumber, worktreePath, ...owner }, 'Set worktree ownership to the container runtime owner');
     } catch (chownError) {
         const error = chownError as Error;
         logger.warn({ issueNumber, worktreePath, error: error.message }, 'Failed to set worktree ownership - container may have permission issues');
@@ -259,7 +189,13 @@ export function buildDockerArgs(params: DockerArgsParams): string[] {
         '-v', '/tmp/git-processor:/tmp/git-processor:rw',
         '-v', '/tmp/claude-logs:/tmp/claude-logs:rw',
         '-v', `${CLAUDE_CONFIG_PATH}:/home/node/.claude:rw`,
-        ...(fs.existsSync(path.join(os.homedir(), '.claude.json')) ? ['-v', `${path.join(os.homedir(), '.claude.json')}:/home/node/.claude.json:rw`] : []),
+        ...(fs.existsSync(path.join(CLAUDE_CONFIG_PATH, 'home', '.claude.json'))
+            ? [
+                '-v', `${path.join(CLAUDE_CONFIG_PATH, 'home')}:${CLAUDE_RUNTIME_HOME}:rw`,
+                '-v', `${CLAUDE_CONFIG_PATH}:${CLAUDE_RUNTIME_HOME}/.claude:rw`,
+                '-e', `PROPR_CLAUDE_HOME=${CLAUDE_RUNTIME_HOME}`,
+            ]
+            : []),
         '-e', `GH_TOKEN=${githubToken}`,
         '-w', '/home/node/workspace',
         CLAUDE_DOCKER_IMAGE,
@@ -292,122 +228,6 @@ export function buildDockerArgs(params: DockerArgsParams): string[] {
     logger.info({ issueNumber, hasSystemPrompt: systemPrompt !== undefined, hasTools: tools !== undefined }, 'Docker args built');
 
     return wrapDockerRunArgsWithRepoSetup(dockerArgs, CLAUDE_DOCKER_IMAGE, 'claude');
-}
-
-export function parseStreamJsonOutput(result: ExecutionResult): ClaudeOutput {
-    const claudeOutput: ClaudeOutput = {
-        success: result.exitCode === 0,
-        rawOutput: result.stdout,
-        error: result.stderr,
-        conversationLog: [],
-        sessionId: null,
-        finalResult: null
-    };
-
-    if (!result.stdout) return claudeOutput;
-
-    const lines = result.stdout.split('\n').filter(line => line.trim());
-    for (const line of lines) {
-        let jsonLine: JsonLineMessage;
-        try {
-            jsonLine = JSON.parse(line);
-        } catch {
-            continue;
-        }
-
-        try {
-            processJsonLine(jsonLine, claudeOutput, result.messageTimestamps);
-        } catch (error) {
-            // Propagate usage limit detection to trigger upstream requeue logic.
-            if (error instanceof UsageLimitError) {
-                throw error;
-            }
-        }
-    }
-
-    return claudeOutput;
-}
-
-function handleRateLimitError(jsonLine: JsonLineMessage): void {
-    let messageText = '';
-    if (jsonLine.message?.content && Array.isArray(jsonLine.message.content)) {
-        const textItem = jsonLine.message.content.find(item => item.type === 'text' && item.text);
-        if (textItem) messageText = textItem.text || '';
-    }
-    const resetTimestamp = parseResetTimeFromMessage(messageText) || calculateNextRoundHourPlus2Minutes();
-    logger.warn({ messageText, resetTimestamp }, 'Claude rate limit reached (new format). Throwing specific error for requeue.');
-    throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`, resetTimestamp, messageText || 'Rate limit reached');
-}
-
-function processConversationMessage(jsonLine: JsonLineMessage, claudeOutput: ClaudeOutput, messageTimestamps: Map<string, string>): void {
-    const messageKey = jsonLine.message?.id || `${jsonLine.type}-${JSON.stringify(jsonLine).substring(0, 100)}`;
-    const timestamp = messageTimestamps?.get(messageKey);
-    claudeOutput.conversationLog.push({ ...jsonLine, timestamp: timestamp || new Date().toISOString() });
-    if (jsonLine.type === 'assistant' && jsonLine.message?.model) claudeOutput.model = jsonLine.message.model;
-}
-
-function processJsonLine(
-    jsonLine: JsonLineMessage,
-    claudeOutput: ClaudeOutput,
-    messageTimestamps: Map<string, string>
-): void {
-    // Check for new rate limit format: {"type": "assistant", "error": "rate_limit", "message": {...}}
-    if (jsonLine.type === 'assistant' && jsonLine.error === 'rate_limit') {
-        handleRateLimitError(jsonLine);
-    }
-
-    if (jsonLine.type === 'user' || jsonLine.type === 'assistant') {
-        processConversationMessage(jsonLine, claudeOutput, messageTimestamps);
-    }
-
-    if (jsonLine.session_id) claudeOutput.sessionId = jsonLine.session_id;
-    if (jsonLine.conversation_id) claudeOutput.conversationId = jsonLine.conversation_id;
-    if (jsonLine.model) claudeOutput.model = jsonLine.model;
-
-    if (jsonLine.type === 'result') {
-        processResultLine(jsonLine, claudeOutput);
-    }
-}
-
-function processResultLine(jsonLine: JsonLineMessage, claudeOutput: ClaudeOutput): void {
-    claudeOutput.finalResult = {
-        type: jsonLine.type || 'result',
-        subtype: jsonLine.subtype,
-        is_error: jsonLine.is_error,
-        result: jsonLine.result,
-        num_turns: jsonLine.num_turns,
-        total_cost_usd: jsonLine.total_cost_usd,
-        cost_usd: jsonLine.cost_usd,
-        model: jsonLine.model,
-        conversation_id: jsonLine.conversation_id,
-        usage: jsonLine.usage
-    };
-    claudeOutput.success = !jsonLine.is_error;
-
-    // Extract token usage from result line
-    if (jsonLine.usage) {
-        claudeOutput.tokenUsage = {
-            input_tokens: jsonLine.usage.input_tokens,
-            output_tokens: jsonLine.usage.output_tokens,
-            cache_creation_input_tokens: jsonLine.usage.cache_creation_input_tokens,
-            cache_read_input_tokens: jsonLine.usage.cache_read_input_tokens
-        };
-    }
-
-    if (jsonLine.result) {
-        const limitMatch = jsonLine.result.match(/Claude AI usage limit reached\|(\d+)/);
-        if (limitMatch && limitMatch[1]) {
-            const resetTimestamp = parseInt(limitMatch[1], 10);
-            logger.warn({ resetTimestamp }, 'Claude usage limit reached. Throwing specific error for requeue.');
-            throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`, resetTimestamp);
-        }
-    }
-
-    if (jsonLine.total_cost_usd && !jsonLine.cost_usd) {
-        claudeOutput.finalResult.cost_usd = jsonLine.total_cost_usd;
-    }
-    if (jsonLine.model) claudeOutput.model = jsonLine.model;
-    if (jsonLine.conversation_id) claudeOutput.conversationId = jsonLine.conversation_id;
 }
 
 export async function storePromptInRedis(options: StorePromptOptions): Promise<void> {

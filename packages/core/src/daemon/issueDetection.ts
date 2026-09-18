@@ -11,6 +11,9 @@ import { getGithubUserWhitelist } from '../utils/userWhitelist.js';
 import { isAuthorizedIssueTriggerActor } from './issueTriggerAuthorization.js';
 import type { DetectedIssue } from '../webhook/webhookHandler.js';
 import type { DeliveryDisposition } from '../intake/routingWebSocketProtocol.js';
+import { consumeExecutionAdmission, createRedisAdmissionStore, pendingExecutionAdmissionKey, requiresEzerExecutionAdmission } from '../admission/ezerExecutionAdmission.js';
+import { getAuthenticatedOctokit } from '../auth/githubAuth.js';
+import { requireStoryPublicationPolicyAtRevision } from '../publication/index.js';
 
 export type { DetectedIssue };
 
@@ -254,18 +257,18 @@ export async function processDetectedIssue(issue: DetectedIssue, correlationId: 
         triggeringLabel: triggeringLabel
     }, 'Detected eligible issue');
 
+    // Preserve the next single-use admission when an equivalent parent already
+    // owns this issue. The Redis intake lock above serializes this check.
     const queue = await getIssueQueue();
     const activeJobs = await queue.getActive();
     const waitingJobs = await queue.getWaiting();
     const existingJobs = [...activeJobs, ...waitingJobs];
-
     interface JobData {
         number?: number;
         repoOwner?: string;
         repoName?: string;
         isChildJob?: boolean;
     }
-
     const jobExists = existingJobs.some(job =>
         job.name === 'processGitHubIssue' &&
         (job.data as JobData).number === issue.number &&
@@ -273,10 +276,55 @@ export async function processDetectedIssue(issue: DetectedIssue, correlationId: 
         (job.data as JobData).repoName === issue.repoName &&
         !(job.data as JobData).isChildJob
     );
-
     if (jobExists) {
         correlatedLogger.debug({ issueNumber: issue.number, repository: repoFullName }, 'A parent job for this issue is already active or waiting, skipping duplicate');
         return { status: 'ignored', reason: 'job_already_queued' };
+    }
+
+    let executionAdmissionReceipt;
+    let admittedBaseBranch: string | undefined;
+    if (requiresEzerExecutionAdmission({
+        repository: repoFullName,
+        triggeringLabel,
+        requiredLabel: process.env.EZER_ADMISSION_REQUIRED_LABEL,
+        protectedRepositories: process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES,
+    })) {
+        const signingSecret = process.env.EZER_ADMISSION_HMAC_SECRET;
+        if (!signingSecret) {
+            correlatedLogger.error({ repository: repoFullName, issueNumber: issue.number }, 'Ezer admission signing secret is not configured; refusing execution');
+            return { status: 'blocked', reason: 'ezer_admission_unavailable' };
+        }
+        const admissionStore = createRedisAdmissionStore(redisClient);
+        const pendingToken = await admissionStore.get(pendingExecutionAdmissionKey(repoFullName, issue.number));
+        if (!pendingToken) {
+            correlatedLogger.warn({ repository: repoFullName, issueNumber: issue.number }, 'No pending signed Ezer admission; refusing execution');
+            return { status: 'blocked', reason: 'ezer_admission_missing' };
+        }
+        try {
+            const admission = await consumeExecutionAdmission({
+                token: pendingToken,
+                signingSecret,
+                expected: { repository: repoFullName, issueNumber: issue.number },
+                store: admissionStore,
+                preConsumePolicy: async claims => {
+                    if (!claims.storyExecution) return;
+                    const octokit = await getAuthenticatedOctokit();
+                    await requireStoryPublicationPolicyAtRevision({
+                        octokit,
+                        repository: claims.repository,
+                        baseSha: claims.storyExecution.baseSha,
+                        changedPaths: claims.storyExecution.allowedPaths,
+                        signedStoryId: claims.storyId,
+                        taskAssignment: claims.storyExecution.taskAssignment,
+                    });
+                },
+            });
+            executionAdmissionReceipt = admission.receipt;
+            admittedBaseBranch = admission.claims.target;
+        } catch (error) {
+            correlatedLogger.warn({ repository: repoFullName, issueNumber: issue.number, error: (error as Error).message }, 'Signed Ezer admission refused');
+            return { status: 'blocked', reason: 'ezer_admission_refused' };
+        }
     }
 
     correlatedLogger.info({
@@ -295,7 +343,9 @@ export async function processDetectedIssue(issue: DetectedIssue, correlationId: 
             repoName: issue.repoName,
             number: issue.number,
             triggeringLabel: triggeringLabel,
-            correlationId: generateCorrelationId()
+            correlationId: generateCorrelationId(),
+            executionAdmissionReceipt,
+            ...(admittedBaseBranch === undefined ? {} : { baseBranch: admittedBaseBranch }),
         };
 
         const addToQueueWithRetry = (): Promise<unknown> => withRetry(

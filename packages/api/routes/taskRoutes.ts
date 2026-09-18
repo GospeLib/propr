@@ -1,10 +1,14 @@
 import { Request, Response } from 'express';
+import { enqueueAdmittedComment } from './ezerCommentFollowup.js';
+import { EZER_INTERNAL_SECRET_HEADER, verifyEzerInternalRequest } from '../ezerInternalAuth.js';
 import { Knex } from 'knex';
-import { Queue } from 'bullmq';
+import { Queue, type JobType } from 'bullmq';
+
+const LIVE_ISSUE_JOB_STATES: JobType[] = ['active', 'wait', 'delayed', 'prioritized', 'paused', 'waiting-children'];
 import { issueQueue, COMMENT_BATCH_DELAY_MS, getAuthenticatedOctokit, generateCorrelationId, logger } from '@propr/core';
 import type { CommentJobData, UnprocessedComment } from '@propr/core';
 import { ACTIVE_TASK_LIFECYCLE_STATES } from '@propr/shared';
-import { getTasksFromDb } from './taskHelpers.js';
+import { getTasksFromDb, taskFollowupPullRequest } from './taskHelpers.js';
 import { validateTaskId, validateRepositoryFilter, validateStringLength, validatePositiveInteger } from './validation.js';
 import { validateRevertRequestBody, formatCommit, validateRevertPreviewParams, checkRevertAuthorization, checkRevertPreviewAuthorization, lookupPr, buildRevertJobData, verifyCommitBelongsToPr, resolveRepoAndCheckAccess } from './revertHelpers.js';
 
@@ -18,6 +22,7 @@ interface TaskRecord {
   repository: string;
   issue_number: number;
   task_type: string;
+  pr_number?: number;
 }
 
 export function createTaskRoutes(deps: TaskRoutesDeps) {
@@ -50,6 +55,13 @@ export function createTaskRoutes(deps: TaskRoutesDeps) {
         return;
       }
 
+      // Validate issue number filter (exact match, positive integer)
+      const issueNumberValidation = validatePositiveInteger(req.query.issueNumber, 'Issue number', { min: 1, max: Number.MAX_SAFE_INTEGER });
+      if (!issueNumberValidation.valid) {
+        res.status(400).json({ error: issueNumberValidation.error });
+        return;
+      }
+
       // Validate search parameter length
       const searchValidation = validateStringLength(search, 'Search', { maxLength: 500 });
       if (!searchValidation.valid) {
@@ -61,12 +73,29 @@ export function createTaskRoutes(deps: TaskRoutesDeps) {
         db,
         status,
         repository,
+        issueNumber: issueNumberValidation.value,
         limit,
         offset,
         search,
         forReview: forReview === 'true',
         excludeMerged: excludeMerged === 'true'
       });
+      if (repository !== 'all' && issueNumberValidation.value !== undefined) {
+        if (!taskQueue) throw new Error('Task queue unavailable for authoritative issue activity');
+        const jobs = await taskQueue.getJobs(LIVE_ISSUE_JOB_STATES);
+        const globalLiveJobs = jobs.length;
+        const liveJobs = jobs.filter(job => {
+          const data = job.data;
+          if (!data || typeof data.repoOwner !== 'string' || typeof data.repoName !== 'string') {
+            throw new Error('Unscoped live queue job prevents authoritative inactivity');
+          }
+          return `${data.repoOwner}/${data.repoName}` === repository &&
+            Number(data.number ?? data.prNumber) === issueNumberValidation.value;
+        }).length;
+        res.json({ ...result, queueActivity: { repository, issueNumber: issueNumberValidation.value,
+          observedAt: new Date().toISOString(), liveJobs, globalLiveJobs } });
+        return;
+      }
       res.json(result);
     } catch (error) {
       console.error('Error in /api/tasks:', error);
@@ -308,6 +337,19 @@ export function createTaskRoutes(deps: TaskRoutesDeps) {
 
       if (!repoOwner || !repoName || !issueNumber) {
         res.status(400).json({ error: 'Task does not have valid GitHub issue information' });
+        return;
+      }
+
+      if (req.headers[EZER_INTERNAL_SECRET_HEADER] !== undefined || req.body.existingCommentId !== undefined) {
+        const followupPrNumber = taskFollowupPullRequest(task);
+        if (!verifyEzerInternalRequest(req) || !Number.isSafeInteger(req.body.existingCommentId) ||
+            req.body.existingCommentId < 1 || typeof req.body.admissionId !== 'string' || !followupPrNumber) {
+          res.status(403).json({ error: 'An existing task PR, exact comment and authenticated Ezer admission are required' });
+          return;
+        }
+        const result = await enqueueAdmittedComment({ repository: task.repository, prNumber: followupPrNumber,
+          commentId: req.body.existingCommentId, body, admissionId: req.body.admissionId });
+        res.json({ success: true, ...result });
         return;
       }
 

@@ -1,3 +1,4 @@
+import { configuredAgentImages } from './configuredAgentImages.js';
 import logger from '../utils/logger.js';
 import { Agent, AgentConfig } from './types.js';
 import { ClaudeAgent } from './impl/ClaudeAgent.js';
@@ -8,7 +9,7 @@ import { shutdownQueue } from '../queue/taskQueue.js';
 import { loadAgentRuntimePackageState } from './runtime/agentRuntimePackages.js';
 import { SyntheticAgentRegistry, type BeginSyntheticRoutingOptions, type SyntheticRoutingSession } from './SyntheticAgentRegistry.js';
 import { createAgentFromConfig } from './createAgentFromConfig.js';
-import { resolveDefaultAgentConfig, resolveUnifiedAgentImage } from './agentImagePreparation.js';
+import { resolveDefaultAgentConfig, resolveInstalledAgentImages, resolveUnifiedAgentImage } from './agentImagePreparation.js';
 
 export interface AgentRegistryOperationalStatus {
     unifiedAgentImage: {
@@ -121,8 +122,22 @@ export class AgentRegistry {
                 return;
             }
 
-            const bundleImage = await this.ensureUnifiedAgentImage(configs, prepareImages);
-            if (!bundleImage) {
+            const installedImages = await configuredAgentImages(configs, async image => {
+                try {
+                    const observed = await executeDockerCommand('docker', ['image', 'inspect', image]);
+                    return observed.exitCode === 0;
+                } catch { return false; }
+            });
+            const prepared = installedImages ? await resolveInstalledAgentImages(installedImages, prepareImages) : undefined;
+            if (prepared && !prepared.images) {
+                this.recordUnavailableUnifiedAgentImage(prepared.imageTag, prepared.error);
+                await this.captureRuntimePackageStateVersion();
+                this.initialized = true;
+                return;
+            }
+            const runtimeImages = prepared?.images;
+            const bundleImage = runtimeImages ? undefined : await this.ensureUnifiedAgentImage(configs, prepareImages);
+            if (!installedImages && !bundleImage) {
                 await this.captureRuntimePackageStateVersion();
                 this.initialized = true;
                 logger.warn(
@@ -136,6 +151,8 @@ export class AgentRegistry {
             // Resolve potentially slow image work before replacing the live
             // registry, so a package/version rebuild does not interrupt tasks
             // that can still use the previous image.
+            this.clearUnifiedAgentImageRetry();
+            this.unavailableUnifiedAgentImage = null;
             this.agents.clear();
             this.agentsByAlias.clear();
             for (const config of configs) {
@@ -155,7 +172,7 @@ export class AgentRegistry {
                         continue;
                     }
 
-                    config.dockerImage = bundleImage;
+                    config.dockerImage = runtimeImages?.get(config.id) ?? bundleImage!;
 
                     const agent = this.createAgentFromConfig(config);
                     this.agents.set(config.id, agent);

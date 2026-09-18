@@ -20,28 +20,13 @@ fi
 if [ -d "/home/node/.codex" ]; then
     echo "Codex config directory mounted"
 
-    # Fix ownership if running as root. The container keeps Docker's
-    # no-new-privileges boundary for the entire run, so do not rely on sudo here.
-    # This is crucial because Docker volume mounts often default to root ownership,
-    # but Codex running as 'node' needs to read/write config files.
-    if [ "$(id -u)" = "0" ]; then
-        echo "Fixing ownership of Codex config files..."
-        # First try recursive chown
-        chown -R node:node /home/node/.codex 2>/dev/null || true
-        # Also fix permissions on files that might be 600 (root-only readable)
-        chmod -R u+rw /home/node/.codex 2>/dev/null || true
-
-        # For files that still aren't readable (e.g., on some volume mounts),
-        # copy them with correct permissions
-        for file in config.toml history.jsonl auth.json; do
-            if [ -f "/home/node/.codex/$file" ] && ! su-exec node test -r "/home/node/.codex/$file" 2>/dev/null; then
-                echo "Fixing permissions for $file..."
-                cp "/home/node/.codex/$file" "/tmp/codex-$file"
-                chown node:node "/tmp/codex-$file"
-                chmod 644 "/tmp/codex-$file"
-                mv "/tmp/codex-$file" "/home/node/.codex/$file"
-            fi
-        done
+    # Host configuration ownership is part of the existing login. Never recursively
+    # rewrite it or copy credential files to weaken their permissions.
+    CODEX_RUNTIME_UID=$(stat -c '%u' /home/node/.codex)
+    CODEX_RUNTIME_GID=$(stat -c '%g' /home/node/.codex)
+    if [ "$CODEX_RUNTIME_UID" = "0" ]; then
+        echo "Codex configuration must belong to a non-root runtime user" >&2
+        exit 1
     fi
 
     # Ensure necessary subdirectories exist to prevent runtime errors
@@ -111,7 +96,7 @@ if [ $# -gt 0 ]; then
     if [ "$(id -u)" = "0" ]; then
         echo "Switching to node user..."
         cd /home/node/workspace
-        exec su-exec node env HOME=/home/node USER=node LOGNAME=node "$@"
+        exec su-exec "${CODEX_RUNTIME_UID:-1000}:${CODEX_RUNTIME_GID:-1000}" env HOME=/home/node USER=node LOGNAME=node "$@"
     else
         exec "$@"
     fi

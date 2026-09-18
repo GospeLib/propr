@@ -7,6 +7,8 @@
  * consume new comments while older comments continue to work.
  */
 
+import { prepareIntegrityReview } from './reviewIntegritySection.js';
+
 export type ReviewOutputStatus = 'valid_with_blockers' | 'valid_clean' | 'invalid';
 
 export interface ActionableFinding {
@@ -303,11 +305,12 @@ function prepareReviewBody(body: string): string {
  */
 export function parseStructuredReview(body: string): StructuredReviewResult {
     if (ERROR_REVIEW_MARKER_RE.test(body)) return invalidReview();
-    const cleaned = prepareReviewBody(body);
-    const machineResult = parseContract(cleaned, MACHINE_CONTRACT);
+    const integrity = prepareIntegrityReview(prepareReviewBody(body));
+    if (!integrity.valid) return invalidReview();
+    const machineResult = parseContract(integrity.reviewBody, MACHINE_CONTRACT);
     return machineResult.status !== 'invalid'
         ? machineResult
-        : parseContract(cleaned, PUBLIC_CONTRACT);
+        : parseContract(integrity.reviewBody, PUBLIC_CONTRACT);
 }
 
 /** Parse only blocker records from either supported review representation. */
@@ -398,7 +401,9 @@ export function renderPublicReview(
     options: PublicReviewRenderOptions = {},
 ): string | null {
     if (ERROR_REVIEW_MARKER_RE.test(body)) return null;
-    const cleaned = prepareReviewBody(body);
+    const integrity = prepareIntegrityReview(prepareReviewBody(body));
+    if (!integrity.valid) return null;
+    const cleaned = integrity.reviewBody;
     const parsed = parseContract(cleaned, MACHINE_CONTRACT);
     if (parsed.status === 'invalid') return null;
     if (
@@ -440,6 +445,9 @@ export function renderPublicReview(
         '## Suggestions',
         SUGGESTIONS_INTRODUCTION,
         formatPublicSuggestions(parsed.suggestions),
+        ...(integrity.integritySection
+            ? ['## Pre-development integrity', integrity.integritySection]
+            : []),
         '## Score',
         `${scoreSection}${scoreCapNote}`,
     ].join('\n\n');

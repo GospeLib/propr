@@ -13,7 +13,8 @@ after(async () => {
 });
 
 describe('issueJobDispatcher handleDispatch', () => {
-  test('reads GitHub label objects and stamps the parsed reasoning level onto queued child jobs', async () => {
+  for (const admitted of [false, true, 'selected'] as const) {
+  test(`dispatch preserves reasoning and ${admitted ? 'the admitted target' : 'label selection'}`, async () => {
     const queuedJobs: Array<{
       jobName: string;
       jobData: IssueJobData;
@@ -74,6 +75,7 @@ describe('issueJobDispatcher handleDispatch', () => {
         repoName: 'propr',
         number: 1701,
         correlationId: 'test-correlation',
+        ...(admitted ? { baseBranch: 'stage', executionAdmissionReceipt: { admissionId: 'admission', operationId: 'operation', receiptKey: 'receipt',...(admitted==='selected'?{route:{selectionId:'route',routeId:'owner:model',agentId:'owner-id',agentAlias:'owner',provider:'codex',model:'model',attemptOrdinal:1}}:{}) } } : {}),
       },
     } as Job<IssueJobData>, deps);
 
@@ -85,9 +87,11 @@ describe('issueJobDispatcher handleDispatch', () => {
     assert.equal(queuedJobs.length, 1);
     assert.equal(queuedJobs[0].jobName, 'processGitHubIssue');
     assert.equal(queuedJobs[0].jobData.reasoningLevel, 'max');
-    assert.equal(queuedJobs[0].jobData.baseBranch, 'develop');
-    assert.equal(queuedJobs[0].jobData.agentAlias, 'codex');
-    assert.equal(queuedJobs[0].jobData.modelName, 'codex:gpt-5.5');
-    assert.equal(queuedJobs[0].options.jobId, 'issue-integry-propr-1701-codex-codex:gpt-5.5-develop');
+    assert.equal(queuedJobs[0].jobData.baseBranch, admitted ? 'stage' : 'develop');
+    if (admitted) assert.equal(queuedJobs[0].jobData.executionAdmissionReceipt?.admissionId, 'admission');
+    assert.equal(queuedJobs[0].jobData.agentAlias, admitted==='selected'?'owner':'codex');
+    assert.equal(queuedJobs[0].jobData.modelName, admitted==='selected'?'model':'codex:gpt-5.5');
+    assert.equal(queuedJobs[0].options.jobId, `issue-integry-propr-1701-${admitted==='selected'?'owner-model':'codex-codex:gpt-5.5'}-${admitted ? 'stage' : 'develop'}`);
   });
+  }
 });

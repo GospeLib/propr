@@ -11,6 +11,7 @@ import {
 } from '@propr/shared';
 import { isDemoMode } from './demoMode.js';
 import type { GitHubUser } from './authTypes.js';
+import { getEzerInternalAuthorization, isEzerInternalEligibleRoute, verifyEzerInternalRequest } from './ezerInternalAuth.js';
 
 export { INSTANCE_PERMISSIONS };
 export type { InstancePermission, InstanceRole };
@@ -87,6 +88,15 @@ export async function resolveInstanceAuthorization(
 }
 
 export async function resolveAuthorization(req: Request, res: Response, next: NextFunction): Promise<void> {
+    // Ezer internal requests carry no GitHub identity (req.user is never set for
+    // them). Re-derive narrow route eligibility and secret validity here rather than trusting
+    // upstream middleware state, and attach a minimal read-only authorization
+    // directly instead of resolving one from a (nonexistent) user.
+    if (isEzerInternalEligibleRoute(req.method, req.path) && verifyEzerInternalRequest(req)) {
+        req.authorization = getEzerInternalAuthorization();
+        next();
+        return;
+    }
     if (!req.user) {
         res.status(401).json({ error: 'Authentication required' });
         return;

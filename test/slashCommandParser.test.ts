@@ -62,6 +62,32 @@ describe('parseSlashCommand', () => {
         assert.deepStrictEqual(result, { command: 'merge', args: [], instructions: '' });
     });
 
+    test('parses bare /ezer as an alias for /fix', () => {
+        const result = parseSlashCommand('/ezer');
+        assert.deepStrictEqual(result, { command: 'fix', args: [], instructions: '' });
+    });
+
+    test('parses /ezer with inline instructions identically to /fix', () => {
+        const ezerResult = parseSlashCommand('/ezer address the linting errors');
+        const fixResult = parseSlashCommand('/fix address the linting errors');
+        assert.deepStrictEqual(ezerResult, fixResult);
+        assert.deepStrictEqual(ezerResult, { command: 'fix', args: ['address', 'the', 'linting', 'errors'], instructions: '' });
+    });
+
+    test('parses /ezer with multiline instructions', () => {
+        const body = '/ezer\nPlease fix the failing test in utils.test.ts';
+        const result = parseSlashCommand(body);
+        assert.ok(result);
+        assert.strictEqual(result.command, 'fix');
+        assert.deepStrictEqual(result.args, []);
+        assert.strictEqual(result.instructions, 'Please fix the failing test in utils.test.ts');
+    });
+
+    test('does not treat "/ezersomething" as the /ezer alias', () => {
+        const result = parseSlashCommand('/ezersomething do a thing');
+        assert.strictEqual(result, null);
+    });
+
     test('trims whitespace around body', () => {
         const result = parseSlashCommand('  /review  claude  \n');
         assert.ok(result);

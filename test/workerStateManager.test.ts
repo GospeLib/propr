@@ -374,6 +374,10 @@ test('createTaskState handles database error gracefully', async () => {
     // Verify error was logged
     assert.ok(mockCorrelatedLogger.error.mock.calls.length >= 1, 'Error should be logged');
 
+    mockRedisInstance.setex.mock.resetCalls();
+    await assert.rejects(stateManager.createTaskState('strict-db-error', issueRef, undefined,
+        { requireDurableHistory: true }), /Database connection failed/);
+    assert.equal(mockRedisInstance.setex.mock.calls.length, 0, 'failed strict admission must not leave a Redis projection');
     // Restore original mock
     mockDbTasksInsert.mock.mockImplementation(originalInsert);
 
@@ -1025,6 +1029,15 @@ test('updateTaskState handles database error gracefully', async () => {
     // State should still be updated in Redis
     assert.strictEqual(result.state, TaskStates.PROCESSING);
     assert.strictEqual(result.history.length, 2);
+
+    mockRedisInstance.eval.mock.resetCalls();
+    mockPublishTaskUpdate.mock.resetCalls();
+    await assert.rejects(stateManager.updateTaskState('task-db-error-update', TaskStates.COMPLETED,
+        { requireDurableHistory: true }), /Task history was not persisted/);
+    assert.equal(mockPublishTaskUpdate.mock.calls.length, 0, 'failed durable settlement must not publish completion');
+    assert.equal(mockRedisInstance.eval.mock.calls.length, 2, 'restore only the exact failed Redis projection');
+    assert.equal(mockRedisInstance.eval.mock.calls[1].arguments[3], mockRedisInstance.eval.mock.calls[0].arguments[5]);
+    assert.deepEqual(JSON.parse(mockRedisInstance.eval.mock.calls[1].arguments[5] as string), existingState);
 
     // Verify error was logged
     assert.ok(mockCorrelatedLogger.error.mock.calls.length >= 1, 'Error should be logged');

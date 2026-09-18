@@ -108,7 +108,6 @@ describe('wrapDockerRunArgsWithRepoSetup', () => {
 
     test('agent entrypoints do not require sudo under Docker no-new-privileges', () => {
         for (const scriptPath of [
-            'scripts/claude-entrypoint.sh',
             'scripts/codex-entrypoint.sh',
             'scripts/antigravity-entrypoint.sh'
         ]) {
@@ -118,8 +117,30 @@ describe('wrapDockerRunArgsWithRepoSetup', () => {
                 .filter(line => !line.trim().startsWith('#'))
                 .join('\n');
             assert.doesNotMatch(executableLines, /\bsudo\b/, `${scriptPath} should not invoke sudo`);
-            assert.match(script, /exec su-exec node env HOME=\/home\/node USER=node LOGNAME=node "\$@"/);
+            if (scriptPath === 'scripts/codex-entrypoint.sh') {
+                assert.match(script, /CODEX_RUNTIME_UID=\$\(stat -c '%u' \/home\/node\/\.codex\)/);
+                assert.match(script, /CODEX_RUNTIME_GID=\$\(stat -c '%g' \/home\/node\/\.codex\)/);
+                assert.match(script, /if \[ "\$CODEX_RUNTIME_UID" = "0" \][\s\S]*exit 1/);
+                assert.match(script, /exec su-exec "\$\{CODEX_RUNTIME_UID:-1000\}:\$\{CODEX_RUNTIME_GID:-1000\}" env HOME=\/home\/node USER=node LOGNAME=node "\$@"/);
+                assert.doesNotMatch(executableLines, /chown\s+-R/);
+            } else {
+                assert.match(script, /exec su-exec node env HOME=\/home\/node USER=node LOGNAME=node "\$@"/);
+            }
         }
+    });
+
+    test('Claude creates an immutable admitted-worker marker before dropping privileges', () => {
+        const script = fs.readFileSync('scripts/claude-entrypoint.sh', 'utf8');
+        const markerIndex = script.indexOf('PROPR_EZER_ADMISSION_MARKER_B64');
+        const dropPrivilegesIndex = script.indexOf('exec su-exec');
+
+        assert.ok(markerIndex > -1);
+        assert.ok(markerIndex < dropPrivilegesIndex);
+        assert.match(script, /chown root:root "\$PROPR_EZER_MARKER_DIR" "\$PROPR_EZER_MARKER_PATH"/);
+        assert.match(script, /chmod 0444 "\$PROPR_EZER_MARKER_PATH"/);
+        assert.match(script, /chmod 0555 "\$PROPR_EZER_MARKER_DIR"/);
+        assert.match(script, /unset PROPR_EZER_ADMISSION_MARKER_B64/);
+        assert.match(script, /exec su-exec "\$PROPR_CLAUDE_RUN_USER" env HOME="\$\{PROPR_CLAUDE_HOME:-\/home\/node\}" USER=node LOGNAME=node "\$@"/);
     });
 
     test('throws when the configured docker image cannot be found', () => {

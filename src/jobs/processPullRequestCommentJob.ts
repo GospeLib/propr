@@ -1,3 +1,6 @@
+import { execFileSync } from 'node:child_process';
+import { verifyAdmittedPRComment } from './ezerCommentAdmission.js';
+import { buildAdmittedWorkerEnvironment } from './ezerAdmittedWorkerEnvironment.js';
 import { Job } from 'bullmq';
 import type { Logger } from 'pino';
 import { findRunningDockerContainerForTask, getAuthenticatedOctokit, hashTaskAttemptToken, inspectLegacyDockerContainerLivenessForTask, logger, retryConfigs, runWithExecutionAbortSignal, withRetry } from '@propr/core';
@@ -93,6 +96,8 @@ interface LockParams {
 }
 
 interface ProcessingState {
+    ezerAdmissionVerified?: boolean;
+    artifactCorrection?: import('@propr/core').TypedArtifactCorrection;
     octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>> | null;
     localRepoPath: string | undefined;
     worktreeInfo: WorktreeInfo | undefined;
@@ -131,8 +136,10 @@ async function initializePRJobContext(job: Job<CommentJobData>): Promise<PRJobCo
     const primaryProcessingLabels = await getPrimaryLabels();
     const isBatchJob = !!comments && Array.isArray(comments);
     const initialComments: UnprocessedComment[] = isBatchJob ? [...comments] : [{ id: commentId!, body: commentBody!, author: commentAuthor!, type: 'issue' as const }];
-    const { commentsToProcess, pickedUpComments } = await pickUpPendingCommentsWithClaim(initialComments, { repoOwner, repoName, pullRequestNumber, correlatedLogger, redisClient });
-    applyPendingCommentCommandContext(job.data, commentsToProcess, correlatedLogger);
+    const { commentsToProcess, pickedUpComments } = job.data.executionAdmissionReceipt
+        ? { commentsToProcess: initialComments, pickedUpComments: [] }
+        : await pickUpPendingCommentsWithClaim(initialComments, { repoOwner, repoName, pullRequestNumber, correlatedLogger, redisClient });
+    if (!job.data.executionAdmissionReceipt) applyPendingCommentCommandContext(job.data, commentsToProcess, correlatedLogger);
     const { branchName: jobBranchName, llm: jobLlm } = job.data;
     return { pullRequestNumber, jobBranchName, repoOwner, repoName, llm: jobLlm, correlationId, correlatedLogger, primaryProcessingLabels, isBatchJob, commentsToProcess, pickedUpComments, originalUltrafixMeta };
 }
@@ -150,7 +157,7 @@ async function acquirePRLock(lockParams: LockParams): Promise<boolean> {
     return false;
 }
 
-async function validatePRAndComments(octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>>, context: PRJobContext & { llm: string | null | undefined }): Promise<ValidationResult> {
+async function validatePRAndComments(octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>>, context: PRJobContext & { llm: string | null | undefined; admittedComment?: boolean }): Promise<ValidationResult> {
     const { commentsToProcess, pullRequestNumber, repoOwner, repoName, primaryProcessingLabels, correlatedLogger, llm: initialLlm } = context;
     const prData = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
         owner: repoOwner, repo: repoName, pull_number: pullRequestNumber,
@@ -166,7 +173,7 @@ async function validatePRAndComments(octokit: Awaited<ReturnType<typeof getAuthe
     // Check if PR has ANY of the primary processing labels (e.g., 'AI' or 'gitfix')
     if (!prData.data.labels.some(label => primaryProcessingLabels.includes(label.name))) return { skip: true, reason: 'missing_required_label' };
     const llm = extractModelFromLabels(prData.data.labels, initialLlm, pullRequestNumber, correlatedLogger);
-    const unprocessedComments = filterUnprocessedComments(validatedComments, prCommentsForValidation, botUsername, { pullRequestNumber, correlatedLogger });
+    const unprocessedComments = context.admittedComment ? validatedComments : filterUnprocessedComments(validatedComments, prCommentsForValidation, botUsername, { pullRequestNumber, correlatedLogger });
     if (unprocessedComments.length === 0) return { skip: true, reason: 'already_processed' };
     return { skip: false, prData, validatedComments, unprocessedComments, llm, prCommentsForValidation };
 }
@@ -213,8 +220,9 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
     const { pullRequestNumber, jobBranchName, repoOwner, repoName, correlationId, correlatedLogger } = context;
 
     state.octokit = await withRetry(() => getAuthenticatedOctokit(), { ...retryConfigs.githubApi, correlationId }, 'get_authenticated_octokit');
-    const validation = await validatePRAndComments(state.octokit, { ...context, llm });
+    const validation = await validatePRAndComments(state.octokit, { ...context, llm, admittedComment: state.ezerAdmissionVerified });
     if (validation.skip) {
+        if (state.ezerAdmissionVerified) throw new Error(`Admitted PR comment cannot execute: ${validation.reason}`);
         correlatedLogger.info({ pullRequestNumber, reason: validation.reason }, 'Skipping PR comment processing');
         return { status: 'skipped', reason: validation.reason, pullRequestNumber };
     }
@@ -297,6 +305,12 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
     state.worktreeInfo = await createWorktreeFromExistingBranch(state.localRepoPath, branchName, { worktreeDirName: `pr-${pullRequestNumber}-followup-${timestamp}`, owner: repoOwner, repoName });
     correlatedLogger.info({ worktreePath: state.worktreeInfo.worktreePath, branchName: state.worktreeInfo.branchName }, 'Created worktree from existing PR branch');
+    if (state.ezerAdmissionVerified && execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: state.worktreeInfo.worktreePath, encoding: 'utf8',
+    }).trim() !== job.data.executionAdmissionComment?.headSha) {
+        throw new Error('ezer-comment-refused:worktree-head-changed');
+    }
+
 
     const requestBody = isFixMode
         ? (fixSelection.remainingInstructions || 'Apply only the selected review finding records below.')
@@ -355,15 +369,31 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
         titleContext: buildPrTaskTitleContextHistoryMetadata(titleContext),
     });
 
-    const visualPreviewSettings = await loadRepositoryVisualPreviewSettings(`${repoOwner}/${repoName}`);
+    const visualPreviewSettings = state.artifactCorrection
+        ? undefined
+        : await loadRepositoryVisualPreviewSettings(`${repoOwner}/${repoName}`);
     const prompt = buildPrompt({ pullRequestNumber, combinedCommentBody: localizedCombinedCommentBody, commentHistory, originalTaskSpec: localizedOriginalTaskSpec, worktreeInfo: state.worktreeInfo, repoOwner, repoName, commentCount: state.unprocessedComments.length, commandMode: job.data.commandMode || 'default', reviewCommentsSection, visualPreviewSettings });
 
+    const correction = state.artifactCorrection;
+    if (correction && Date.parse(correction.deadline) <= Date.now()) throw new Error('TYPED_CORRECTION_DEADLINE_EXCEEDED');
     const { claudeResult, agentType } = await resolveAndExecuteAgent({
-        llm, worktreePath: state.worktreeInfo.worktreePath, branchName: state.worktreeInfo.branchName, prompt,
+        llm, worktreePath: state.worktreeInfo.worktreePath, branchName: state.worktreeInfo.branchName,
+        prompt: correction ? `${prompt}\n\nThis is a separately admitted exact owner correction to typed artifact ${correction.itemId}, not a new investigation or implementation. Modify only ${correction.outputPath}. Preserve owner decisions and all other files. The original investigation budget remains consumed. This correction expires at ${correction.deadline}.` : prompt,
+        timeoutMs: correction ? Date.parse(correction.deadline)-Date.now() : undefined,
         pullRequestNumber, repoOwner, repoName, stateManager, correlatedLogger, githubToken: githubToken.token, taskId, redisClient,
         reasoningLevel: job.data.reasoningLevel,
+        admittedEnvironment: buildAdmittedWorkerEnvironment({ repoOwner, repoName, number: pullRequestNumber,
+            baseBranch: job.data.executionAdmissionTarget, executionAdmissionReceipt: job.data.executionAdmissionReceipt }, taskId, state.ezerAdmissionVerified),
+        verifiedExecutionCorrelation: state.ezerAdmissionVerified ? job.data.executionAdmissionReceipt : undefined,
     });
     state.claudeResult = claudeResult;
+    if (correction) {
+        if (Date.parse(correction.deadline) <= Date.now()) throw new Error('TYPED_CORRECTION_DEADLINE_EXCEEDED');
+        const paths = execFileSync('git', ['diff','--name-only',correction.priorRevision,'--'], {cwd:state.worktreeInfo.worktreePath,encoding:'utf8'}).trim().split('\n').filter(Boolean);
+        const untracked = execFileSync('git', ['ls-files','--others','--exclude-standard'], {cwd:state.worktreeInfo.worktreePath,encoding:'utf8'}).trim().split('\n').filter(Boolean);
+        const changed = [...new Set([...paths,...untracked])];
+        if (changed.length !== 1 || changed[0] !== correction.outputPath) throw new Error('TYPED_CORRECTION_OUTPUT_SCOPE_MISMATCH');
+    }
 
     checkTerminalStateAfterExecution(await stateManager.getTaskState(taskId), taskId, correlatedLogger);
 
@@ -381,7 +411,9 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
     });
 
     const postResult = await handlePostExecution(
-        { state, job, taskId, stateManager, context, unprocessedReviewComments: selectedReviewComments, llm, redisClient, prProcessingLockKey: lockKey, prProcessingLockToken: lockToken },
+        { state, job, taskId, stateManager, context, unprocessedReviewComments: selectedReviewComments, llm, redisClient,
+            prProcessingLockKey: lockKey, prProcessingLockToken: lockToken,
+            ezerAdmissionVerified: state.ezerAdmissionVerified === true },
         taskUrl,
     );
 
@@ -425,7 +457,7 @@ export async function processPullRequestCommentJob(job: Job<CommentJobData>): Pr
     });
 
     try {
-        await stateManager.createTaskState(taskId, { number: pullRequestNumber, repoOwner, repoName, comments: job.data.comments, modelName } as unknown as Parameters<typeof stateManager.createTaskState>[1], correlationId);
+        await stateManager.createTaskState(taskId, { number: pullRequestNumber, repoOwner, repoName, comments: job.data.comments, modelName, executionAdmissionReceipt: job.data.executionAdmissionReceipt } as unknown as Parameters<typeof stateManager.createTaskState>[1], correlationId);
     } catch (stateError) {
         correlatedLogger.warn({ taskId, error: (stateError as Error).message }, 'Failed to create initial task state, continuing anyway');
     }
@@ -433,6 +465,7 @@ export async function processPullRequestCommentJob(job: Job<CommentJobData>): Pr
     const state: ProcessingState = { octokit: null, localRepoPath: undefined, worktreeInfo: undefined, claudeResult: null, authorsText: '', unprocessedComments: [], startingWorkComment: null };
 
     try {
+        state.ezerAdmissionVerified = await verifyAdmittedPRComment(job.data, redisClient, binding => { state.artifactCorrection = binding; });
         // Branch early for review mode — read-only analysis, no commits or pushes
         if (job.data.commandMode === 'review') {
             return await runWithExecutionAbortSignal(executionController.signal, () => executeReviewProcessing({ job, context, llm, taskId, stateManager, state, redisClient, validatePRAndComments }), hashTaskAttemptToken(lockToken));

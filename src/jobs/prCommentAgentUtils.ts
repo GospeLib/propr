@@ -263,6 +263,9 @@ export async function resolvePRCommentModelName(llm: string | null | undefined, 
 }
 
 export interface AgentExecutionParams {
+    timeoutMs?: number;
+    admittedEnvironment?: Record<string, string>;
+    verifiedExecutionCorrelation?: { admissionId: string; operationId: string };
     llm: string | null | undefined;
     worktreePath: string;
     branchName: string;
@@ -312,13 +315,15 @@ export async function resolveAndExecuteAgent(params: AgentExecutionParams): Prom
     }, 'Executing PR comment task with agent');
 
     const agentResult = await agent.executeTask({
+        environment: params.admittedEnvironment,
+        timeoutMs: params.timeoutMs,
         worktreePath,
         issueRef: { number: pullRequestNumber, repoOwner, repoName },
         prompt,
         model: modelToUse,
         githubToken,
         branchName,
-        onSessionId: createSessionIdCallbackForPR(taskId, { pullRequestNumber, repoOwner, repoName }, { llm: modelToUse, stateManager, correlatedLogger, redisClient }),
+        onSessionId: createSessionIdCallbackForPR(taskId, { pullRequestNumber, repoOwner, repoName }, { llm: modelToUse, stateManager, correlatedLogger, redisClient, verifiedExecutionCorrelation: params.verifiedExecutionCorrelation }),
         onContainerId: createContainerIdCallbackForPR(taskId, stateManager),
         taskId,
         prNumber: pullRequestNumber,

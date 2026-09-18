@@ -5,7 +5,7 @@ import type { ReasoningLevel } from '@propr/shared';
 import type { Redis } from 'ioredis';
 import { calculateReviewCost } from './reviewContextHelpers.js';
 import { buildReviewPromptWithinBudget } from './reviewPromptBuilder.js';
-import { buildReviewErrorComment } from './reviewCommentFormatter.js';
+import { buildReviewErrorComment, reviewAnalysisWithPublicOutcome } from './reviewCommentFormatter.js';
 import { buildReviewCommentWithReservedFindingRange } from './reviewFindingNumberAllocator.js';
 
 const REVIEW_TIMEOUT_MS = 30 * 60 * 1000;
@@ -127,7 +127,8 @@ export async function runSingleReview(
             owner: repoOwner, repo: repoName, issue_number: pullRequestNumber, body: reviewCommentBody,
         });
 
-        return { assignment, analysisResult, commentId: reviewComment.data.id, commentUrl: reviewComment.data.html_url, prompt: reviewPrompt, findingCount };
+        const publicOutcome = reviewAnalysisWithPublicOutcome(analysisResult, reviewCommentBody);
+        return { assignment, analysisResult: publicOutcome, ...(publicOutcome.success ? {} : { error: publicOutcome.error }), commentId: reviewComment.data.id, commentUrl: reviewComment.data.html_url, prompt: reviewPrompt, findingCount };
     } catch (reviewError) {
         const errorMsg = (reviewError as Error).message;
         correlatedLogger.error({ pullRequestNumber, model, error: errorMsg }, 'Review analysis failed');

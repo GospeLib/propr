@@ -10,6 +10,7 @@ const {
   createAbortGenerationHandler,
   createAbortRefinementHandler,
   setAbortSignal,
+  createAbortRedis,
 } = await import('../routes/plannerAbortHandlers.js');
 const { closeConnection } = await import('@propr/core');
 type AbortRedisFactory = import('../routes/plannerAbortHandlers.js').AbortRedisFactory;
@@ -56,6 +57,16 @@ after(async () => {
 });
 
 describe('planner abort handlers', () => {
+  test('abort marker clients have bounded connect, command and retry lifetimes', () => {
+    const client = createAbortRedis() as unknown as { options: Record<string, unknown>; disconnect(): void };
+    try {
+      assert.equal(client.options.connectTimeout, 5000);
+      assert.equal(client.options.commandTimeout, 5000);
+      assert.equal(client.options.maxRetriesPerRequest, 1);
+      const retry = client.options.retryStrategy as (attempt: number) => number | null;
+      assert.equal(retry(2), null);
+    } finally { client.disconnect(); }
+  });
   test('preserves a generation that completes before the conditional abort transition', async () => {
     await database('task_drafts').insert({
       draft_id: 'generation-race',

@@ -1,8 +1,15 @@
+import {Redis} from 'ioredis';
+import {stopAdmittedTask} from './ezerStopTask.js';
+import {EZER_INTERNAL_SECRET_HEADER,verifyEzerInternalRequest} from '../ezerInternalAuth.js';
+import {db,getAuthenticatedOctokit,createRedisAdmissionStore} from '@propr/core';
 import type { Response } from 'express';
 import type { FlatRequest } from '../requestTypes.js';
 import { RedisClientType } from 'redis';
-import { stopDockerContainer, getStateManager, getIssueQueue } from '@propr/core';
-import type { IssueRef } from '@propr/core';
+import { stopDockerContainer, getStateManager, getIssueQueue, clearWorkerAbortSignalWithClient,
+  MAX_ATOMIC_UPDATE_ATTEMPTS, waitForAtomicUpdateRetry } from '@propr/core';
+import type { IssueRef, TaskStateExpectation } from '@propr/core';
+import { stopOwnership, stopSettlementExpectation, latestExecutionEntry, signalOwnedExecution, STOP_ABORT_TTL_SECONDS,
+  STOP_CONTAINER_TIMEOUT_SECONDS, type StopOwnership, type StopState, type StopExecutionBinding } from './taskStopOwnership.js';
 import { validateTaskId, validateTailParam } from './validation.js';
 import { getDockerContainerLogs, getDockerContainerStatus } from './dockerCommandSafety.js';
 
@@ -13,17 +20,7 @@ interface DockerRoutesDeps {
   stopTaskExecution?: StopTaskExecutor;
 }
 
-interface TaskStateHistory {
-  state: string;
-  metadata?: {
-    containerId?: string;
-    containerName?: string;
-  };
-}
-
-interface TaskState {
-  history: TaskStateHistory[];
-}
+type TaskState = StopState;
 
 /** Task states in which a worker is actively executing the task. */
 const ACTIVE_TASK_STATES = ['processing', 'claude_execution', 'post_processing'];
@@ -37,6 +34,7 @@ export interface StopTaskRedisClient {
   set(key: string, value: string, options?: { EX?: number }): Promise<unknown>;
   rPush(key: string, value: string): Promise<unknown>;
   del(key: string): Promise<unknown>;
+  eval?(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
 }
 
 interface StoppableQueueJob {
@@ -50,6 +48,8 @@ export interface StopTaskQueue {
 }
 
 export interface StopTaskExecutionOptions {
+  controlAdmission?: {admissionId:string;operationId:string};
+  expectedExecution?: StopExecutionBinding;
   redisClient: StopTaskRedisClient;
   /** Who requested the stop (username or e.g. 'system'). Defaults to 'user'. */
   requestedBy?: string;
@@ -70,17 +70,19 @@ export interface StopTaskExecutionOptions {
   /** Override the BullMQ queue lookup (used by tests). Defaults to getIssueQueue(). */
   getQueue?: () => Promise<StopTaskQueue>;
   /** Override marking the task cancelled (used by tests). Defaults to the shared state manager. */
-  markCancelled?: (taskId: string, cancelledBy: string, metadata: { reason?: string; historyMetadata?: Record<string, unknown> }) => Promise<unknown>;
+  markCancelled?: (taskId: string, cancelledBy: string, metadata: { reason?: string; historyMetadata?: Record<string, unknown> }, expectation?: TaskStateExpectation) => Promise<unknown>;
   /** Override task state creation for queued jobs that never started (used by tests). */
   createTaskState?: (taskId: string, issueRef: IssueRef) => Promise<unknown>;
   /** Override the container stop (used by tests). Defaults to stopDockerContainer(). */
-  stopContainer?: (containerId: string, timeoutSeconds?: number) => Promise<{ success: boolean; error?: string }>;
+  stopContainer?: typeof stopDockerContainer;
 }
 
 export interface StopTaskExecutionResult {
   success: boolean;
   taskId: string;
   containerStopped: boolean;
+  /** Exact container was already absent; this is not an observed terminal state. */
+  containerAbsent?: boolean;
   removedQueuedJobs: number;
   message: string;
   notFound?: boolean;
@@ -171,12 +173,18 @@ function parseTaskState(taskId: string, stateData: string | null): TaskState | n
   }
 }
 
-async function setAbortSignal(taskId: string, options: StopTaskExecutionOptions): Promise<void> {
-  await options.redisClient.set(`worker:abort:${taskId}`, JSON.stringify({
+async function setAbortSignal(taskId: string, options: StopTaskExecutionOptions, ownership?: StopOwnership): Promise<string> {
+  const marker = JSON.stringify({
     timestamp: new Date().toISOString(),
     requestedBy: options.requestedBy ?? 'user',
-    ...(options.cancellationReason ? { reason: options.cancellationReason } : {})
-  }), { EX: 3600 });
+    ...(options.cancellationReason ? { reason: options.cancellationReason } : {}),
+    ...(options.expectedExecution ? { containerId: options.expectedExecution.containerId } : {}),
+  });
+  if (options.expectedExecution && ownership) {
+    if (!options.redisClient.eval) throw Error('ezer-stop-refused:atomic-marker-unavailable');
+    await signalOwnedExecution(taskId, ownership, marker, options.redisClient.eval.bind(options.redisClient));
+  } else await options.redisClient.set(`worker:abort:${taskId}`, marker, { EX: STOP_ABORT_TTL_SECONDS });
+  return marker;
 }
 
 /** Best-effort extraction of an issue ref from queue job data so a task state can be created. */
@@ -233,19 +241,36 @@ async function ensureTaskStateForQueuedJob(taskId: string, jobData: Record<strin
 }
 
 /** Marks the task cancelled. Returns true when the cancellation was recorded. */
-async function markTaskCancelledSafely(taskId: string, historyMetadata: Record<string, unknown>, options: StopTaskExecutionOptions): Promise<boolean> {
+async function markTaskCancelledSafely(taskId: string, historyMetadata: Record<string, unknown>, options: StopTaskExecutionOptions, ownership?: StopOwnership): Promise<boolean> {
   try {
+    const attempts = ownership && !options.expectedExecution ? MAX_ATOMIC_UPDATE_ATTEMPTS : 1;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+    let expectation: TaskStateExpectation | undefined;
+    if (ownership) {
+      const current = parseTaskState(taskId, await options.redisClient.get(`worker:state:${taskId}`));
+      expectation = current ? stopSettlementExpectation(current, ownership, options.expectedExecution ? 'execution' : 'task') : undefined;
+      if (!expectation) return false;
+    }
     const mark = options.markCancelled
-      ?? ((id: string, by: string, metadata: { reason?: string; historyMetadata?: Record<string, unknown> }) =>
-        getStateManager().markTaskCancelled(id, by, metadata));
-    await mark(taskId, options.requestedBy ?? 'user', {
+      ?? ((id: string, by: string, metadata: { reason?: string; historyMetadata?: Record<string, unknown> }, expected?: TaskStateExpectation) =>
+        expected ? getStateManager().markTaskCancelledIfCurrent(id, expected, by, metadata)
+          : getStateManager().markTaskCancelled(id, by, metadata));
+    const recorded = await mark(taskId, options.requestedBy ?? 'user', {
       ...(options.reason ? { reason: options.reason } : {}),
       historyMetadata: {
         ...(options.cancellationReason ? { cancellationReason: options.cancellationReason } : {}),
-        ...historyMetadata
+        ...historyMetadata,
+        ...(options.controlAdmission?{controlAdmissionId:options.controlAdmission.admissionId,controlOperationId:options.controlAdmission.operationId}:{})
       }
-    });
+    }, expectation);
+    if (recorded === null) {
+      if (attempt + 1 === attempts) return false;
+      await waitForAtomicUpdateRetry(attempt);
+      continue;
+    }
     console.log(`[stop-execution] Task ${taskId} marked as cancelled`);
+    break;
+    }
   } catch (stateError) {
     console.warn(`[stop-execution] Failed to mark task as cancelled: ${(stateError as Error).message}`);
     return false;
@@ -272,11 +297,13 @@ export async function stopTaskExecution(taskIdOrJobId: string, options: StopTask
   const stopMessage = options.reason ?? 'Stop requested by user. Terminating execution...';
   const taskId = normalizeTaskId(taskIdOrJobId);
 
-  const markCancelled = (historyMetadata: Record<string, unknown>): Promise<boolean> => markTaskCancelledSafely(taskId, historyMetadata, options);
+  let ownership: StopOwnership | undefined;
+  const markCancelled = (historyMetadata: Record<string, unknown>): Promise<boolean> => markTaskCancelledSafely(taskId, historyMetadata, options, ownership);
 
   const stateData = await redisClient.get(`worker:state:${taskId}`);
   const state = parseTaskState(taskId, stateData);
   const currentState = state?.history[state.history.length - 1]?.state;
+  if (options.expectedExecution) ownership = stopOwnership(state ?? { history: [] }, stateData ?? '', options.expectedExecution);
   const isRunning = !!currentState && ACTIVE_TASK_STATES.includes(currentState);
 
   if (!isRunning) {
@@ -344,21 +371,28 @@ export async function stopTaskExecution(taskIdOrJobId: string, options: StopTask
   }
 
   // Set abort signal for the worker to pick up
-  await setAbortSignal(taskId, options);
+  ownership ??= stopOwnership(state!, stateData!);
+  const abortMarker = await setAbortSignal(taskId, options, ownership);
   await redisClient.rPush(`conversation:${taskId}`, JSON.stringify({ type: 'system', timestamp: new Date().toISOString(), content: stopMessage, level: 'warning' }));
   console.log(`[stop-execution] Abort signal set for task: ${taskId}`);
 
-  const containerId = await stopRunningTaskContainer(taskId, state!, options);
-  const containerStopped = containerId !== null;
+  const stopped = await stopRunningTaskContainer(taskId, ownership, options);
+  const containerStopped = stopped !== null && !stopped.absent;
 
   // Remove any queued/delayed jobs for the same task (e.g. pending retries)
-  const { removed: removedQueuedJobs } = await removeQueuedJobsForTask(taskIdOrJobId, taskId, options);
+  const { removed: removedQueuedJobs } = options.expectedExecution ? { removed: 0 }
+    : await removeQueuedJobsForTask(taskIdOrJobId, taskId, options);
 
   let cancellationRecorded = false;
-  if (containerStopped) {
+  if (stopped) {
     // Clear abort signal after direct container stop
-    await redisClient.del(`worker:abort:${taskId}`);
-    cancellationRecorded = await markCancelled({ containerId, stoppedAt: new Date().toISOString() });
+    if (!options.expectedExecution) await clearWorkerAbortSignalWithClient(taskId, {
+      get: redisClient.get.bind(redisClient),
+      ...(redisClient.eval ? { eval: (script: string, keyCount: number, ...args: string[]) =>
+        redisClient.eval!(script, { keys: args.slice(0, keyCount), arguments: args.slice(keyCount) }) } : {}),
+    }, abortMarker);
+    cancellationRecorded = await markCancelled({ containerId: stopped.containerId,
+      ...(stopped.absent ? { containerAbsent: true } : { stoppedAt: new Date().toISOString() }) });
   } else if (options.ensureCancelled) {
     // The container could not be stopped directly. Record the cancellation now
     // rather than relying on the worker to observe the abort signal. The signal
@@ -371,12 +405,14 @@ export async function stopTaskExecution(taskIdOrJobId: string, options: StopTask
     success: true,
     taskId,
     containerStopped,
+    ...(stopped?.absent ? { containerAbsent: true } : {}),
     removedQueuedJobs,
-    abortSignalled: !containerStopped,
+    abortSignalled: stopped === null,
     cancellationRecorded,
     message: containerStopped
       ? 'Execution stopped. The Docker container has been terminated.'
-      : 'Stop request sent to worker. The execution will be terminated shortly.'
+      : stopped?.absent ? 'The exact container is already absent; no terminal Docker state was observed.'
+        : 'Stop request sent to worker. The execution will be terminated shortly.'
   };
 }
 
@@ -384,8 +420,8 @@ export async function stopTaskExecution(taskIdOrJobId: string, options: StopTask
  * Attempts to directly stop the Docker container of a running task.
  * Returns the container ID when the container was stopped, null otherwise.
  */
-async function stopRunningTaskContainer(taskId: string, state: TaskState, options: StopTaskExecutionOptions): Promise<string | null> {
-  const entry = state.history.find(h => h.state === 'claude_execution' && h.metadata?.containerId);
+async function stopRunningTaskContainer(taskId: string, ownership: StopOwnership, options: StopTaskExecutionOptions): Promise<{ containerId: string; absent: boolean } | null> {
+  const entry = ownership.entry;
   const containerId = entry?.metadata?.containerId;
   if (!containerId) {
     console.log(`[stop-execution] No container ID found for task ${taskId}, relying on abort signal`);
@@ -394,15 +430,20 @@ async function stopRunningTaskContainer(taskId: string, state: TaskState, option
 
   console.log(`[stop-execution] Found container ID: ${containerId}, attempting to stop...`);
   const stopContainer = options.stopContainer ?? stopDockerContainer;
-  const stopResult = await stopContainer(containerId, 10);
+  const stopResult = await stopContainer(containerId, STOP_CONTAINER_TIMEOUT_SECONDS, {
+    requireObservedCessation: true,
+    ...(entry?.metadata?.preserveTerminalEvidence ? { preserveTerminalEvidence: true } : {}),
+  });
   if (!stopResult.success) {
     console.warn(`[stop-execution] Failed to stop container ${containerId}: ${stopResult.error}`);
     return null;
   }
+  if (stopResult.error) console.warn(`[stop-execution] Container ${containerId} stopped but cleanup needs attention: ${stopResult.error}`);
 
-  console.log(`[stop-execution] Container ${containerId} stopped successfully`);
-  await options.redisClient.rPush(`conversation:${taskId}`, JSON.stringify({ type: 'system', timestamp: new Date().toISOString(), content: 'Docker container terminated.', level: 'info' }));
-  return containerId;
+  const absent = stopResult.cessation === 'absent';
+  await options.redisClient.rPush(`conversation:${taskId}`, JSON.stringify({ type: 'system', timestamp: new Date().toISOString(),
+    content: absent ? 'Exact Docker container is already absent.' : 'Docker container terminated.', level: 'info' }));
+  return { containerId, absent };
 }
 
 export function createDockerRoutes(deps: DockerRoutesDeps) {
@@ -425,7 +466,7 @@ export function createDockerRoutes(deps: DockerRoutesDeps) {
         return;
       }
       const state = JSON.parse(stateData) as { history: Array<{ state: string; metadata?: { containerId?: string; containerName?: string } }> };
-      const entry = state.history.find(h => h.state === 'claude_execution' && h.metadata?.containerId);
+      const entry = latestExecutionEntry(state);
       if (!entry?.metadata?.containerId) {
         res.status(404).json({ error: 'No Docker container info available for this task' });
         return;
@@ -461,7 +502,7 @@ export function createDockerRoutes(deps: DockerRoutesDeps) {
         return;
       }
       const state = JSON.parse(stateData) as { history: Array<{ state: string; metadata?: { containerId?: string } }> };
-      const entry = state.history.find(h => h.state === 'claude_execution' && h.metadata?.containerId);
+      const entry = latestExecutionEntry(state);
       if (!entry?.metadata?.containerId) {
         res.status(404).json({ error: 'No Docker container info available for this task' });
         return;
@@ -492,6 +533,21 @@ export function createDockerRoutes(deps: DockerRoutesDeps) {
         return;
       }
 
+      if(req.headers[EZER_INTERNAL_SECRET_HEADER]!==undefined){
+        if(!verifyEzerInternalRequest(req)||typeof req.body?.signedAdmission!=='string'||!Number.isSafeInteger(req.body?.existingCommentId)){
+          res.status(403).json({error:'A signed exact-execution admission and existing owner comment are required'});return;
+        }
+        const admissionRedis=new Redis({host:process.env.REDIS_HOST||'127.0.0.1',port:Number(process.env.REDIS_PORT||'6379')});
+        try{
+          const result=await stopAdmittedTask({taskId:req.params.taskId,commentId:req.body.existingCommentId,token:req.body.signedAdmission},{
+            store:createRedisAdmissionStore(admissionRedis),signingSecret:process.env.EZER_ADMISSION_HMAC_SECRET||'',
+            readTask:async taskId=>{const row=await db('tasks').where({task_id:taskId}).first();return row?{repository:row.repository,issueNumber:row.issue_number}:undefined;},
+            readComment:async(repository,commentId)=>{const [owner,repo]=repository.split('/');const api=await getAuthenticatedOctokit();const {data}=await api.request('GET /repos/{owner}/{repo}/issues/comments/{comment_id}',{owner,repo,comment_id:commentId});return {...data,body:data.body??'',user:data.user?{id:data.user.id,login:data.user.login}:null};},
+            readState:taskId=>redisClient.get(`worker:state:${taskId}`),
+            stop:(taskId,options)=>executeStopTask(taskId,{...options,redisClient}),
+          });res.json(result);return;
+        } finally{admissionRedis.disconnect();}
+      }
       console.log(`[stop-execution] Attempting to stop task: ${req.params.taskId}`);
       const result = await executeStopTask(req.params.taskId, { redisClient, requestedBy: req.user?.username || 'user' });
 
@@ -504,7 +560,8 @@ export function createDockerRoutes(deps: DockerRoutesDeps) {
         return;
       }
 
-      res.json({ success: true, message: result.message, taskId: result.taskId, containerStopped: result.containerStopped });
+      res.json({ success: true, message: result.message, taskId: result.taskId, containerStopped: result.containerStopped,
+        ...(result.containerAbsent ? { containerAbsent: true } : {}) });
     } catch {
       console.error('Error in /api/task/:taskId/stop');
       res.status(500).json({ error: 'Internal server error' });

@@ -1,3 +1,4 @@
+import {forwardRoutingOwnerEvent} from './routingOwnerEvent.js';
 /**
  * Routing WebSocket intake service (daemon side).
  *
@@ -112,6 +113,7 @@ export class RoutingWebSocketIntakeService {
     private readonly initialReconnectDelayMs: number;
     private readonly maxReconnectDelayMs: number;
     private readonly pullTimeoutMs: number;
+    private readonly ownerRelayInstallationId: string|number|undefined;
     private readonly shutdownDrainTimeoutMs: number;
     private readonly webSocketFactory?: WebSocketCtor;
     private readonly fetchImpl?: FetchLike;
@@ -164,6 +166,7 @@ export class RoutingWebSocketIntakeService {
         this.relayToken = (options.relayToken ?? process.env.PROPR_GH_RELAY_TOKEN ?? '').trim();
         this.accountStatus = new ConnectAccountStatusTracker(options.installationId ?? process.env.GH_INSTALLATION_ID,
             () => this.notifyStatusChange());
+        this.ownerRelayInstallationId = options.installationId ?? process.env.GH_INSTALLATION_ID;
         this.dispatch = options.dispatch ?? processWebhookEvent;
         this.initialReconnectDelayMs = options.reconnectDelayMs ?? 1_000;
         this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 30_000;
@@ -469,7 +472,9 @@ export class RoutingWebSocketIntakeService {
             // report accepted/blocked/ignored (with reason/billing); a void return
             // means a plain `accepted`. A thrown error is handled below and withholds
             // the ACK so the relay redelivers.
-            disposition = normalizeDisposition(await this.dispatch(payload, rawEventType, correlationId));
+            disposition = await forwardRoutingOwnerEvent(payload, rawEventType, deliveryId, delivery.installationId ?? this.ownerRelayInstallationId)
+                ? ACCEPTED_DISPOSITION
+                : normalizeDisposition(await this.dispatch(payload, rawEventType, correlationId));
         } catch (error) {
             this.deliveries.fail(deliveryId);
             log.error(

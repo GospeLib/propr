@@ -1,6 +1,7 @@
 import type { Logger } from 'pino';
 import { setTimeout } from 'timers/promises';
 import type { ClaudeCodeResponse } from '@propr/core';
+import { verifyStoryPublication, type StoryExecutionContract } from '@propr/core';
 import type { WorktreeInfo, CommitResult, WorkerStateManager } from '@propr/core';
 import {
     cleanupWorktree, cleanupPreparedVisualPreviewEvidence, commitChanges,
@@ -18,8 +19,11 @@ import type { RepoValidationResult, PRValidationResult } from '@propr/core';
 import type { IssueJobData } from '@propr/core';
 import { createPullRequest, ensureEpicBaseBranchExists, type PostProcessingResult } from './issueJobHelpers.js';
 import { handleCreatedPlanIssuePR, handleNoCodeChanges } from './issueJobPostProcessingHelpers.js';
+import { buildStoryCommitMessage, buildStoryPublicationMetadata } from './publicationMetadata.js';
+import { requireStoryPublicationPolicy } from './storyPublicationPolicy.js';
 import { AI_COMMIT_AUTHOR } from './commitAuthor.js';
 import type { GitHubToken } from './githubTypes.js';
+import { publishSignedStoryCommit } from './signedStoryPublication.js';
 
 type RepoValidation = RepoValidationResult;
 type PRValidation = PRValidationResult;
@@ -47,6 +51,7 @@ function hasPublishableAgentWork(claudeResult: ClaudeCodeResponse | null): boole
 }
 
 async function handleUnpublishableAgentFailure(options: {
+    internalRecovery?: boolean;
     octokit: Octokit;
     issueRef: IssueJobData;
     claudeResult: ClaudeCodeResponse;
@@ -67,6 +72,7 @@ async function handleUnpublishableAgentFailure(options: {
         throw new Error(`Failed to remove the processing label from issue #${issueRef.number}${details}`);
     }
 
+    if (options.internalRecovery) return { success: false, pr: null, updatedLabels: [], error: errorMessage };
     const completionComment = await generateCompletionComment(claudeResult, {
         number: issueRef.number,
         repoOwner: issueRef.repoOwner,
@@ -103,6 +109,7 @@ type Octokit = {
 };
 
 export interface PostProcessOptions {
+    execution?: StoryExecutionContract;
     octokit: Octokit;
     issueRef: IssueJobData;
     worktreeInfo: WorktreeInfo;
@@ -185,10 +192,14 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
     let commitResult: CommitResult | null = null;
     let postProcessingResult: PostProcessingResult | null = null;
     let preparedVisualPreview: Awaited<ReturnType<typeof prepareVisualPreviewEvidence>> | undefined;
+    const storyChangedPaths = options.execution
+        ? await verifyStoryPublication(worktreeInfo.worktreePath, options.execution)
+        : [];
 
     try {
-        if (!hasPublishableAgentWork(claudeResult)) {
+        if (!hasPublishableAgentWork(claudeResult) || (options.execution !== undefined && !claudeResult.success)) {
             postProcessingResult = await handleUnpublishableAgentFailure({
+                internalRecovery: options.execution !== undefined,
                 octokit,
                 issueRef,
                 claudeResult,
@@ -199,22 +210,35 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
         }
 
         const completionNote = buildImplementationCompletionNote(claudeResult);
-        let commitMessage = `fix(ai): Resolve issue #${issueRef.number} - ${currentIssueData.data.title.substring(0, 50)}\n\nImplemented by ProPR AI using ${modelName} model.\n\n${completionNote}`;
+        const signedStoryId = options.execution ? options.execution.taskAssignment?.taskId ?? issueRef.executionAdmissionReceipt?.storyId : undefined;
+        const taskLinkRequired = options.execution
+            ? (await requireStoryPublicationPolicy({
+                worktreePath: worktreeInfo.worktreePath,
+                changedPaths: storyChangedPaths,
+                signedStoryId: issueRef.executionAdmissionReceipt?.storyId,
+                taskAssignment: options.execution?.taskAssignment,
+            })).taskLinkRequired
+            : false;
+        let commitMessage = signedStoryId
+            ? buildStoryCommitMessage(signedStoryId, taskLinkRequired, options.execution)
+            : `fix(ai): Resolve issue #${issueRef.number} - ${currentIssueData.data.title.substring(0, 50)}\n\nImplemented by ProPR AI using ${modelName} model.\n\n${completionNote}`;
+        if (!signedStoryId && claudeResult?.commitMessage) commitMessage = claudeResult.commitMessage;
 
-        if (claudeResult?.commitMessage) {
-            commitMessage = claudeResult.commitMessage;
-        }
-
-        preparedVisualPreview = await prepareVisualPreviewEvidence({
+        // Signed execution fixes the allowed paths and publication metadata; ordinary
+        // upstream visual-preview cleanup must not mutate that admitted candidate.
+        if (!options.execution) preparedVisualPreview = await prepareVisualPreviewEvidence({
             worktreePath: worktreeInfo.worktreePath,
             settings: await loadRepositoryVisualPreviewSettings(`${issueRef.repoOwner}/${issueRef.repoName}`),
             taskId: taskId || `${issueRef.repoOwner}-${issueRef.repoName}-${issueRef.number}`
         });
 
-        commitResult = await commitChanges(
+        commitResult = options.execution?.taskAssignment ? await publishSignedStoryCommit({
+            octokit: octokit as never, owner: issueRef.repoOwner, repo: issueRef.repoName,
+            worktreePath: worktreeInfo.worktreePath, execution: options.execution, commitMessage,
+        }) : await commitChanges(
             worktreeInfo.worktreePath, commitMessage,
             AI_COMMIT_AUTHOR,
-            { issueNumber: issueRef.number, issueTitle: currentIssueData.data.title }
+            { issueNumber: issueRef.number, issueTitle: currentIssueData.data.title, execution: options.execution }
         );
 
         claudeResult.modifiedFiles = commitResult?.filesChanged || claudeResult.modifiedFiles;
@@ -226,7 +250,7 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
             return { commitResult, postProcessingResult };
         }
 
-        await pushBranch(worktreeInfo.worktreePath, worktreeInfo.branchName, { repoUrl, authToken: githubToken.token });
+        if (!options.execution?.taskAssignment) await pushBranch(worktreeInfo.worktreePath, worktreeInfo.branchName, { repoUrl, authToken: githubToken.token, execution: options.execution });
 
         correlatedLogger.debug('Waiting for branch propagation...');
         await setTimeout(3000);
@@ -242,7 +266,7 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
 
         // Self-heal a deleted epic base branch (e.g. after its Epic PR was
         // closed) so the child PR isn't rejected with base "invalid" on rerun.
-        if (issueRef.baseBranch) {
+        if (issueRef.baseBranch && !options.execution) {
             await ensureEpicBaseBranchExists(octokit, {
                 owner: issueRef.repoOwner,
                 repo: issueRef.repoName,
@@ -252,6 +276,14 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
             });
         }
 
+        const publicationMetadata = signedStoryId ? buildStoryPublicationMetadata({
+            execution: options.execution,
+            storyId: signedStoryId,
+            issueNumber: issueRef.number,
+            repository: `${issueRef.repoOwner}/${issueRef.repoName}`,
+            commitHash: commitResult.commitHash,
+            taskLinkRequired,
+        }) : undefined;
         postProcessingResult = await createPullRequest(
             octokit, issueRef, worktreeInfo,
             {
@@ -262,12 +294,30 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
                 PR_LABEL,
                 correlatedLogger,
                 issueTitle: currentIssueData.data.title,
-                visualPreview: {
+                publicationMetadata,
+                visualPreview: preparedVisualPreview ? {
                     evidence: preparedVisualPreview.evidence,
                     worktreePath: worktreeInfo.worktreePath
-                }
+                } : undefined
             }
         );
+        if (options.execution) {
+            const prNumber = postProcessingResult?.pr?.number;
+            if (!prNumber) throw Error('STORY_EXECUTION_PR_REQUIRED');
+            const { data: current } = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+                owner: issueRef.repoOwner, repo: issueRef.repoName, pull_number: prNumber }) as {
+                    data: { head?: { sha?: string; ref?: string; repo?: { full_name?: string } };
+                        base?: { ref?: string; repo?: { full_name?: string } }; merged?: boolean; state?: string;
+                        title?: string; body?: string; auto_merge?: unknown } };
+            const repository = `${issueRef.repoOwner}/${issueRef.repoName}`;
+            if (current.head?.sha !== commitResult.commitHash || current.head.ref !== options.execution.featureBranch ||
+                current.head.repo?.full_name !== repository || current.base?.repo?.full_name !== repository ||
+                current.base.ref !== options.execution.targetBranch || current.merged !== false || current.state !== 'open')
+                throw Error('STORY_EXECUTION_PUBLICATION_CHANGED');
+            if (options.execution.publicationMetadata && (current.title !== publicationMetadata?.prTitle ||
+                current.body !== publicationMetadata?.prBody || current.auto_merge != null))
+                throw Error('STORY_EXECUTION_PUBLICATION_METADATA_CHANGED');
+        }
 
         // Update plan issue status to 'under_review' if PR was created successfully
         if (postProcessingResult?.pr?.number) {
@@ -285,6 +335,7 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
         );
 
     } catch (postProcessingError) {
+        if (options.execution) throw postProcessingError;
         // A completed execution or an actual commit can be marked done during
         // fallback. A failed/interrupted run with no commit must remain retryable.
         const canMarkDone = claudeResult.success || commitResult !== null;

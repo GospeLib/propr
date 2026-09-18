@@ -37,6 +37,7 @@ import {
 } from '../github/visualPreviewAttachments.js';
 
 interface PostExecutionState {
+    artifactCorrection?: import('@propr/core').TypedArtifactCorrection;
     octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>> | null;
     worktreeInfo: WorktreeInfo | undefined;
     claudeResult: ClaudeCodeResponse | null;
@@ -70,6 +71,7 @@ interface PostExecutionParams {
     redisClient: Redis;
     prProcessingLockKey: string;
     prProcessingLockToken: string;
+    ezerAdmissionVerified?: boolean;
 }
 
 interface UndoContextParams {
@@ -146,11 +148,12 @@ interface CompletionCommentPublicationOptions {
     llm: string | null | undefined;
     taskUrl: string;
     unprocessedReviewComments: AIReviewComment[];
-    visualPreviewEvidence: Awaited<ReturnType<typeof prepareVisualPreviewEvidence>>['evidence'];
+    visualPreviewEvidence?: Awaited<ReturnType<typeof prepareVisualPreviewEvidence>>['evidence'];
 }
 
 async function publishCompletionComment(options: CompletionCommentPublicationOptions): Promise<{ data: { html_url: string; body?: string } }> {
-    const { state, context, commitResult, changesSummary, commitMessage, llm, taskUrl, unprocessedReviewComments, visualPreviewEvidence } = options;
+    const { state, context, commitResult, changesSummary, commitMessage, llm, taskUrl, unprocessedReviewComments } = options;
+    const visualPreviewEvidence = options.visualPreviewEvidence ?? { assets: [], toolSuggestions: [] };
     const { repoOwner, repoName, pullRequestNumber, correlatedLogger } = context;
     const hasVisualPreviewContent = visualPreviewEvidence.assets.length > 0
         || visualPreviewEvidence.toolSuggestions.length > 0;
@@ -222,8 +225,12 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
     const { repoOwner, repoName, pullRequestNumber, correlatedLogger } = context;
 
     requirePostExecutionState(state);
-    const disposition = getPostExecutionDisposition(state.claudeResult);
     const terminationReason = resolveAgentTerminationReason(state.claudeResult);
+    if (params.ezerAdmissionVerified === true &&
+        (state.claudeResult.success !== true || terminationReason !== undefined)) {
+        throw new Error('ezer-comment-refused:incomplete-execution');
+    }
+    const disposition = getPostExecutionDisposition(state.claudeResult);
     const partial = disposition === 'partial';
     if (disposition === 'failed') {
         throw new Error(`Agent execution failed: ${state.claudeResult.error || 'Unknown error'}`);
@@ -231,7 +238,7 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
 
     let preparedVisualPreview: Awaited<ReturnType<typeof prepareVisualPreviewEvidence>> | undefined;
     try {
-        preparedVisualPreview = await prepareVisualPreviewEvidence({
+        if (!state.artifactCorrection) preparedVisualPreview = await prepareVisualPreviewEvidence({
             worktreePath: state.worktreeInfo.worktreePath,
             settings: await loadRepositoryVisualPreviewSettings(`${repoOwner}/${repoName}`),
             taskId
@@ -251,7 +258,7 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
             llm,
             taskUrl,
             unprocessedReviewComments,
-            visualPreviewEvidence: preparedVisualPreview.evidence
+            visualPreviewEvidence: preparedVisualPreview?.evidence
         });
         correlatedLogger.info({ pullRequestNumber, commitHash: commitResult?.commitHash, commentUrl: completionComment.data.html_url, partial, terminationReason }, partial ? 'Published partial follow-up changes after interrupted execution' : 'Successfully applied follow-up changes');
 

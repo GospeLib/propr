@@ -4,14 +4,21 @@ import { handleError } from '../utils/errorHandler.js';
 import { withRetry, retryConfigs } from '../utils/retryHandler.js';
 import { getAuthenticatedOctokit } from '../auth/githubAuth.js';
 import { createHooklessGit } from './hooklessGit.js';
+import type { StoryExecutionContract } from '../admission/storyExecutionContract.js';
+import { verifyStoryPublication } from './storyPublication.js';
 
 interface InstallationAuth {
     token: string;
 }
 
+// Consume the credential span without requiring a trailing delimiter: requiring
+// @ after an unbounded span rescans every repeated prefix on malformed errors.
+const AUTHENTICATED_GIT_CREDENTIAL = /https:\/\/x-access-token:[^@\s'"]*/g;
+const REDACTED_GIT_CREDENTIAL = 'https://x-access-token:[REDACTED]';
+
 export function redactAuthenticatedGitUrl(message: string): string {
     return message
-        .replace(/https:\/\/x-access-token:[^@\s'"]+@github\.com\//g, 'https://x-access-token:[REDACTED]@github.com/')
+        .replace(AUTHENTICATED_GIT_CREDENTIAL, REDACTED_GIT_CREDENTIAL)
         .replace(/\b(?:ghs|ghp|gho|ghu|ghr|github_pat)_[A-Za-z0-9_.-]+/g, '[REDACTED_GITHUB_TOKEN]');
 }
 
@@ -115,6 +122,7 @@ export async function ensureBranchAndPush(worktreePath: string, branchName: stri
 }
 
 interface PushBranchOptions {
+    execution?: StoryExecutionContract;
     repoUrl?: string;
     authToken?: string;
     remote?: string;
@@ -150,9 +158,20 @@ export async function pushBranch(worktreePath: string, branchName: string, optio
     const { repoUrl, authToken, remote = 'origin', rebaseOnNonFastForward = false } = options;
 
     const git = createHooklessGit(worktreePath);
+    if (options.execution && (branchName !== options.execution.featureBranch || rebaseOnNonFastForward))
+        throw Error('STORY_EXECUTION_BRANCH_CHANGED');
 
     const performPush = async (token: string | undefined): Promise<void> => {
         if (repoUrl && token) await setupAuthenticatedRemote(git, repoUrl, token);
+        if (options.execution) {
+            await verifyStoryPublication(worktreePath, options.execution);
+            const head = (await git.revparse(['HEAD'])).trim();
+            const destination = `refs/heads/${branchName}`;
+            const remoteHead = (await git.raw(['ls-remote', '--heads', remote, destination])).trim().split(/\s+/)[0];
+            if (remoteHead && remoteHead !== options.execution.baseSha) throw Error('STORY_EXECUTION_REMOTE_CHANGED');
+            await git.push([`--force-with-lease=${destination}:${remoteHead}`, remote, `${head}:${destination}`]);
+            return;
+        }
 
         try {
             const currentBranch = await git.revparse(['--abbrev-ref', 'HEAD']);

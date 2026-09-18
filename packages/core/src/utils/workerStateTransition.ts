@@ -10,6 +10,16 @@ import { db } from '../db/connection.js';
 import { getEventPublisher } from './eventPublisher.js';
 import logger from './logger.js';
 
+export const MAX_ATOMIC_UPDATE_ATTEMPTS = 8;
+const ATOMIC_RETRY_BASE_DELAY_MS = 5;
+const ATOMIC_RETRY_MAX_DELAY_MS = 100;
+const ATOMIC_RETRY_BACKOFF_FACTOR = 2;
+
+export async function waitForAtomicUpdateRetry(attempt: number): Promise<void> {
+    const delayMs = Math.min(ATOMIC_RETRY_BASE_DELAY_MS * (ATOMIC_RETRY_BACKOFF_FACTOR ** attempt), ATOMIC_RETRY_MAX_DELAY_MS);
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+}
+
 const COMPARE_AND_SET_TASK_STATE_SCRIPT = `
 if redis.call('get', KEYS[1]) ~= ARGV[1] then
     return 0
@@ -22,6 +32,27 @@ export interface TaskStateTransition {
     state: TaskStateData;
     previousState: TaskState;
     reason: string;
+}
+
+export function cancellationMetadata(cancelledBy: string, metadata: UpdateMetadata): UpdateMetadata {
+    return { ...metadata, reason: metadata.reason ?? `Task cancelled by ${cancelledBy}`,
+        historyMetadata: { ...(metadata.historyMetadata ?? {}), cancelledBy, cancelledAt: new Date().toISOString() } };
+}
+
+/** Strict durability never publishes or leaves its own failed Redis projection behind. */
+export async function publishAndReconcileTaskTransition(redis: Redis, options: {
+    taskId: string; key: string; stateExpiry: number;
+    current: TaskStateData; transition: TaskStateTransition; metadata: UpdateMetadata;
+}): Promise<TaskStatePublicationResult> {
+    const { taskId, key, stateExpiry, current, transition, metadata } = options;
+    const publication = await publishTaskStateTransition(taskId, transition, metadata);
+    if (metadata.requireDurableHistory && !publication.historyPersisted) {
+        // Exact CAS prevents rollback of a concurrent ownership/cancellation transition.
+        await compareAndSetTaskStateData(redis, { key, stateExpiry,
+            currentJson: JSON.stringify(transition.state), state: current });
+        throw Error(`Task history was not persisted: ${publication.errors.join('; ')}`);
+    }
+    return publication;
 }
 
 export function taskStateExpectation(task: TaskStateData): TaskStateExpectation {
@@ -118,7 +149,7 @@ export async function compareAndSetTaskState(
         newState: TaskState;
         metadata: UpdateMetadata;
     },
-): Promise<TaskStateTransition | null> {
+): Promise<{ current: TaskStateData; transition: TaskStateTransition } | null> {
     const currentJson = await redis.get(options.key);
     if (!currentJson) return null;
     const current = JSON.parse(currentJson) as TaskStateData;
@@ -131,7 +162,7 @@ export async function compareAndSetTaskState(
         currentJson,
         state: transition.state,
     });
-    return updated ? transition : null;
+    return updated ? { current, transition } : null;
 }
 
 export async function publishTaskStateTransition(
@@ -183,6 +214,8 @@ export async function publishTaskStateTransition(
             version: state.version,
         }, 'Failed to persist task state update to database');
     }
+
+    if (metadata.requireDurableHistory && !publication.historyPersisted) return publication;
 
     try {
         publication.eventPublished = await getEventPublisher().publishTaskUpdate({

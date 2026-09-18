@@ -29,6 +29,7 @@ import {
     isVisualPreviewUploadAuthenticationError,
     publishPullRequestVisualPreviews,
 } from '../github/visualPreviewAttachments.js';
+import type { StoryPublicationMetadata } from './publicationMetadata.js';
 
 export type RepoValidation = RepoValidationResult;
 
@@ -65,6 +66,7 @@ interface CreatePROptions {
         evidence: VisualPreviewEvidence;
         worktreePath: string;
     };
+    publicationMetadata?: StoryPublicationMetadata;
 }
 
 export function buildIssueReference(
@@ -183,14 +185,14 @@ export async function createPullRequest(
     worktreeInfo: WorktreeInfo,
     options: CreatePROptions
 ): Promise<PostProcessingResult> {
-    const { commitResult, claudeResult, modelName, repoValidation, PR_LABEL, correlatedLogger, issueTitle, visualPreview } = options;
+    const { commitResult, claudeResult, modelName, repoValidation, PR_LABEL, correlatedLogger, issueTitle, visualPreview, publicationMetadata } = options;
     const jobId = `${issueRef.repoOwner}-${issueRef.repoName}-${issueRef.number}`;
 
     const modelShortName = getModelShortName(modelName);
-    const prTitle = '[' + issueRef.number + ' by ' + modelShortName + '] ' + issueTitle;
+    const prTitle = publicationMetadata?.prTitle ?? '[' + issueRef.number + ' by ' + modelShortName + '] ' + issueTitle;
 
     const completionComment = await generateCompletionComment(claudeResult, { number: issueRef.number, repoOwner: issueRef.repoOwner, repoName: issueRef.repoName });
-    const basePrBody = `## AI Implementation Summary
+    const basePrBody = publicationMetadata?.prBody ?? `## AI Implementation Summary
 
 ${buildIssueReference(issueRef.number, commitResult !== null, claudeResult)}
 
@@ -206,13 +208,13 @@ ${completionComment}
 ### 💡 Need changes?
 
 Comment on this PR to request refinements — the AI agent monitors comments and will update the implementation based on your feedback. Keep iterating until you're satisfied!`;
-    const visualPreviewSection = visualPreview && commitResult
+    const visualPreviewSection = !publicationMetadata && visualPreview && commitResult
         ? renderVisualPreviewSection({
             assets: [],
             toolSuggestions: visualPreview.evidence.toolSuggestions
         }, {})
         : '';
-    const prBody = appendVisualPreviewSection(basePrBody, visualPreviewSection);
+    const prBody = publicationMetadata ? basePrBody : appendVisualPreviewSection(basePrBody, visualPreviewSection);
 
     try {
         const prResponse = await octokit.request<{ data: { number: number; html_url: string; title: string } }>('POST /repos/{owner}/{repo}/pulls', {
@@ -251,7 +253,7 @@ Comment on this PR to request refinements — the AI agent monitors comments and
             correlatedLogger.warn({ prNumber: prResponse.data.number, labels: labelsToAdd, error: (labelError as Error).message }, 'Failed to add PR labels to new PR after retries');
         }
 
-        if (visualPreview && commitResult && visualPreview.evidence.assets.length > 0) {
+        if (!publicationMetadata && visualPreview && commitResult && visualPreview.evidence.assets.length > 0) {
             try {
                 await publishPullRequestVisualPreviews({
                     owner: issueRef.repoOwner,

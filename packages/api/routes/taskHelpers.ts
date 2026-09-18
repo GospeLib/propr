@@ -1,9 +1,23 @@
 import { Knex } from 'knex';
 
+// A consumed owner stop remains terminal when the only later rows are refused automatic retries.
+const CURRENT_TASK_HISTORY_ORDER = `ROW_NUMBER() OVER(PARTITION BY task_id ORDER BY
+  CASE WHEN state = 'cancelled' AND json_valid(metadata) = 1 THEN
+    CASE WHEN json_extract(metadata, '$.cancellationReason') = 'ezer_owner_stop'
+      AND json_extract(metadata, '$.controlAdmissionId') IS NOT NULL
+      AND json_extract(metadata, '$.controlOperationId') IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM task_history later WHERE later.task_id = task_history.task_id
+        AND later.timestamp > task_history.timestamp
+        AND NOT ((later.state = 'pending' AND later.reason = 'Task created')
+          OR (later.state = 'failed' AND later.reason = 'ezer-execution-admission-refused:missing-worker-receipt')))
+    THEN 1 ELSE 0 END ELSE 0 END DESC, timestamp DESC) as rn`;
+
+
 export interface TaskQuery {
   db: Knex;
   status: string;
   repository: string;
+  issueNumber?: number;
   limit: number;
   offset: number;
   search?: string;
@@ -14,14 +28,14 @@ export interface TaskQuery {
 export async function getTasksFromDb(
   query: TaskQuery
 ): Promise<{ tasks: unknown[]; total: number; offset: number; limit: number }> {
-  const { db, status, repository, limit, offset, search, forReview, excludeMerged } = query;
+  const { db, status, repository, issueNumber, limit, offset, search, forReview, excludeMerged } = query;
   const latestHistorySubquery = db('task_history')
     .select(
       'task_id',
       'state',
       'timestamp',
       'reason',
-      db.raw('ROW_NUMBER() OVER(PARTITION BY task_id ORDER BY timestamp DESC) as rn')
+      db.raw(CURRENT_TASK_HISTORY_ORDER)
     )
     .as('h');
 
@@ -97,6 +111,9 @@ export async function getTasksFromDb(
   if (repository && repository !== 'all') {
     baseQuery.where('t.repository', repository);
   }
+  if (issueNumber !== undefined) {
+    baseQuery.where('t.issue_number', issueNumber);
+  }
   if (search && search.trim() !== '') {
     const searchTerm = `%${search.trim()}%`;
     baseQuery.where(function() {
@@ -125,8 +142,52 @@ export async function getTasksFromDb(
     .limit(limit)
     .offset(offset);
 
-  const tasks = dbTasks.map((row: Record<string, unknown>) => mapDbTaskToResponse(row));
+  const taskIds = dbTasks.map((row: Record<string, unknown>) => row.task_id as string);
+  const correlations = await fetchDurableCorrelations(db, taskIds);
+  const tasks = dbTasks.map((row: Record<string, unknown>) => mapDbTaskToResponse(row, correlations.get(row.task_id as string)));
   return { tasks, total, offset, limit };
+}
+
+export interface DurableExecutionCorrelation {
+  admissionId?: string;
+  operationId?: string;
+  sessionId?: string;
+}
+
+function parseHistoryMetadata(value: unknown): Record<string, unknown> {
+  if (!value) return {};
+  try {
+    return typeof value === 'string' ? JSON.parse(value) : value as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Scans task_history metadata for the given tasks and keeps the latest known
+ * value of each correlation field per task. These fields are each written to a
+ * single history row (e.g. admissionId/operationId/sessionId land on the
+ * claude_execution row), not necessarily the task's current/latest row, so a
+ * single-row join would silently drop them once a task moves past that state.
+ */
+async function fetchDurableCorrelations(db: Knex, taskIds: string[]): Promise<Map<string, DurableExecutionCorrelation>> {
+  const correlations = new Map<string, DurableExecutionCorrelation>();
+  if (taskIds.length === 0) return correlations;
+
+  const rows = await db('task_history')
+    .select('task_id', 'metadata')
+    .whereIn('task_id', taskIds)
+    .orderBy('timestamp', 'asc');
+
+  for (const row of rows) {
+    const metadata = parseHistoryMetadata(row.metadata);
+    const current = correlations.get(row.task_id as string) ?? {};
+    if (typeof metadata.admissionId === 'string') current.admissionId = metadata.admissionId;
+    if (typeof metadata.operationId === 'string') current.operationId = metadata.operationId;
+    if (typeof metadata.sessionId === 'string') current.sessionId = metadata.sessionId;
+    correlations.set(row.task_id as string, current);
+  }
+  return correlations;
 }
 
 function parseRepositoryParts(repository: unknown): { owner: string | null; name: string | null } {
@@ -166,7 +227,7 @@ function extractPrNumberFromFinalResult(row: Record<string, unknown>): number | 
   }
 }
 
-function mapDbTaskToResponse(row: Record<string, unknown>): Record<string, unknown> {
+function mapDbTaskToResponse(row: Record<string, unknown>, correlation?: DurableExecutionCorrelation): Record<string, unknown> {
   const { owner: repositoryOwner, name: repositoryName } = parseRepositoryParts(row.repository);
   const { title, subtitle, llmProvider, prNumber: jobDataPrNumber, issueNumber: jobDataIssueNumber } = parseInitialJobData(row);
   const prNumber = (row.pr_number as number | null) || jobDataPrNumber || extractPrNumberFromFinalResult(row);
@@ -187,6 +248,18 @@ function mapDbTaskToResponse(row: Record<string, unknown>): Record<string, unkno
     progress: (row.state === 'completed' || row.state === 'failed' || row.state === 'cancelled') ? 100 : (row.state === 'processing' ? 50 : 0),
     attemptsMade: 1, modelName: row.model_name, model: row.model_name, llmProvider,
     planIssueStatus: row.plan_issue_status || null,
-    critiqueScore: critiqueScore !== null && !isNaN(critiqueScore) ? critiqueScore : null
+    critiqueScore: critiqueScore !== null && !isNaN(critiqueScore) ? critiqueScore : null,
+    correlationId: (row.correlation_id as string | null) ?? null,
+    admissionId: correlation?.admissionId ?? null,
+    operationId: correlation?.operationId ?? null,
+    sessionId: correlation?.sessionId ?? null,
+    commitHash: (row.commit_hash as string | null) ?? null
   };
+}
+
+const ADMITTED_PR_COMMENT_TASK = /^pr-comments-batch-ezer-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+/** These task IDs are created only by the signed PR-comment ingress; their issue number is the PR. */
+export function taskFollowupPullRequest(task: {task_id:string;issue_number:number;pr_number?:number|null}): number | undefined {
+ const candidate=task.pr_number??(ADMITTED_PR_COMMENT_TASK.test(task.task_id)?task.issue_number:undefined);
+ return typeof candidate==='number'&&Number.isSafeInteger(candidate)&&candidate>0?candidate:undefined;
 }

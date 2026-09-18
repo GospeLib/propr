@@ -44,6 +44,7 @@ interface FetchLinkedIssueOptions {
 }
 
 interface SessionIdOptions {
+    verifiedExecutionCorrelation?: { admissionId: string; operationId: string };
     llm: string;
     stateManager: WorkerStateManager;
     correlatedLogger: Logger;
@@ -347,14 +348,14 @@ export function createSessionIdCallbackForPR(
             if (currentState?.state === TaskStates.CLAUDE_EXECUTION) {
                 // Already in claude_execution, just update the history metadata with session info
                 await stateManager.updateHistoryMetadata(taskId, 'claude_execution', {
-                    sessionId, conversationId, model: llm
+                    sessionId, conversationId, model: llm, ...options.verifiedExecutionCorrelation
                 });
             } else {
                 // Transition to claude_execution state
                 await stateManager.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, {
                     reason: 'Claude execution started',
                     claudeResult: { success: false, sessionId, conversationId },
-                    historyMetadata: { sessionId, conversationId, model: llm }
+                    historyMetadata: { sessionId, conversationId, model: llm, ...options.verifiedExecutionCorrelation }
                 });
             }
 

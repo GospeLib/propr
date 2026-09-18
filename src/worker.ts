@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { executeIntegration } from '@propr/core';
 import { Worker } from 'bullmq';
 import { Redis } from 'ioredis';
 import { GITHUB_ISSUE_QUEUE_NAME, closeStateManager, createWorker, getStateManager, runMigrations } from '@propr/core';
@@ -321,6 +322,7 @@ async function startWorker(options: WorkerOptions = {}): Promise<StartedWorker> 
         concurrency: workerConcurrency,
         workerFactory: createWorker,
         processors: {
+            processIntegrationJob: job => executeIntegration(job.data),
             processGitHubIssueJob,
             processPullRequestCommentJob,
             processTaskImportJob,

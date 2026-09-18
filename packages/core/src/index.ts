@@ -12,7 +12,7 @@ export { persistLlmLog, createLlmLogFromAnalysis, createLlmLogFromAgentExecution
 export type { LlmLogEntry, WorkReference, WorkType } from './utils/llmLogger.js';
 export type { LLMMetricsSummary, LLMMetricsData, RecordMetricsOptions, ClaudeResult as LLMClaudeResult, IssueRef as LLMIssueRef, ModelPricing, ExtractedMetrics, AggregatedMetrics, CostCheckMetrics, PersistMetrics, ConversationDetail, LLMMetricsSummaryResult, ModelMetrics, DailyMetric, HighCostAlert, ConversationStep, TokenUsage, ExecutionType } from './utils/llmMetrics.types.js';
 export { WorkerStateManager, getStateManager, closeStateManager, TaskStates } from './utils/workerStateManager.js';
-export { taskStateExpectation } from './utils/workerStateTransition.js';
+export { taskStateExpectation, MAX_ATOMIC_UPDATE_ATTEMPTS, waitForAtomicUpdateRetry } from './utils/workerStateTransition.js';
 export { hashTaskAttemptToken } from './utils/taskAttemptGeneration.js';
 export { getEventPublisher, closeEventPublisher, EventPublisher } from './utils/eventPublisher.js';
 export type { TaskState, IssueRef, HistoryEntry, LastError, ClaudeResultSummary, PRResult, TaskStateData, TaskStateExpectation, TaskStatePublicationResult, TaskStateUpdateResult, UpdateMetadata, TaskResult, ResumableTaskInfo, NonTerminalTaskScanResult, WorkerStateManagerOptions } from './utils/workerStateManager.types.js';
@@ -34,6 +34,10 @@ export type { SubscriptionUsageRecord, SubscriptionUsageMetrics } from './utils/
 export { getGitHubInstallationToken, getAuthenticatedOctokit, validateGithubIntakePrerequisites } from './auth/githubAuth.js';
 export type { PaginatedOctokitInstance } from './auth/githubAuth.js';
 export { buildAuthPayload, generateAuthToken, verifyAuthToken, AUTH_TOKEN_MAX_AGE_MS, AUTH_TOKEN_MAX_CLOCK_SKEW_MS } from './auth/systemTaskAuth.js';
+export { consumeExecutionAdmission, createRedisAdmissionStore, readExecutionAdmissionConsumption, pendingExecutionAdmissionKey, requiresEzerExecutionAdmission, inspectWorkerAdmissionReceipt, verifyWorkerAdmissionReceipt } from './admission/ezerExecutionAdmission.js';
+export type { CommentAdmissionBinding, AdmissionStore, ExecutionAdmissionClaims, WorkerAdmissionReceipt } from './admission/ezerExecutionAdmission.js';
+export { requireStoryPublicationId, requireStoryPublicationPolicyAtRevision, requireStoryPublicationPolicyFromReader, storyPublicationSpecLinkPath, storyPublicationTaskLinkRequired, STORY_PUBLICATION_TASK_ID_PATTERN, STORY_PUBLICATION_TASK_SUFFIX_PATTERN, STORY_PUBLICATION_SPEC_DIRECTORY_PREFIX } from './publication/index.js';
+export type { StoryPublicationPolicyInput } from './publication/index.js';
 
 export * from './config/configManager.js';
 // Note: loadUltrafixRatingGoal, loadUltrafixMaxCycles, loadUltrafixPauseSeconds, loadPrReviewModel
@@ -83,7 +87,7 @@ export type { BranchConfiguration } from './git/branchConfig.js';
 export { createHooklessGit, DISABLED_GIT_HOOKS_PATH } from './git/hooklessGit.js';
 export { AI_COMMIT_AUTHOR, commitChanges } from './git/commitOperations.js';
 export type { CommitResult } from './git/commitOperations.js';
-export { setupAuthenticatedRemote, ensureBranchAndPush, pushBranch } from './git/repoBranching.js';
+export { setupAuthenticatedRemote, ensureBranchAndPush, pushBranch, redactAuthenticatedGitUrl } from './git/repoBranching.js';
 export { ensureRepoCloned, createWorktreeForIssue, getRepoUrl, fetchLatestChanges } from './git/repoManager.js';
 export type { WorktreeResult, WorktreeInfo, FetchLatestChangesOptions, FetchLatestChangesResult } from './git/repoManager.js';
 export { cleanupExistingBranch, createWorktreeFromExistingBranch } from './git/worktreeCreation.js';
@@ -216,7 +220,7 @@ export {
     runLightweightLLMAnalysis,
     UsageLimitError
 } from './claude/claudeService.js';
-export { AGENT_TYPES, AGENT_IMAGE_NAME, DEFAULT_AGENT_DOCKER_IMAGES, validateAgentType } from './agents/constants.js';
+export { AGENT_TYPES, AGENT_IMAGE_NAME, DEFAULT_AGENT_DOCKER_IMAGES, validateAgentType, PLANNING_ARTIFACT_PROFILE, PLANNING_ARTIFACT_TIMEOUT_MS, PLANNING_ARTIFACT_MAX_OUTPUT_TOKENS } from './agents/constants.js';
 export type { AgentTypeValidationResult } from './agents/constants.js';
 export type {
     ExecuteClaudeCodeOptions,
@@ -236,7 +240,9 @@ export {
     buildClaudePrompt
 } from './claude/claudeHelpers.js';
 export type { ClaudeOutput, ConversationLogEntry, ClaudeOutputResult, BuildClaudePromptOptions, DockerArgsParams, StorePromptOptions } from './claude/claudeHelpers.js';
-export { buildPlannerAbortSignalKey, executeDockerCommand, findRunningDockerContainerForTask, findTaskContainer, inspectLegacyDockerContainerLivenessForTask, runWithExecutionAbortSignal, runWithPlannerAbortContext, stopDockerContainer, ExecutionAbortedError, ensureAgentBundleImage } from './claude/docker/dockerExecutor.js';
+export { buildPlannerAbortSignalKey, executeDockerCommand, findRunningDockerContainerForTask, findTaskContainer, inspectLegacyDockerContainerLivenessForTask, runWithExecutionAbortSignal, runWithPlannerAbortContext, stopDockerContainer, clearWorkerAbortSignalWithClient, ExecutionAbortedError, ensureAgentBundleImage } from './claude/docker/dockerExecutor.js';
+export { buildPlannerAbortRedisOptions } from './claude/docker/dockerAbortController.js';
+export type { ExecutionChildIdentity, ExecutionTerminal } from './claude/docker/index.js';
 export type { RunningTaskContainer } from './claude/docker/dockerExecutor.js';
 export { cleanupUnusedAgentImages, listAgentImages } from './claude/docker/dockerImageManager.js';
 export type { VersionedImageBuildResult } from './claude/docker/dockerExecutor.js';
@@ -433,3 +439,18 @@ export {
     scheduleRepositoryRenameCheck
 } from './services/repositoryMigrationService.js';
 export type { RepositoryRenameResult, MigrationResult } from './services/repositoryMigrationService.js';
+
+export { enqueueAdmittedComment } from './admission/admittedComment.js';
+export { requireIntegrationPayload, integrationDigest } from './admission/integrationPayload.js';
+export type { IntegrationPayload, IntegrationJobData } from './admission/integrationPayload.js';
+export { executeIntegration, validateCurrentIntegration } from './admission/integrationExecution.js';
+export { EZER_REVIEW_REQUEST, requireReviewRequestMode } from './admission/reviewRequest.js';
+
+export { requireTypedInvestigation, type TypedInvestigationAdmission } from './admission/ezerExecutionAdmission.js';
+
+export { requireTypedArtifactCorrection, type TypedArtifactCorrection } from './admission/ezerExecutionAdmission.js';
+
+export type { StopAdmissionBinding } from './admission/ezerExecutionAdmission.js';
+export { requireStoryExecutionContract, type StoryExecutionContract } from './admission/storyExecutionContract.js';
+export { requireAuthorizedPublicationMetadata, publicationMetadataDigest, type AuthorizedPublicationMetadata } from './admission/authorizedPublicationMetadata.js';
+export { verifyStoryPublication } from './git/storyPublication.js';

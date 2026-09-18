@@ -21,6 +21,22 @@ export interface AgentImageResolution {
     error?: string;
 }
 
+/** Prepare one coherent replacement without racing runtime-package state saves. */
+export async function resolveInstalledAgentImages(
+    installed: ReadonlyMap<string, string>,
+    prepareImages: boolean,
+): Promise<{ images: Map<string, string> } | { images?: never; imageTag: string; error: string }> {
+    const images = new Map<string, string>();
+    for (const [id, imageTag] of installed) {
+        try {
+            images.set(id, await resolveAgentRuntimeImage(imageTag, { buildMissing: prepareImages }));
+        } catch (error) {
+            return { imageTag, error: (error as Error).message };
+        }
+    }
+    return { images };
+}
+
 async function resolveBundleBaseImage(
     configs: AgentConfig[],
     prepareImages: boolean,

@@ -55,6 +55,7 @@ interface AgentStatus {
   type: AgentConfig['type'] | 'synthetic';
   alias: string;
   status: 'connected' | 'disconnected' | 'degraded';
+  supportedModels?: string[];
 }
 
 export function createStatusRoutes(deps: StatusRoutesDeps) {
@@ -416,7 +417,7 @@ async function getAgentStatuses(
       if (!registeredAgent) {
         return buildConfiguredAgentStatus(config, registry, healthTimeoutMs);
       }
-      return buildRegisteredAgentStatus(registeredAgent, healthTimeoutMs);
+      return buildRegisteredAgentStatus(registeredAgent, healthTimeoutMs, true);
     }));
 
   const syntheticStatuses = await Promise.all(syntheticAgents
@@ -460,14 +461,14 @@ async function buildConfiguredAgentStatus(
   healthTimeoutMs: number
 ): Promise<AgentStatus> {
   try {
-    return await buildRegisteredAgentStatus(registry.createAgentFromConfig(config), healthTimeoutMs);
+    return await buildRegisteredAgentStatus(registry.createAgentFromConfig(config), healthTimeoutMs, true);
   } catch (error) {
     console.error('Error checking configured agent status:', error);
     return buildDisconnectedAgentStatus(config);
   }
 }
 
-async function buildRegisteredAgentStatus(agent: Agent, healthTimeoutMs: number): Promise<AgentStatus> {
+async function buildRegisteredAgentStatus(agent: Agent, healthTimeoutMs: number, configuredModels = false): Promise<AgentStatus> {
   let healthy = false;
   try {
     healthy = await withTimeout(agent.healthCheck(), healthTimeoutMs, false);
@@ -478,7 +479,8 @@ async function buildRegisteredAgentStatus(agent: Agent, healthTimeoutMs: number)
     id: agent.config.id,
     type: agent.config.type,
     alias: agent.config.alias,
-    status: healthy ? 'connected' : 'disconnected'
+    status: healthy ? 'connected' : 'disconnected',
+    ...(configuredModels ? {supportedModels:[...agent.config.supportedModels]} : {})
   };
 }
 

@@ -1,3 +1,4 @@
+import { isManagedBundleImage } from '../agents/configuredAgentImages.js';
 import path from 'path';
 import {
     AGENT_DEFAULTS,
@@ -134,7 +135,6 @@ const OPENCODE_CURRENT_MODELS = OPENCODE_MODELS.map(model => model.id);
 const RETIRED_OPENCODE_DEFAULT_MODELS = new Set([
     'opencode-minimax-m3-free'
 ]);
-const MANAGED_AGENT_IMAGE_PREFIX = 'propr/agent:';
 
 function migrateCliVersion(agent: AgentConfig): boolean {
     if (agent.cliVersionType) {
@@ -161,7 +161,7 @@ function applyDefaultAgentFields(agent: AgentConfig): boolean {
         logger.info({ agentAlias: agent.alias, configPath: agent.configPath }, 'Added missing agent config path');
     }
 
-    if (!agent.dockerImage || (agent.dockerImage !== defaults.dockerImage && !agent.dockerImage.startsWith(MANAGED_AGENT_IMAGE_PREFIX))) {
+    if (!agent.dockerImage) {
         agent.dockerImage = defaults.dockerImage;
         migrated = true;
         logger.info({ agentAlias: agent.alias, dockerImage: agent.dockerImage }, 'Normalized agent Docker image');
@@ -369,7 +369,7 @@ export async function migrateAgentConfigs(): Promise<boolean> {
 
         const bundleImage = generateAgentBundleImageTag(getAgentCliVersionMatrix(agents), computeContentHash());
         for (const agent of agents) {
-            if (agent.dockerImage !== bundleImage) {
+            if (isManagedBundleImage(agent.dockerImage) && agent.dockerImage !== bundleImage) {
                 agent.dockerImage = bundleImage;
                 migrated = true;
             }

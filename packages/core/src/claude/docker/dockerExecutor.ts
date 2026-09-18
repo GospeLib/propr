@@ -1,7 +1,10 @@
 import { spawn, execFileSync, SpawnOptions, ChildProcess } from 'child_process';
 import fs from 'fs';
+import { createInterface } from 'node:readline';
 import { Redis } from 'ioredis';
 import logger from '../../utils/logger.js';
+import type { DockerExecutionCessation, DockerContainerTerminalState } from './dockerContainerControl.js';
+import { recordDockerTerminalEvidence } from './dockerTerminalEvidence.js';
 import {
     abortSpawnedExecution,
     createDockerExecutionState,
@@ -15,6 +18,8 @@ import {
     plannerAbortSignalKeyForTask,
     scheduleForceKill,
     setupAbortChecker,
+    buildPlannerAbortRedisOptions,
+    closeAbortRedis,
 } from './dockerAbortController.js';
 
 export { stopDockerContainer } from './dockerContainerControl.js';
@@ -27,6 +32,7 @@ export {
     buildPlannerAbortSignalKey,
     checkAbortSignal,
     clearWorkerAbortSignal,
+    clearWorkerAbortSignalWithClient,
     plannerAbortSignalKeyForTask,
     runWithPlannerAbortContext,
     shouldTerminateAfterAbortLookupFailure,
@@ -44,9 +50,30 @@ export interface ExecutionResult {
     timeoutMs?: number;
 }
 export interface RunningTaskContainer { id: string; name: string; }
+export interface ExecutionChildIdentity { pid: number; containerName: string | null; }
+export interface ExecutionTerminal extends ExecutionResult {
+    child: ExecutionChildIdentity;
+    aborted: boolean;
+    childStopped: boolean;
+    signal: NodeJS.Signals | null;
+    containerCessation: DockerExecutionCessation;
+    containerState?: DockerContainerTerminalState;
+    containerCleanup?: { retained: boolean; error: string };
+    containerObservationError?: string;
+}
 export type LegacyTaskContainerLiveness = 'running' | 'not_found' | 'unavailable';
 
 export interface DockerCommandOptions {
+    /** Keep the container until its terminal state and complete output are durably observed. */
+    preserveTerminalEvidence?: boolean;
+    /** Ownership evidence callback; must finish before an execution-scoped timeout teardown. */
+    onTimeout?: () => void | Promise<void>;
+    onAbortRequested?: () => void | Promise<void>;
+    /** A command deadline preserves sibling commands; an execution lease closes exact attempt ownership. */
+    timeoutScope?: 'command' | 'execution';
+    onChildStarted?: (identity: ExecutionChildIdentity) => void | Promise<void>;
+    /** Called after child close and teardown, before output is discarded or returned. */
+    onTerminal?: (terminal: ExecutionTerminal) => void | Promise<void>;
     timeout?: number; cwd?: string; worktreePath?: string; stdinData?: string; taskId?: string; streamToRedis?: boolean; streamStderrToRedis?: boolean; stripAnsi?: boolean;
     /** Resolve with buffered output on timeout so implementation jobs can publish partial work. */
     preserveOutputOnTimeout?: boolean;
@@ -57,6 +84,8 @@ export interface DockerCommandOptions {
 }
 
 interface JsonLineMessage { type?: string; message?: { id?: string; model?: string; }; session_id?: string; conversation_id?: string; }
+const PROCESS_OUTPUT_ENCODING = 'utf8';
+const FALLBACK_MESSAGE_KEY_LENGTH = 100;
 
 // ANSI escape code regex for stripping terminal formatting (constructed dynamically to avoid control char lint errors)
 const ANSI_REGEX = new RegExp('[' + String.fromCharCode(0x1b) + String.fromCharCode(0x9b) + '][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]', 'g');
@@ -159,6 +188,17 @@ function spawnCommandProcess(
     return child;
 }
 
+/** Decode each pipe once and frame metadata separately from exact retained text. */
+function observeCommandOutput(child: ChildProcess, receive: {
+    stdout: (chunk: string) => void;
+    stderr: (chunk: string) => void;
+    line: (line: string) => void;
+}): void {
+    child.stdout?.setEncoding(PROCESS_OUTPUT_ENCODING).on('data', receive.stdout);
+    child.stderr?.setEncoding(PROCESS_OUTPUT_ENCODING).on('data', receive.stderr);
+    if (child.stdout) createInterface({ input: child.stdout, crlfDelay: Infinity }).on('line', receive.line);
+}
+
 export function executeDockerCommand(command: string, args: string[], options: DockerCommandOptions = {}): Promise<ExecutionResult> {
     const ownershipContext = getExecutionOwnershipContext();
     const executionSignal = options.signal ?? ownershipContext?.signal;
@@ -173,11 +213,12 @@ export function executeDockerCommand(command: string, args: string[], options: D
 
         let stdout = '', stderr = '';
         const state = createDockerExecutionState();
+        if (options.preserveTerminalEvidence) state.preserveTerminalEvidence = true;
         let ownershipFailure: unknown;
         let hasOwnershipFailure = false;
         let timeoutInitiatedAbort = false;
         const pendingCallbacks = new Set<Promise<void>>();
-        let containerDetectionTimer: ReturnType<typeof setTimeout> | null = null;
+        let containerDetectionTimer: ReturnType<typeof setInterval> | null = null;
         const messageTimestamps = new Map<string, string>();
         const abortExecution = (executionTimeout = false): void => {
             void abortSpawnedExecution(
@@ -185,6 +226,7 @@ export function executeDockerCommand(command: string, args: string[], options: D
                 state,
                 {
                     namedContainer,
+                    preserveTerminalEvidence: options.preserveTerminalEvidence,
                     scheduleForceKill,
                     // A command timeout belongs only to this subprocess. Using
                     // the task-generation fence here leaves a teardown sweep
@@ -192,8 +234,8 @@ export function executeDockerCommand(command: string, args: string[], options: D
                     // analysis container started by the same task. Ownership
                     // loss and explicit cancellation still require the broad,
                     // generation-fenced cleanup below.
-                    taskId: executionTimeout ? undefined : taskId,
-                    attemptGeneration: executionTimeout ? undefined : ownershipContext?.attemptGeneration,
+                    taskId: executionTimeout && options.timeoutScope !== 'execution' ? undefined : taskId,
+                    attemptGeneration: executionTimeout && options.timeoutScope !== 'execution' ? undefined : ownershipContext?.attemptGeneration,
                 },
             );
         };
@@ -204,7 +246,11 @@ export function executeDockerCommand(command: string, args: string[], options: D
         };
         const abortForExecutionSignal = (): void => {
             preserveOwnershipFailure(getExecutionAbortError(executionSignal) ?? new ExecutionAbortedError());
-            abortExecution();
+            if (options.onAbortRequested) invokeExecutionCallback(async () => {
+                await options.onAbortRequested!();
+                abortExecution();
+            });
+            else abortExecution();
         };
         const failFromCallback = (error: unknown): void => {
             preserveOwnershipFailure(error);
@@ -216,10 +262,15 @@ export function executeDockerCommand(command: string, args: string[], options: D
             void callbackPromise.finally(() => pendingCallbacks.delete(callbackPromise));
         };
         executionSignal?.addEventListener('abort', abortForExecutionSignal, { once: true });
+        if (child.pid && options.onChildStarted) invokeExecutionCallback(() => options.onChildStarted!({ pid: child.pid!, containerName: namedContainer }));
         const timeoutHandle = setTimeout(() => {
             state.timedOut = true;
             timeoutInitiatedAbort = !state.aborted.value;
-            abortExecution(true);
+            if (options.onTimeout) invokeExecutionCallback(async () => {
+                await options.onTimeout!();
+                abortExecution(true);
+            });
+            else abortExecution(true);
         }, timeout);
         const plannerAbortKey = taskId ? plannerAbortSignalKeyForTask(taskId) : null;
         const abortChecker = taskId && plannerAbortKey
@@ -250,29 +301,29 @@ export function executeDockerCommand(command: string, args: string[], options: D
                 state,
                 onContainerId,
                 invokeExecutionCallback,
+                namedContainer,
             );
         }
 
-        child.stdout?.on('data', (data: Buffer) => {
-            const chunk = data.toString(), ts = new Date().toISOString();
-            stdout += chunk;
-            for (const line of chunk.split('\n')) {
-                if (!line.trim()) continue;
+        observeCommandOutput(child, {
+            stdout: chunk => { stdout += chunk; },
+            stderr: chunk => { stderr += chunk; },
+            line: line => {
+                if (!line.trim()) return;
                 try {
                     const j: JsonLineMessage = JSON.parse(line);
-                    if (j.type === 'assistant' || j.type === 'user') messageTimestamps.set(j.message?.id || `${j.type}-${JSON.stringify(j).substring(0, 100)}`, ts);
+                    if (j.type === 'assistant' || j.type === 'user') messageTimestamps.set(j.message?.id || `${j.type}-${JSON.stringify(j).substring(0, FALLBACK_MESSAGE_KEY_LENGTH)}`, new Date().toISOString());
                     if (!state.sessionIdDetected && onSessionId && j.session_id) {
                         state.sessionIdDetected = true;
                         invokeExecutionCallback(() => onSessionId(j.session_id!, j.conversation_id));
                     }
                 } catch { /* skip */ }
-            }
+            },
         });
-        child.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
 
         child.on('close', async (exitCode: number | null) => {
             clearTimeout(timeoutHandle);
-            if (containerDetectionTimer) clearTimeout(containerDetectionTimer);
+            if (containerDetectionTimer) clearInterval(containerDetectionTimer);
             if (abortChecker) await abortChecker.close();
             await Promise.allSettled([...pendingCallbacks]);
             if (state.teardownPromise) await state.teardownPromise;
@@ -280,6 +331,18 @@ export function executeDockerCommand(command: string, args: string[], options: D
             await cleanupRedisStreaming(redisState, taskId, stripAnsi, getRedisOutput());
             const executionAbortError = getExecutionAbortError(executionSignal);
             if (executionAbortError) preserveOwnershipFailure(executionAbortError);
+            if (options.onTerminal) {
+                try {
+                    await recordDockerTerminalEvidence(options, {
+                        exitCode, stdout, stderr, messageTimestamps,
+                        child: { pid: child.pid ?? 0, containerName: namedContainer },
+                        aborted: state.aborted.value || hasOwnershipFailure,
+                        childStopped: Boolean(child.pid), signal: child.signalCode,
+                        timedOut: state.timedOut, timeoutMs: state.timedOut ? timeout : undefined,
+                    }, { containerId: state.containerId.value, taskId,
+                        attemptGeneration: ownershipContext?.attemptGeneration });
+                } catch (error) { preserveOwnershipFailure(error); }
+            }
             if (hasOwnershipFailure) {
                 reject(ownershipFailure);
                 return;
@@ -302,13 +365,13 @@ export function executeDockerCommand(command: string, args: string[], options: D
         });
         child.on('error', async (error: Error) => {
             clearTimeout(timeoutHandle);
-            if (containerDetectionTimer) clearTimeout(containerDetectionTimer);
+            if (containerDetectionTimer) clearInterval(containerDetectionTimer);
             executionSignal?.removeEventListener('abort', abortForExecutionSignal);
             if (abortChecker) await abortChecker.close();
             await Promise.allSettled([...pendingCallbacks]);
             if (state.teardownPromise) await state.teardownPromise;
             if (redisState.interval) clearInterval(redisState.interval);
-            if (redisState.client) redisState.client.quit().catch(() => {});
+            if (redisState.client) await closeAbortRedis(redisState.client);
             reject(error);
         });
     });
@@ -317,7 +380,7 @@ export function executeDockerCommand(command: string, args: string[], options: D
 function initRedisStreaming(taskId: string, stripAnsi: boolean | undefined, getStdout: () => string, state: { client: Redis | null; interval: ReturnType<typeof setInterval> | null; lastLen: number }): void {
     (async () => {
         try {
-            state.client = new Redis({ host: process.env.REDIS_HOST || 'redis', port: parseInt(process.env.REDIS_PORT || '6379', 10) });
+            state.client = new Redis(buildPlannerAbortRedisOptions());
             const redisKey = `agent:output:${taskId}`;
             state.interval = setInterval(async () => {
                 const stdout = getStdout();
@@ -334,35 +397,46 @@ function initRedisStreaming(taskId: string, stripAnsi: boolean | undefined, getS
 async function cleanupRedisStreaming(state: { client: Redis | null; interval: ReturnType<typeof setInterval> | null }, taskId: string | undefined, stripAnsi: boolean | undefined, stdout: string): Promise<void> {
     if (state.interval) clearInterval(state.interval);
     if (state.client && taskId) {
-        try { await state.client.setex(`agent:output:${taskId}`, 3600, stripAnsi ? stripAnsiCodes(stdout) : stdout); await state.client.quit(); }
+        try { await state.client.setex(`agent:output:${taskId}`, 3600, stripAnsi ? stripAnsiCodes(stdout) : stdout); }
         catch (err) { logger.debug({ error: (err as Error).message }, 'Failed to cleanup Redis streaming'); }
+        finally { await closeAbortRedis(state.client); }
     }
 }
 
-function detectContainerId(
+const CONTAINER_DETECTION_INTERVAL_MS = 2000;
+const CONTAINER_DETECTION_TIMEOUT_MS = 5000;
+
+/** Observe startup until the enclosing execution ends; a slow Docker create is not absence. */
+export function detectContainerId(
     worktreePath: string,
     state: { containerIdDetected: boolean; containerId: { value: string | null } },
     onContainerId?: (containerId: string, containerName: string) => void | Promise<void>,
     invokeCallback?: (callback: () => void | Promise<void>) => void,
-): ReturnType<typeof setTimeout> {
-    return setTimeout(() => {
-        if (state.containerIdDetected) return;
+    expectedName?: string | null,
+    inspect: typeof execFileSync = execFileSync,
+): ReturnType<typeof setInterval> {
+    const timer = setInterval(() => {
+        if (state.containerIdDetected) { clearInterval(timer); return; }
         try {
-            const out = execFileSync('/usr/bin/docker', [
+            const out = inspect('/usr/bin/docker', [
                 'ps',
                 '--filter', `volume=${worktreePath}`,
+                ...(expectedName ? ['--filter', `name=${expectedName}`] : []),
                 '--format', '{{.ID}}:{{.Names}}',
-                '--latest',
-            ], { encoding: 'utf8', timeout: 5000 }).trim();
-            if (out) {
-                const [id, name] = out.split(':');
+            ], { encoding: 'utf8', timeout: CONTAINER_DETECTION_TIMEOUT_MS }).toString().trim();
+            const matches = out.split('\n').filter(Boolean).map(line => line.split(':'))
+                .filter(([, name]) => !expectedName || name === expectedName);
+            if (matches.length === 1) {
+                const [id, name] = matches[0];
                 state.containerIdDetected = true;
                 state.containerId.value = id;
+                clearInterval(timer);
                 if (onContainerId && invokeCallback) invokeCallback(() => onContainerId(id, name));
                 logger.debug({ containerId: id, containerName: name, worktreePath }, 'Detected Docker container ID');
             }
         } catch (err) { logger.debug({ error: (err as Error).message }, 'Failed to detect container ID'); }
-    }, 2000);
+    }, CONTAINER_DETECTION_INTERVAL_MS);
+    return timer;
 }
 
 // Re-export image builder functions for backward compatibility

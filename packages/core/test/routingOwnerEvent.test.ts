@@ -86,7 +86,9 @@ test('the separately approved manifest/retry extension forwards exact created co
  await assert.rejects(()=>forwardRoutingOwnerEvent(manifest,'issue_comment',deliveryId,installationId,{...options,planControlEnabled:false}),/OWNER_PLAN_CONTROL_RELAY_NOT_ENABLED/);
  const retry=fixture();retry.repository.full_name='GospeLib/main';retry.comment.body='/ezer retry EP-real-S01 2';
  assert.equal(await forwardRoutingOwnerEvent(retry,'issue_comment',deliveryId,installationId,options),true);
- (retry as any).issue={number:90,pull_request:{url:'pr'}};await assert.rejects(()=>forwardRoutingOwnerEvent(retry,'issue_comment',deliveryId,installationId,options),/OWNER_RETRY_ISSUE_REQUIRED/);assert.equal(sends,2);
+ const lane=fixture();lane.repository.full_name='GospeLib/main';lane.comment.body='/ezer retry EP-real-S02-T02 2';
+ assert.equal(await forwardRoutingOwnerEvent(lane,'issue_comment',deliveryId,installationId,options),true);assert.equal(sends,3);
+ (retry as any).issue={number:90,pull_request:{url:'pr'}};await assert.rejects(()=>forwardRoutingOwnerEvent(retry,'issue_comment',deliveryId,installationId,options),/OWNER_RETRY_ISSUE_REQUIRED/);assert.equal(sends,3);
 });
 
 test('pause/resume require their disabled-by-default flag and never fall through on malformed or PR commands',async()=>{

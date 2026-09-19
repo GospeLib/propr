@@ -11,7 +11,9 @@ const OWNER_RELAY_SECRET_MIN_LENGTH=32;
 const OWNER_COMMAND=/^\/ezer accept-review-stop (stop:[a-f0-9]+) ([a-f0-9]{40}) (sha256:[a-f0-9]{64}) ([0-9]+)$/;
 const STOP_REPOSITORY='GospeLib/main';
 const MANIFEST_COMMAND=/^\/ezer approve (sha256:[a-f0-9]{64}) ([a-f0-9]{40})$/;
-const RETRY_COMMAND=/^\/ezer retry (EP-[a-zA-Z0-9-]+-S[0-9]+) ([1-9][0-9]*)$/;
+/** An Ezer delivery unit: an approved story, or one of its repository lanes `<story>-T<nn>`. */
+const DELIVERY_UNIT_ID_SOURCE='EP-[a-zA-Z0-9-]+-S[0-9]+(?:-T[0-9]+)?';
+const RETRY_COMMAND=new RegExp(`^/ezer retry (${DELIVERY_UNIT_ID_SOURCE}) ([1-9][0-9]*)$`);
 const PAUSE_COMMAND=/^\/ezer pause ([a-zA-Z0-9:_-]+)$/;
 const RESUME_COMMAND=/^\/ezer resume ([a-zA-Z0-9:_-]+) ([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/;
 const ROUTE_COMMAND=/^\/ezer use ([^\s]+) ([a-zA-Z0-9:_-]+)$/;

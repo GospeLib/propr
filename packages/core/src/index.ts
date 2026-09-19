@@ -454,3 +454,5 @@ export type { StopAdmissionBinding } from './admission/ezerExecutionAdmission.js
 export { requireStoryExecutionContract, type StoryExecutionContract } from './admission/storyExecutionContract.js';
 export { requireAuthorizedPublicationMetadata, publicationMetadataDigest, type AuthorizedPublicationMetadata } from './admission/authorizedPublicationMetadata.js';
 export { verifyStoryPublication } from './git/storyPublication.js';
+export { preserveExecutionCheckpoint, restoreExecutionCheckpoint, executionCheckpointRef, EXECUTION_CHECKPOINT_REF_PREFIX, type ExecutionCheckpointRecord, type ExecutionFailureClassification, type RestoredExecutionCheckpoint } from './git/executionCheckpoint.js';
+export { type ExecutionRecoveryCheckpoint, type ExecutionRecoveryContext } from './admission/executionRecoveryContext.js';

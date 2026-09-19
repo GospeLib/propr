@@ -57,6 +57,26 @@ function extractExecutionError(
 }
 
 /**
+ * Counts completed model turns. The CLI result line reports `num_turns`; a run
+ * killed at its lease has no result line, so count distinct assistant messages
+ * (one streamed message can span several events sharing its id).
+ */
+export function countAgentTurns(
+    reportedTurns: number | undefined,
+    conversationLog: ReadonlyArray<{ type?: string; message?: { id?: string } }> | undefined
+): number {
+    if (Number.isSafeInteger(reportedTurns) && (reportedTurns as number) >= 0) return reportedTurns as number;
+    const messageIds = new Set<string>();
+    let anonymousMessages = 0;
+    for (const entry of conversationLog ?? []) {
+        if (entry?.type !== 'assistant') continue;
+        if (entry.message?.id) messageIds.add(entry.message.id);
+        else anonymousMessages += 1;
+    }
+    return messageIds.size + anonymousMessages;
+}
+
+/**
  * Result of processing a Docker execution result.
  */
 export interface ProcessedDockerResult {
@@ -137,7 +157,8 @@ export function processDockerResult(
         terminationReason,
         prompt,
         conversationLog: fullConversationLog,
-        tokenUsage: correctedTokenUsage
+        tokenUsage: correctedTokenUsage,
+        numTurns: countAgentTurns(claudeOutput.finalResult?.num_turns, claudeOutput.conversationLog)
     };
 
     return {

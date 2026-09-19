@@ -1,5 +1,6 @@
 import { SimpleGit } from 'simple-git';
 import { requireStoryExecutionContract, type StoryExecutionContract } from '../admission/storyExecutionContract.js';
+import { restoreExecutionCheckpoint } from './executionCheckpoint.js';
 import fs from 'fs-extra';
 import path from 'path';
 import { Octokit } from '@octokit/core';
@@ -224,6 +225,12 @@ export interface WorktreeResult {
 
 export type WorktreeInfo = WorktreeResult;
 
+/** A continuation attempt starts from its exact prior checkpoint's in-scope work, uncommitted on the admitted base. */
+async function restoreAdmittedCheckpoint(worktreePath: string, execution: StoryExecutionContract | undefined, issueId: number | string): Promise<void> {
+    const restored = execution && await restoreExecutionCheckpoint(worktreePath, execution);
+    if (restored) logger.info({ worktreePath, issueId, ...restored }, 'Restored execution checkpoint into admitted worktree');
+}
+
 export async function createWorktreeForIssue(localRepoPath: string, issueInfo: IssueInfo, options: CreateWorktreeOptions = {}): Promise<WorktreeResult> {
     const { issueId, issueTitle, owner, repoName } = issueInfo;
     const { baseBranch = null, octokit = null, modelName = null } = options;
@@ -304,6 +311,7 @@ export async function createWorktreeForIssue(localRepoPath: string, issueInfo: I
             branchName,
             { startPoint: execution?.baseSha ?? `origin/${resolvedBaseBranch}`, ...(execution ? { execution } : {}) },
         );
+        await restoreAdmittedCheckpoint(worktreePath, execution, issueId);
         await setupWorktreePermissions(worktreePath, branchName, issueId);
         await addToSafeDirectories(git, worktreePath, localRepoPath, { branchName, issueId });
 

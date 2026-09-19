@@ -77,6 +77,8 @@ export interface ClaudeCodeResponse {
     error?: string;
     terminationReason?: AgentTerminationReason;
     tokenUsage?: TokenUsage;
+    /** Model turns actually completed, including runs stopped at a turn limit or lease. */
+    numTurns?: number;
     usageMetrics?: UsageTrackingMetrics | null;
 }
 

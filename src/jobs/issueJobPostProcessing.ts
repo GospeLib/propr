@@ -1,7 +1,7 @@
 import type { Logger } from 'pino';
 import { setTimeout } from 'timers/promises';
 import type { ClaudeCodeResponse } from '@propr/core';
-import { verifyStoryPublication, type StoryExecutionContract } from '@propr/core';
+import { preserveExecutionCheckpoint, verifyStoryPublication, type ExecutionCheckpointRecord, type StoryExecutionContract } from '@propr/core';
 import type { WorktreeInfo, CommitResult, WorkerStateManager } from '@propr/core';
 import {
     cleanupWorktree, cleanupPreparedVisualPreviewEvidence, commitChanges,
@@ -24,6 +24,7 @@ import { requireStoryPublicationPolicy } from './storyPublicationPolicy.js';
 import { AI_COMMIT_AUTHOR } from './commitAuthor.js';
 import type { GitHubToken } from './githubTypes.js';
 import { publishSignedStoryCommit } from './signedStoryPublication.js';
+import { classifyExecutionFailure } from './executionOutcome.js';
 
 type RepoValidation = RepoValidationResult;
 type PRValidation = PRValidationResult;
@@ -187,19 +188,49 @@ async function handleMissingCommit(options: PostProcessOptions): Promise<PostPro
     });
 }
 
+/** Error carrying the checkpoint already preserved when later failure handling throws. */
+export type ErrorWithExecutionCheckpoint = Error & { executionCheckpoint?: ExecutionCheckpointRecord };
+
+async function handleStoppedAdmittedExecution(options: PostProcessOptions, execution: StoryExecutionContract): Promise<PostProcessingResult> {
+    const { octokit, issueRef, worktreeInfo, claudeResult, repoUrl, githubToken, AI_PROCESSING_TAG, correlatedLogger } = options;
+    const executionCheckpoint = await preserveExecutionCheckpoint({
+        worktreePath: worktreeInfo.worktreePath,
+        execution,
+        taskId: options.taskId ?? `${issueRef.repoOwner}-${issueRef.repoName}-${issueRef.number}-${options.jobId ?? 'job'}`,
+        failureClassification: classifyExecutionFailure(claudeResult),
+        author: AI_COMMIT_AUTHOR,
+        repoUrl,
+        authToken: githubToken.token,
+    });
+    const log = executionCheckpoint.status === 'failed' ? correlatedLogger.error.bind(correlatedLogger) : correlatedLogger.info.bind(correlatedLogger);
+    log({ issueNumber: issueRef.number, executionCheckpoint }, 'Admitted execution stopped before success; partial work checkpoint recorded');
+    try {
+        const result = await handleUnpublishableAgentFailure({
+            internalRecovery: true, octokit, issueRef, claudeResult, AI_PROCESSING_TAG, correlatedLogger,
+        });
+        return { ...result, executionCheckpoint };
+    } catch (error) {
+        (error as ErrorWithExecutionCheckpoint).executionCheckpoint = executionCheckpoint;
+        throw error;
+    }
+}
+
 export async function performPostProcessing(options: PostProcessOptions): Promise<PostProcessResult> {
     const { octokit, issueRef, worktreeInfo, currentIssueData, claudeResult, modelName, repoValidation, repoUrl, githubToken, PR_LABEL, AI_PROCESSING_TAG, AI_DONE_TAG, correlatedLogger, taskId, stateManager } = options;
     let commitResult: CommitResult | null = null;
     let postProcessingResult: PostProcessingResult | null = null;
     let preparedVisualPreview: Awaited<ReturnType<typeof prepareVisualPreviewEvidence>> | undefined;
+    // An admitted execution that stopped before success (turn limit, lease, or any failure)
+    // never publishes; its partial work is preserved on a checkpoint ref before cleanup.
+    if (options.execution !== undefined && !claudeResult.success)
+        return { commitResult, postProcessingResult: await handleStoppedAdmittedExecution(options, options.execution) };
     const storyChangedPaths = options.execution
         ? await verifyStoryPublication(worktreeInfo.worktreePath, options.execution)
         : [];
 
     try {
-        if (!hasPublishableAgentWork(claudeResult) || (options.execution !== undefined && !claudeResult.success)) {
+        if (!hasPublishableAgentWork(claudeResult)) {
             postProcessingResult = await handleUnpublishableAgentFailure({
-                internalRecovery: options.execution !== undefined,
                 octokit,
                 issueRef,
                 claudeResult,

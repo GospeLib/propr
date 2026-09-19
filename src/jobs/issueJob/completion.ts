@@ -15,6 +15,7 @@ import {
 import type { CommitResult, ClaudeCodeResponse } from '@propr/core';
 import type { PostProcessingResult } from '../issueJobHelpers.js';
 import type { TaskCompletionParams } from './types.js';
+import { buildAgentOutcome } from '../executionOutcome.js';
 
 export function getTaskCompletionStatus(claudeResult: ClaudeCodeResponse | null, postProcessingResult: PostProcessingResult | null): string {
   if (postProcessingResult?.pr && claudeResult && resolveAgentTerminationReason(claudeResult)) {
@@ -24,6 +25,15 @@ export function getTaskCompletionStatus(claudeResult: ClaudeCodeResponse | null,
     return 'claude_processing_failed';
   }
   return postProcessingResult?.pr ? 'complete_with_pr' : 'claude_success_no_changes';
+}
+
+/** Truthful outcome and any preserved partial-work checkpoint, recorded on the terminal task entry. */
+function buildTerminalEvidence(claudeResult: ClaudeCodeResponse | null, postProcessingResult: PostProcessingResult | null) {
+  const executionCheckpoint = postProcessingResult?.executionCheckpoint;
+  return {
+    ...(claudeResult ? { agentOutcome: buildAgentOutcome(claudeResult) } : {}),
+    ...(executionCheckpoint ? { executionCheckpoint } : {}),
+  };
 }
 
 type TerminalStateParams = Pick<
@@ -37,13 +47,15 @@ export async function markTaskTerminalState(params: TerminalStateParams): Promis
   const commitResultData = commitResult
     ? { commitHash: commitResult.commitHash, commitMessage: commitResult.commitMessage }
     : null;
+  const evidence = buildTerminalEvidence(claudeResult, postProcessingResult);
   const taskResult = {
     status,
     claudeSuccess: claudeResult?.success || false,
     prCreated: !!postProcessingResult?.pr,
     prNumber: postProcessingResult?.pr?.number ?? undefined,
     prUrl: postProcessingResult?.pr?.url ?? undefined,
-    commitResult: commitResultData
+    commitResult: commitResultData,
+    ...evidence
   };
 
   if (status === 'claude_processing_failed') {
@@ -57,7 +69,9 @@ export async function markTaskTerminalState(params: TerminalStateParams): Promis
           pr: (taskResult.prUrl && taskResult.prNumber)
             ? { number: taskResult.prNumber, url: taskResult.prUrl }
             : null,
-          commitResult: commitResultData
+          commitResult: commitResultData,
+          // Terminal evidence Ezer reads from the failed history entry.
+          ...evidence
         }
       }
     );

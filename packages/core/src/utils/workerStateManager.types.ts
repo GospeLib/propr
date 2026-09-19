@@ -38,6 +38,12 @@ export interface ClaudeResultSummary {
     sessionId?: string | null;
     executionTime?: number;
     conversationId?: string | null;
+    /** Truthful outcome evidence for an admitted execution; absent for callers that do not record it. */
+    terminationReason?: 'timeout' | 'max_turns';
+    numTurns?: number;
+    tokenUsage?: import('../agents/types.js').TokenUsage;
+    finalOutput?: string;
+    error?: string;
 }
 
 export interface WorktreeInfo {

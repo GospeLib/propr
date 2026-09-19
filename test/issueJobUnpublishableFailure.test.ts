@@ -9,6 +9,13 @@ const pushBranch = mock.fn(async () => undefined);
 const safeUpdateLabels = mock.fn(async () => ({ success: true, removed: ['AI-processing'], added: [], errors: [] }));
 const generateCompletionComment = mock.fn(async () => 'Generated failure details.');
 const createPullRequest = mock.fn(async () => ({ success: true, pr: null, updatedLabels: [] }));
+const checkpointRecord = (failureClassification: string) => ({
+    status: 'preserved', failureClassification, publication: 'none', baseSha: 'e'.repeat(40),
+    featureBranch: 'task/signed-timeout', ref: 'refs/propr/checkpoints/task/signed-timeout/task-44', sha: 'c'.repeat(40),
+    changedPaths: ['src/partial.ts'], outOfScopePaths: [],
+});
+const preserveExecutionCheckpoint = mock.fn(async (options: { failureClassification: string }) => checkpointRecord(options.failureClassification));
+const verifyStoryPublication = mock.fn(async () => []);
 const resolveAgentTerminationReason = mock.fn((result: { terminationReason?: 'timeout' | 'max_turns' }) => result.terminationReason);
 
 await mock.module('timers/promises', {
@@ -23,7 +30,8 @@ await mock.module('@propr/core', {
         loadRepositoryVisualPreviewSettings: mock.fn(async () => ({ enabled: false, types: ['image'] })),
         prepareVisualPreviewEvidence: mock.fn(async () => ({ evidence: { assets: [], toolSuggestions: [] } })),
         pushBranch,
-        verifyStoryPublication: mock.fn(async () => []),
+        verifyStoryPublication,
+        preserveExecutionCheckpoint,
         AI_COMMIT_AUTHOR: { name: 'ProPR AI', email: 'ai@propr.dev' },
         TaskStates: { CANCELLED: 'cancelled' },
         describeAgentTermination: mock.fn(() => 'Agent stopped.'),
@@ -214,8 +222,14 @@ test('an interrupted execution without a commit remains retryable and never crea
     assert.doesNotMatch(request.mock.calls[0].arguments[1].body as string, /AI-done/);
 });
 
-test('a timed-out signed story execution never commits or publishes partial work', async () => {
+for (const [terminationReason, error] of [
+    ['timeout', 'Agent execution timed out after the signed deadline'],
+    ['max_turns', 'The agent reached the maximum turn limit'],
+    [undefined, 'Agent process exited with code 1'],
+] as const) test(`a signed story stopped by ${terminationReason ?? 'an agent error'} checkpoints partial work and never publishes it`, async () => {
     commitChanges.mock.resetCalls();
+    preserveExecutionCheckpoint.mock.resetCalls();
+    verifyStoryPublication.mock.resetCalls();
     commitChanges.mock.mockImplementation(async () => ({
         commitHash: 'd'.repeat(40),
         commitMessage: 'raw model prose',
@@ -251,9 +265,10 @@ test('a timed-out signed story execution never commits or publishes partial work
         currentIssueData: { data: { title: 'Partial timeout', labels: [{ name: 'AI' }] } },
         claudeResult: {
             ...failedAgentResult(),
-            terminationReason: 'timeout',
-            error: 'Agent execution timed out after the signed deadline',
+            ...(terminationReason ? { terminationReason } : {}),
+            error,
         },
+        taskId: 'task-44',
         modelName: 'codex-test',
         repoValidation: { isValid: true, repoData: { defaultBranch: 'stage' } },
         repoUrl: 'https://github.com/owner/repo.git',
@@ -270,6 +285,34 @@ test('a timed-out signed story execution never commits or publishes partial work
     assert.equal(createPullRequest.mock.calls.length, 0);
     assert.equal(result.commitResult, null);
     assert.equal(result.postProcessingResult?.success, false);
+    assert.equal(verifyStoryPublication.mock.calls.length, 0);
+    assert.equal(preserveExecutionCheckpoint.mock.calls.length, 1);
+    const checkpointOptions = preserveExecutionCheckpoint.mock.calls[0].arguments[0] as Record<string, unknown>;
+    assert.equal(checkpointOptions.taskId, 'task-44');
+    assert.equal(checkpointOptions.worktreePath, '/tmp/worktree');
+    assert.equal(checkpointOptions.failureClassification, terminationReason ?? 'agent_error');
+    assert.deepEqual(result.postProcessingResult?.executionCheckpoint, checkpointRecord(terminationReason ?? 'agent_error'));
+});
+
+test('a checkpoint preserved before a later failure-handling error still reaches the task record', async () => {
+    preserveExecutionCheckpoint.mock.resetCalls();
+    safeUpdateLabels.mock.mockImplementation(async () => ({ success: false, removed: [], added: [], errors: ['label API down'] }));
+    await assert.rejects(performPostProcessing({
+        execution: { baseSha: 'e'.repeat(40), featureBranch: 'task/signed-timeout', targetBranch: 'stage', allowedPaths: ['src/partial.ts'] },
+        octokit: { request: mock.fn(async () => ({ data: {} })) },
+        issueRef: { repoOwner: 'owner', repoName: 'repo', number: 44 },
+        worktreeInfo: { worktreePath: '/tmp/worktree', branchName: 'task/signed-timeout' },
+        currentIssueData: { data: { title: 'Partial timeout', labels: [{ name: 'AI' }] } },
+        claudeResult: { ...failedAgentResult(), terminationReason: 'timeout', error: 'timed out' },
+        modelName: 'codex-test', repoValidation: { isValid: true, repoData: { defaultBranch: 'stage' } },
+        repoUrl: 'https://github.com/owner/repo.git', githubToken: { token: 'github-token' }, PR_LABEL: 'propr',
+        AI_PROCESSING_TAG: 'AI-processing', AI_DONE_TAG: 'AI-done', jobId: 'job-44', correlatedLogger: logger, taskId: 'task-44',
+    } as never), (error: Error & { executionCheckpoint?: unknown }) => {
+        assert.match(error.message, /processing label/);
+        assert.deepEqual(error.executionCheckpoint, checkpointRecord('timeout'));
+        return true;
+    });
+    safeUpdateLabels.mock.mockImplementation(async () => ({ success: true, removed: ['AI-processing'], added: [], errors: [] }));
 });
 
 test('a successful signed story publishes deterministic gate-ready metadata instead of model prose', async () => {

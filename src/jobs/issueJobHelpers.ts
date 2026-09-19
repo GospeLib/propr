@@ -48,6 +48,8 @@ export interface PostProcessingResult {
     } | null;
     updatedLabels: string[];
     error?: string;
+    /** Admitted execution stopped before success: its partial work, never a publication. */
+    executionCheckpoint?: import('@propr/core').ExecutionCheckpointRecord;
 }
 
 type Octokit = {

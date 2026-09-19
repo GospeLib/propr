@@ -79,4 +79,48 @@ describe('issue job terminal state', () => {
     assert.equal(result.status, 'partial_with_pr');
     assert.equal(result.prNumber, 42);
   });
+
+  test('records a stopped admitted execution checkpoint and truthful outcome on the failed history entry', async () => {
+    const stateManager = createStateManager();
+    const executionCheckpoint = {
+      status: 'preserved' as const, failureClassification: 'max_turns' as const, publication: 'none' as const,
+      baseSha: 'e'.repeat(40), featureBranch: 'task/story', ref: 'refs/propr/checkpoints/task/story/task-9',
+      sha: 'c'.repeat(40), changedPaths: ['src/a.ts'], outOfScopePaths: [],
+    };
+
+    await markTaskTerminalState({
+      stateManager: stateManager as unknown as StateManager,
+      taskId: 'task-9',
+      claudeResult: {
+        success: false,
+        error: 'The agent reached the maximum turn limit',
+        terminationReason: 'max_turns',
+        executionTime: 1_860_000,
+        output: null,
+        logs: '',
+        modifiedFiles: [],
+        commitMessage: null,
+        summary: 'Implemented the parser; tests for the edge cases remain.',
+        numTurns: 250,
+        tokenUsage: { input_tokens: 1200, output_tokens: 3400, cache_read_input_tokens: 5_000_000 },
+      },
+      postProcessingResult: { success: false, pr: null, updatedLabels: [], error: 'stopped', executionCheckpoint },
+      commitResult: null,
+    });
+
+    assert.equal(stateManager.markTaskCompleted.mock.callCount(), 0);
+    const [, , metadata] = stateManager.markTaskFailed.mock.calls[0].arguments;
+    const expectedOutcome = {
+      success: false, terminationReason: 'max_turns', failureClassification: 'max_turns', numTurns: 250,
+      tokenUsage: { input_tokens: 1200, output_tokens: 3400, cache_read_input_tokens: 5_000_000 },
+      executionTimeMs: 1_860_000,
+      finalOutput: 'Implemented the parser; tests for the edge cases remain.',
+      error: 'The agent reached the maximum turn limit',
+    };
+    assert.deepEqual(metadata.historyMetadata.executionCheckpoint, executionCheckpoint);
+    assert.deepEqual(metadata.historyMetadata.agentOutcome, expectedOutcome);
+    assert.equal(metadata.historyMetadata.pr, null);
+    assert.deepEqual(metadata.prResult.executionCheckpoint, executionCheckpoint);
+    assert.equal(metadata.prResult.prCreated, false);
+  });
 });

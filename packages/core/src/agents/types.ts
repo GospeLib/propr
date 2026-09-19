@@ -182,6 +182,8 @@ export interface AgentExecutionResult {
 
     // Token usage metrics
     tokenUsage?: TokenUsage;
+    /** Model turns actually completed, including runs stopped at a turn limit or lease. */
+    numTurns?: number;
 
     // Agent Tank subscription usage metrics (for tracking session/weekly usage)
     usageMetrics?: UsageTrackingMetrics;

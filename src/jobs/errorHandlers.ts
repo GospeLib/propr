@@ -304,7 +304,10 @@ export async function handleGenericError(
             await stateManager.markTaskCancelled(taskId, 'user', { historyMetadata: { originalError: error.message } });
             correlatedLogger.info({ taskId }, 'Task marked as cancelled due to user abort');
         } else {
-            await stateManager.markTaskFailed(taskId, error, { errorCategory });
+            // A stopped admitted execution may already have preserved partial work before this failure.
+            const executionCheckpoint = (error as Error & { executionCheckpoint?: unknown }).executionCheckpoint;
+            await stateManager.markTaskFailed(taskId, error, { errorCategory,
+                ...(executionCheckpoint ? { historyMetadata: { executionCheckpoint } } : {}) });
         }
     } catch (stateError) {
         correlatedLogger.warn({ error: (stateError as Error).message }, 'Failed to update task state');

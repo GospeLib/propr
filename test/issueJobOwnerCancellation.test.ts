@@ -16,7 +16,7 @@ const stateManager={createTaskState,getTaskCancellation,getTaskState:async()=>({
 const context={taskId:'same-stopped-task',agentAlias:'default',modelName:'claude-test',stateManager,correlatedLogger:log,correlationId:'correlation',issueRef:{repoOwner:'owner',repoName:'repo',number:1},typedInvestigation:{provider:'claude',deadline:new Date(Date.now()+60_000).toISOString(),outputPath:'report.md'},ezerAdmissionVerified:true};
 await mock.module('@propr/core',{namedExports:{ ...publicationPolicy,
  loadRepositoryVisualPreviewSettings:async()=>({enabled:true,types:['image']}),
- logger:log,TaskStates:states,AgentRegistry:{getInstance:()=>({getAgentByAlias:()=>agent})},generateClaudePrompt,updateFileChangesFromWorktree:noOp,recordLLMMetrics:noOp,resolveAgentTerminationReason:noOp,
+ logger:log,TaskStates:states,AgentRegistry:{getInstance:()=>({getAgentByAlias:()=>agent})},generateClaudePrompt,updateFileChangesFromWorktree:noOp,recordLLMMetrics:noOp,resolveAgentTerminationReason:noOp,createLogFiles:noOp,redactSecrets:(value:string)=>value,
  ensureRepoCloned:noOp,getRepoUrl:noOp,safeAddLabel:noOp,safeRemoveLabel:noOp,ensureGitRepository:noOp,UsageLimitError:class extends Error{},validateRepositoryInfo:noOp,addModelSpecificDelay:noOp,withRetry:noOp,retryConfigs:{},updatePlanIssueTaskId:noOp,
 }});
 await mock.module('../src/jobs/issueJobHelpers.js',{namedExports:{localizeContentImages:async(x:string)=>x,handleUsageLimitError:noOp,handleGenericError:noOp,updateTaskTitleInStorage:noOp,buildFinalResult:noOp}});

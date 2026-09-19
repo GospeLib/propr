@@ -16,6 +16,16 @@ const checkpointRecord = (failureClassification: string) => ({
 });
 const preserveExecutionCheckpoint = mock.fn(async (options: { failureClassification: string }) => checkpointRecord(options.failureClassification));
 const verifyStoryPublication = mock.fn(async () => []);
+/** Task state for a stopped admitted execution; records what had already happened when the terminal entry was written. */
+function stoppedStateManager(failWrite?: Error) {
+    const observedAtWrite: Array<{ checkpointsPushed: number; labelUpdates: number }> = [];
+    const markTaskFailed = mock.fn(async (_taskId: string, _error: Error, _metadata: Record<string, any>) => {
+        observedAtWrite.push({ checkpointsPushed: preserveExecutionCheckpoint.mock.callCount(), labelUpdates: safeUpdateLabels.mock.callCount() });
+        if (failWrite) throw failWrite;
+        return {};
+    });
+    return { markTaskFailed, markTaskCompleted: mock.fn(async () => ({})), getTaskState: mock.fn(async () => ({ state: 'claude_execution' })), observedAtWrite };
+}
 const resolveAgentTerminationReason = mock.fn((result: { terminationReason?: 'timeout' | 'max_turns' }) => result.terminationReason);
 
 await mock.module('timers/promises', {
@@ -34,6 +44,7 @@ await mock.module('@propr/core', {
         preserveExecutionCheckpoint,
         AI_COMMIT_AUTHOR: { name: 'ProPR AI', email: 'ai@propr.dev' },
         TaskStates: { CANCELLED: 'cancelled' },
+        ErrorCategories: { CLAUDE_EXECUTION: 'claude_execution' },
         describeAgentTermination: mock.fn(() => 'Agent stopped.'),
         resolveAgentTerminationReason,
         getAuthenticatedOctokit: mock.fn(),
@@ -241,6 +252,7 @@ for (const [terminationReason, error] of [
     generateCompletionComment.mock.resetCalls();
     createPullRequest.mock.resetCalls();
     const request = mock.fn(async () => ({ data: {} }));
+    const stateManager = stoppedStateManager();
 
     const result = await performPostProcessing({
         execution: {
@@ -269,6 +281,7 @@ for (const [terminationReason, error] of [
             error,
         },
         taskId: 'task-44',
+        stateManager,
         modelName: 'codex-test',
         repoValidation: { isValid: true, repoData: { defaultBranch: 'stage' } },
         repoUrl: 'https://github.com/owner/repo.git',
@@ -292,12 +305,72 @@ for (const [terminationReason, error] of [
     assert.equal(checkpointOptions.worktreePath, '/tmp/worktree');
     assert.equal(checkpointOptions.failureClassification, terminationReason ?? 'agent_error');
     assert.deepEqual(result.postProcessingResult?.executionCheckpoint, checkpointRecord(terminationReason ?? 'agent_error'));
+    // The failed terminal record naming the checkpoint is durable before any later step (labels, cleanup) runs.
+    assert.equal(result.postProcessingResult?.terminalStateRecorded, true);
+    assert.equal(stateManager.markTaskFailed.mock.callCount(), 1);
+    assert.deepEqual(stateManager.observedAtWrite, [{ checkpointsPushed: 1, labelUpdates: 0 }]);
+    const [taskId, , metadata] = stateManager.markTaskFailed.mock.calls[0].arguments;
+    assert.equal(taskId, 'task-44');
+    assert.equal(metadata.requireDurableHistory, true);
+    assert.deepEqual(metadata.historyMetadata.executionCheckpoint, checkpointRecord(terminationReason ?? 'agent_error'));
+    assert.equal(metadata.historyMetadata.agentOutcome.failureClassification, terminationReason ?? 'agent_error');
+    assert.deepEqual(metadata.prResult.executionCheckpoint, checkpointRecord(terminationReason ?? 'agent_error'));
+    assert.equal(stateManager.markTaskCompleted.mock.callCount(), 0);
+});
+
+function stoppedExecutionOptions(overrides: Record<string, unknown>) {
+    return {
+        execution: { baseSha: 'e'.repeat(40), featureBranch: 'task/signed-timeout', targetBranch: 'stage', allowedPaths: ['src/partial.ts'] },
+        octokit: { request: mock.fn(async () => ({ data: {} })) },
+        issueRef: { repoOwner: 'owner', repoName: 'repo', number: 44 },
+        worktreeInfo: { worktreePath: '/tmp/worktree', branchName: 'task/signed-timeout' },
+        currentIssueData: { data: { title: 'Partial timeout', labels: [{ name: 'AI' }] } },
+        claudeResult: { ...failedAgentResult(), terminationReason: 'timeout', error: 'timed out' },
+        modelName: 'codex-test', repoValidation: { isValid: true, repoData: { defaultBranch: 'stage' } },
+        repoUrl: 'https://github.com/owner/repo.git', githubToken: { token: 'github-token' }, PR_LABEL: 'propr',
+        AI_PROCESSING_TAG: 'AI-processing', AI_DONE_TAG: 'AI-done', jobId: 'job-44', correlatedLogger: logger, taskId: 'task-44',
+        ...overrides,
+    } as never;
+}
+
+test('failure injected after the checkpoint push still leaves a durable terminal record naming it', async () => {
+    preserveExecutionCheckpoint.mock.resetCalls();
+    safeUpdateLabels.mock.resetCalls();
+    // Crash at the boundary between checkpoint preservation and cleanup: the label step dies.
+    safeUpdateLabels.mock.mockImplementation(async () => { throw new Error('worker crashed before cleanup'); });
+    const stateManager = stoppedStateManager();
+    await assert.rejects(performPostProcessing(stoppedExecutionOptions({ stateManager })), /worker crashed before cleanup/);
+    assert.equal(stateManager.markTaskFailed.mock.callCount(), 1);
+    assert.deepEqual(stateManager.observedAtWrite, [{ checkpointsPushed: 1, labelUpdates: 0 }]);
+    const [, , metadata] = stateManager.markTaskFailed.mock.calls[0].arguments;
+    assert.equal(metadata.requireDurableHistory, true);
+    assert.deepEqual(metadata.historyMetadata.executionCheckpoint, checkpointRecord('timeout'));
+    safeUpdateLabels.mock.mockImplementation(async () => ({ success: true, removed: ['AI-processing'], added: [], errors: [] }));
+});
+
+test('a terminal record that cannot be made durable fails loudly and still carries the checkpoint', async () => {
+    preserveExecutionCheckpoint.mock.resetCalls();
+    safeUpdateLabels.mock.resetCalls();
+    const stateManager = stoppedStateManager(new Error('Durable database history entry required'));
+    await assert.rejects(performPostProcessing(stoppedExecutionOptions({ stateManager })), (error: Error & { executionCheckpoint?: unknown }) => {
+        assert.match(error.message, /Durable database history entry required/);
+        assert.deepEqual(error.executionCheckpoint, checkpointRecord('timeout'));
+        return true;
+    });
+    assert.equal(safeUpdateLabels.mock.callCount(), 0);
+});
+
+test('an admitted execution without a task record never pushes an unrecorded checkpoint', async () => {
+    preserveExecutionCheckpoint.mock.resetCalls();
+    await assert.rejects(performPostProcessing(stoppedExecutionOptions({ stateManager: undefined })), /STORY_EXECUTION_TERMINAL_STATE_UNAVAILABLE/);
+    assert.equal(preserveExecutionCheckpoint.mock.callCount(), 0);
 });
 
 test('a checkpoint preserved before a later failure-handling error still reaches the task record', async () => {
     preserveExecutionCheckpoint.mock.resetCalls();
     safeUpdateLabels.mock.mockImplementation(async () => ({ success: false, removed: [], added: [], errors: ['label API down'] }));
-    await assert.rejects(performPostProcessing({
+    const stateManager = stoppedStateManager();
+    await assert.rejects(performPostProcessing({ stateManager,
         execution: { baseSha: 'e'.repeat(40), featureBranch: 'task/signed-timeout', targetBranch: 'stage', allowedPaths: ['src/partial.ts'] },
         octokit: { request: mock.fn(async () => ({ data: {} })) },
         issueRef: { repoOwner: 'owner', repoName: 'repo', number: 44 },
@@ -312,6 +385,7 @@ test('a checkpoint preserved before a later failure-handling error still reaches
         assert.deepEqual(error.executionCheckpoint, checkpointRecord('timeout'));
         return true;
     });
+    assert.equal(stateManager.markTaskFailed.mock.callCount(), 1);
     safeUpdateLabels.mock.mockImplementation(async () => ({ success: true, removed: ['AI-processing'], added: [], errors: [] }));
 });
 

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, describe, mock, test } from 'node:test';
 import { closeConnection } from '@propr/core';
-import { markTaskTerminalState } from '../src/jobs/issueJob/completion.js';
+import { markTaskComplete, markTaskTerminalState } from '../src/jobs/issueJob/completion.js';
 import type { TaskCompletionParams } from '../src/jobs/issueJob/types.js';
 
 type StateManager = TaskCompletionParams['stateManager'];
@@ -122,5 +122,25 @@ describe('issue job terminal state', () => {
     assert.equal(metadata.historyMetadata.pr, null);
     assert.deepEqual(metadata.prResult.executionCheckpoint, executionCheckpoint);
     assert.equal(metadata.prResult.prCreated, false);
+  });
+
+  test('never writes a second terminal entry over one already made durable by post-processing', async () => {
+    const stateManager = createStateManager();
+    const warn = mock.fn();
+    await markTaskComplete({
+      stateManager: stateManager as unknown as StateManager,
+      taskId: 'task-durable',
+      issueRef: { repoOwner: 'owner', repoName: 'repo', number: 9 } as TaskCompletionParams['issueRef'],
+      currentIssueLabels: [],
+      claudeResult: {
+        success: false, error: 'timed out', terminationReason: 'timeout', executionTime: 1, output: null, logs: '',
+        modifiedFiles: [], commitMessage: null, summary: null,
+      },
+      postProcessingResult: { success: false, pr: null, updatedLabels: [], terminalStateRecorded: true },
+      commitResult: null,
+      correlatedLogger: { warn, debug: mock.fn(), info: mock.fn(), error: mock.fn() } as unknown as TaskCompletionParams['correlatedLogger'],
+    });
+    assert.equal(stateManager.markTaskFailed.mock.callCount(), 0);
+    assert.equal(stateManager.markTaskCompleted.mock.callCount(), 0);
   });
 });

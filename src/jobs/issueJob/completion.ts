@@ -8,78 +8,14 @@ import {
   findPlanIssueByRepoAndNumber,
   PlanIssueStatus,
   triggerNextPendingIssue,
-  updatePlanIssueStatus,
-  resolveAgentTerminationReason,
-  ErrorCategories
+  updatePlanIssueStatus
 } from '@propr/core';
-import type { CommitResult, ClaudeCodeResponse } from '@propr/core';
+import type { CommitResult } from '@propr/core';
 import type { PostProcessingResult } from '../issueJobHelpers.js';
 import type { TaskCompletionParams } from './types.js';
-import { buildAgentOutcome } from '../executionOutcome.js';
+import { markTaskTerminalState } from '../terminalTaskState.js';
 
-export function getTaskCompletionStatus(claudeResult: ClaudeCodeResponse | null, postProcessingResult: PostProcessingResult | null): string {
-  if (postProcessingResult?.pr && claudeResult && resolveAgentTerminationReason(claudeResult)) {
-    return 'partial_with_pr';
-  }
-  if (!claudeResult?.success) {
-    return 'claude_processing_failed';
-  }
-  return postProcessingResult?.pr ? 'complete_with_pr' : 'claude_success_no_changes';
-}
-
-/** Truthful outcome and any preserved partial-work checkpoint, recorded on the terminal task entry. */
-function buildTerminalEvidence(claudeResult: ClaudeCodeResponse | null, postProcessingResult: PostProcessingResult | null) {
-  const executionCheckpoint = postProcessingResult?.executionCheckpoint;
-  return {
-    ...(claudeResult ? { agentOutcome: buildAgentOutcome(claudeResult) } : {}),
-    ...(executionCheckpoint ? { executionCheckpoint } : {}),
-  };
-}
-
-type TerminalStateParams = Pick<
-  TaskCompletionParams,
-  'stateManager' | 'taskId' | 'claudeResult' | 'postProcessingResult' | 'commitResult'
->;
-
-export async function markTaskTerminalState(params: TerminalStateParams): Promise<void> {
-  const { stateManager, taskId, claudeResult, postProcessingResult, commitResult } = params;
-  const status = getTaskCompletionStatus(claudeResult, postProcessingResult);
-  const commitResultData = commitResult
-    ? { commitHash: commitResult.commitHash, commitMessage: commitResult.commitMessage }
-    : null;
-  const evidence = buildTerminalEvidence(claudeResult, postProcessingResult);
-  const taskResult = {
-    status,
-    claudeSuccess: claudeResult?.success || false,
-    prCreated: !!postProcessingResult?.pr,
-    prNumber: postProcessingResult?.pr?.number ?? undefined,
-    prUrl: postProcessingResult?.pr?.url ?? undefined,
-    commitResult: commitResultData,
-    ...evidence
-  };
-
-  if (status === 'claude_processing_failed') {
-    await stateManager.markTaskFailed(
-      taskId,
-      new Error(claudeResult?.error || 'Agent processing failed'),
-      {
-        errorCategory: ErrorCategories.CLAUDE_EXECUTION,
-        prResult: taskResult,
-        historyMetadata: {
-          pr: (taskResult.prUrl && taskResult.prNumber)
-            ? { number: taskResult.prNumber, url: taskResult.prUrl }
-            : null,
-          commitResult: commitResultData,
-          // Terminal evidence Ezer reads from the failed history entry.
-          ...evidence
-        }
-      }
-    );
-    return;
-  }
-
-  await stateManager.markTaskCompleted(taskId, taskResult);
-}
+export { getTaskCompletionStatus, markTaskTerminalState } from '../terminalTaskState.js';
 
 function buildTaskUpdateFields(
   commitResult: CommitResult | null,
@@ -138,7 +74,8 @@ async function closeFailedPlanIssueAndContinue(taskCompletionParams: TaskComplet
 export async function markTaskComplete(taskCompletionParams: TaskCompletionParams): Promise<void> {
   const { taskId, postProcessingResult, commitResult, correlatedLogger } = taskCompletionParams;
   try {
-    await markTaskTerminalState(taskCompletionParams);
+    // A stopped admitted execution already wrote its durable terminal record before cleanup.
+    if (!postProcessingResult?.terminalStateRecorded) await markTaskTerminalState(taskCompletionParams);
 
     const updateFields = buildTaskUpdateFields(commitResult, postProcessingResult);
     await persistTaskUpdateFields(taskId, updateFields, correlatedLogger);

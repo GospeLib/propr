@@ -16,6 +16,7 @@ import { persistLlmLog, createLlmLogFromAnalysis, buildTaskWorkRef, buildAnalysi
 import { buildAnalysisSafetySuffix, resolveAgentRuntimeOwner, executeWithUsageTracking } from './utils/index.js';
 import type { ExecutionType } from '../../utils/llmMetrics.types.js';
 import { resolveAgentTerminationReason } from '../termination.js';
+import { countAgentTurns } from '../turnCount.js';
 import { buildCodexDockerArgs, type CodexDockerArgsParams } from './utils/codexDockerArgsBuilder.js';
 
 // Re-export UsageLimitError for convenience
@@ -134,6 +135,7 @@ export class CodexAgent implements Agent {
             error: parsedOutput.error || (result.exitCode === 0 ? undefined : result.stderr?.trim() || undefined),
             terminationReason,
             tokenUsage: parsedOutput.tokenUsage,
+            numTurns: countAgentTurns('codex', { events: parsedOutput.conversationLog }),
             usageMetrics: usageMetrics ?? undefined
         };
     }

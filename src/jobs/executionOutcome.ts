@@ -14,7 +14,8 @@ export interface AgentOutcome {
     success: boolean;
     terminationReason?: 'timeout' | 'max_turns';
     failureClassification?: ExecutionFailureClassification;
-    numTurns: number;
+    /** Model turns in the provider's own unit; absent when the provider gave no evidence. Never a guessed 0. */
+    numTurns?: number;
     tokenUsage?: ClaudeCodeResponse['tokenUsage'];
     costUsd?: number;
     executionTimeMs: number;
@@ -39,11 +40,12 @@ export function buildAgentOutcome(claudeResult: ClaudeCodeResponse): AgentOutcom
     const costUsd = claudeResult.finalResult?.total_cost_usd ?? claudeResult.finalResult?.cost_usd;
     const finalOutput = finalAssistantOutput(claudeResult);
     const error = claudeResult.success ? undefined : claudeResult.error?.trim();
+    const numTurns = claudeResult.numTurns ?? claudeResult.finalResult?.num_turns ?? undefined;
     return {
         success: claudeResult.success,
         ...(terminationReason ? { terminationReason } : {}),
         ...(claudeResult.success ? {} : { failureClassification: classifyExecutionFailure(claudeResult) }),
-        numTurns: claudeResult.numTurns ?? claudeResult.finalResult?.num_turns ?? 0,
+        ...(typeof numTurns === 'number' ? { numTurns } : {}),
         ...(claudeResult.tokenUsage ? { tokenUsage: claudeResult.tokenUsage } : {}),
         ...(typeof costUsd === 'number' ? { costUsd } : {}),
         executionTimeMs: claudeResult.executionTime,

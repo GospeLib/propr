@@ -203,7 +203,8 @@ export interface AiMetrics {
     timestamp: number;
     cost: number;
     model: string;
-    turns: number;
+    /** Absent when no provider evidence exists for the turn count. Never a guessed 0. */
+    turns?: number;
     executionTimeMs: number;
     issueNumber?: number;
     repo: string | null;

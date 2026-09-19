@@ -13,6 +13,7 @@ import type { ExecutionType } from '../../utils/llmMetrics.types.js';
 import { DEFAULT_AGENT_EXECUTION_TIMEOUT_MS } from '../constants.js';
 import { NoDefaultModelConfiguredError } from '../../config/modelAliases.js';
 import { resolveAgentTerminationReason } from '../termination.js';
+import { countAgentTurns } from '../turnCount.js';
 import {
     buildVibeRepositoryScoutConfig,
     REPOSITORY_SCOUT_CONTAINER_ROOT,
@@ -114,6 +115,8 @@ export class VibeAgent implements Agent {
             const executionTimeMs = Date.now() - startTime;
             const parsedOutput = parseVibeOutput(result.stdout);
             const conversationLog = parseVibeConversationLog(result.stdout);
+            // A run killed at its lease emits no final JSON; its session log still holds the turns taken.
+            const turnEvents = conversationLog.length > 0 ? conversationLog : parseVibeConversationLog(readLatestVibeSessionMessages(runtimeHomePath));
             const tokenUsage = parsedOutput.tokenUsage || readLatestVibeSessionTokenUsage(runtimeHomePath);
             const modelUsed = parsedOutput.model || effectiveModel || 'unknown';
             const terminationReason = resolveAgentTerminationReason({ timedOut: result.timedOut, error: parsedOutput.error || result.stderr });
@@ -137,6 +140,7 @@ export class VibeAgent implements Agent {
                 error,
                 terminationReason,
                 tokenUsage,
+                numTurns: countAgentTurns('vibe', { events: turnEvents }),
                 usageMetrics: usageMetrics ?? undefined
             };
 

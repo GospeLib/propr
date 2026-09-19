@@ -29,10 +29,10 @@ function extractModel(result: JobResult | undefined, job: Job<JobData>): string 
     return result?.claudeResult?.model || data?.modelName || 'unknown';
 }
 
-function extractTurns(result: JobResult | undefined): number {
+function extractTurns(result: JobResult | undefined): number | undefined {
     const claudeResult = result?.claudeResult;
-    if (!claudeResult) return 0;
-    return claudeResult.claudeNumTurns || claudeResult.finalResult?.num_turns || 0;
+    if (!claudeResult) return undefined;
+    return claudeResult.claudeNumTurns ?? claudeResult.finalResult?.num_turns ?? undefined;
 }
 
 export function buildAiMetrics(
@@ -99,7 +99,8 @@ export async function updateFailedMetrics(
             timestamp: job.timestamp,
             cost: 0,
             model: data?.modelName || 'unknown',
-            turns: 0,
+            // No provider evidence is available for a bare job failure: omit rather than
+            // fabricate a 0. Only a proven zero-turn run may ever report 0.
             executionTimeMs: (job.finishedOn || Date.now()) - (job.timestamp || Date.now()),
             issueNumber: data?.number,
             repo: repoFullName,

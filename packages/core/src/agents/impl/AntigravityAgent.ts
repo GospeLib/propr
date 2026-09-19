@@ -29,6 +29,7 @@ import fs from 'fs';
 import path from 'path';
 import { randomBytes } from 'node:crypto';
 import { resolveAgentTerminationReason } from '../termination.js';
+import { countAgentTurns } from '../turnCount.js';
 import { createContainerExecutionId } from './utils/containerExecutionId.js';
 import {
     buildAntigravityRepositoryScoutMcpConfig,
@@ -187,6 +188,7 @@ export class AntigravityAgent implements Agent {
             exitCode: result.exitCode, rawOutput: result.stdout, modelUsed: resolvedModel, modifiedFiles: [],
             commitMessage: null, summary: response.summary ?? undefined, prompt, sessionId: response.sessionId, conversationId: response.conversationId, conversationLog: response.conversationLog,
             tokenUsage: finalTokenUsage, usageMetrics: usageMetrics ?? undefined,
+            numTurns: countAgentTurns('antigravity', { events: response.rawConversationLog }),
             error: success ? undefined : result.stderr || executionError || 'Antigravity execution failed',
             terminationReason
         };

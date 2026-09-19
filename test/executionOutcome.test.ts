@@ -65,7 +65,8 @@ test('final output is redacted and bounded to the recovery checkpointText limit,
     assert.equal(outcome.finalOutput?.length, MAX_FINAL_OUTPUT_CHARACTERS);
     assert.ok(outcome.finalOutput?.endsWith('END'));
     assert.equal(outcome.failureClassification, 'agent_error');
-    assert.equal(outcome.numTurns, 0);
+    // No turn evidence: the count is unknown and absent, never a false 0.
+    assert.equal(Object.hasOwn(outcome, 'numTurns'), false);
 });
 
 test('the claude_execution state records outcome evidence only for admitted executions', () => {

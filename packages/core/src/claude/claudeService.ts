@@ -4,6 +4,7 @@ import logger from '../utils/logger.js';
 import { getDefaultModel, resolveModelAlias } from '../config/modelAliases.js';
 import { AgentRegistry } from '../agents/AgentRegistry.js';
 import type { AgentTerminationReason, AnalysisResult } from '../agents/types.js';
+import { countAgentTurns } from '../agents/turnCount.js';
 import { generateTaskImportPrompt, IssueRef, IssueDetails } from './prompts/promptGenerator.js';
 import { executeDockerCommand, buildClaudeDockerImage as buildDockerImageInternal } from './docker/dockerExecutor.js';
 import {
@@ -259,7 +260,7 @@ function parseAgentModelFormat(model: string, correlatedLogger: ReturnType<typeo
     return { effectiveModel: model };
 }
 
-function buildLlmMetricsPayload(claudeResult: ClaudeCodeResponse, fallbackModel: string) {
+export function buildLlmMetricsPayload(claudeResult: ClaudeCodeResponse, fallbackModel: string) {
     return {
         model: claudeResult.model ?? fallbackModel,
         success: claudeResult.success,
@@ -269,7 +270,7 @@ function buildLlmMetricsPayload(claudeResult: ClaudeCodeResponse, fallbackModel:
         conversationLog: claudeResult.conversationLog as unknown as ConversationStep[],
         tokenUsage: claudeResult.tokenUsage,
         finalResult: claudeResult.finalResult ? {
-            num_turns: claudeResult.conversationLog?.length ?? 0,
+            num_turns: countAgentTurns('claude', { events: claudeResult.conversationLog as unknown as ReadonlyArray<unknown> | undefined }),
             cost_usd: undefined
         } : null,
         error: claudeResult.error

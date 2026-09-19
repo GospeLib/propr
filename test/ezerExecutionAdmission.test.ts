@@ -309,6 +309,51 @@ test('typed artifact correction is a separate exact comment admission with one-u
   }
 });
 
+describe('delegated recovery grant startBy', () => {
+  test('refuses a startBy that has already passed at consumption time', async () => {
+    await assert.rejects(() => consumeExecutionAdmission({
+      token: sign(claims({ startBy: new Date(NOW_MS - 1).toISOString() })),
+      signingSecret: SIGNING_SECRET,
+      expected: { repository: 'GospeLib/main', issueNumber: 2260 },
+      store: store(), nowMs: NOW_MS,
+    }), /expired/);
+  });
+
+  test('accepts a future startBy and still derives the run deadline from expiresAt', async () => {
+    const sharedStore = store();
+    const result = await consumeExecutionAdmission({
+      token: sign(claims({ startBy: new Date(NOW_MS + 30_000).toISOString(), expiresAt: new Date(NOW_MS + 60_000).toISOString() })),
+      signingSecret: SIGNING_SECRET,
+      expected: { repository: 'GospeLib/main', issueNumber: 2260 },
+      store: sharedStore, nowMs: NOW_MS,
+    });
+    assert.equal(result.claims.expiresAt, new Date(NOW_MS + 60_000).toISOString());
+    await assert.doesNotReject(() => verifyWorkerAdmissionReceipt({
+      receipt: result.receipt,
+      expected: { repository: 'GospeLib/main', issueNumber: 2260, target: 'stage' },
+      store: sharedStore,
+    }));
+  });
+
+  test('leaves absent startBy behaviour unchanged', async () => {
+    await assert.doesNotReject(() => consumeExecutionAdmission({
+      token: sign(claims()),
+      signingSecret: SIGNING_SECRET,
+      expected: { repository: 'GospeLib/main', issueNumber: 2260 },
+      store: store(), nowMs: NOW_MS,
+    }));
+  });
+
+  test('refuses a malformed startBy', async () => {
+    await assert.rejects(() => consumeExecutionAdmission({
+      token: sign({ ...claims(), startBy: 'not-a-timestamp' } as ExecutionAdmissionClaims),
+      signingSecret: SIGNING_SECRET,
+      expected: { repository: 'GospeLib/main', issueNumber: 2260 },
+      store: store(), nowMs: NOW_MS,
+    }), /malformed-admission/);
+  });
+});
+
 const SELECTED_ROUTE={selectionId:'route-event',routeId:'local:gpt-5.6-sol',agentId:'agent-1',agentAlias:'local',provider:'codex',model:'gpt-5.6-sol',attemptOrdinal:2};
 test('retains the exact signed route and rejects changed worker models and forged receipt hints',async()=>{
  for(const mode of ['exact','model','hint'] as const){

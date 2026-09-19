@@ -96,6 +96,10 @@ export interface ExecutionDelegation {
     delegatePrincipalId: string;
     delegateSessionId: string;
     approvalPrincipalId: string;
+    /** Optional provenance Ezer now signs alongside a delegated grant; preserved verbatim, never validated beyond shape. */
+    grantWindow?: { startsAt: string; expiresAt: string };
+    scope?: string[];
+    provenance?: string;
 }
 function parseDelegation(input: unknown): ExecutionDelegation {
     if (!input || typeof input !== 'object' || Array.isArray(input)) refuse('invalid-execution-delegation');
@@ -105,7 +109,29 @@ function parseDelegation(input: unknown): ExecutionDelegation {
         delegatePrincipalId: requiredString(value.delegatePrincipalId, 'missing-delegation-principal'),
         delegateSessionId: requiredString(value.delegateSessionId, 'missing-delegation-session'),
         approvalPrincipalId: requiredString(value.approvalPrincipalId, 'missing-delegation-approval-principal'),
+        ...(value.grantWindow === undefined ? {} : { grantWindow: requireGrantWindow(value.grantWindow) }),
+        ...(value.scope === undefined ? {} : { scope: requireStringArray(value.scope, 'invalid-delegation-scope') }),
+        ...(value.provenance === undefined ? {} : { provenance: requiredString(value.provenance, 'invalid-delegation-provenance') }),
     };
+}
+
+function requireGrantWindow(value: unknown): { startsAt: string; expiresAt: string } {
+    if (!value || typeof value !== 'object') refuse('invalid-delegation-grant-window');
+    const v = value as Record<string, unknown>;
+    return {
+        startsAt: requireIsoTimestamp(v.startsAt, 'invalid-delegation-grant-window'),
+        expiresAt: requireIsoTimestamp(v.expiresAt, 'invalid-delegation-grant-window'),
+    };
+}
+
+function requireStringArray(value: unknown, reason: string): string[] {
+    if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || item.trim() === '')) refuse(reason);
+    return [...value] as string[];
+}
+
+function requireIsoTimestamp(value: unknown, reason: string): string {
+    if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) refuse(reason);
+    return value;
 }
 export interface ExecutionAdmissionClaims {
     delegatedAuthority?: ExecutionDelegation;
@@ -129,6 +155,8 @@ export interface ExecutionAdmissionClaims {
     issueNumber: number;
     issuedAt: string;
     expiresAt: string;
+    /** Optional: the delegated recovery grant's expiry. expiresAt still carries the full run lease. Absent = unchanged behaviour. */
+    startBy?: string;
 }
 
 export interface WorkerAdmissionReceipt {
@@ -242,6 +270,7 @@ function parseClaims(encodedPayload: string): ExecutionAdmissionClaims {
         issueNumber: Number(candidate.issueNumber),
         issuedAt: requiredString(candidate.issuedAt, 'missing-issued-at'),
         expiresAt: requiredString(candidate.expiresAt, 'missing-expires-at'),
+        ...(candidate.startBy === undefined ? {} : { startBy: requireIsoTimestamp(candidate.startBy, 'malformed-admission') }),
     };
 }
 
@@ -292,6 +321,7 @@ function validateClaims(claims: ExecutionAdmissionClaims, expected: ExpectedExec
     if (!Number.isFinite(issuedAtMs) || !Number.isFinite(expiresAtMs) || expiresAtMs <= issuedAtMs) refuse('invalid-expiry');
     if (issuedAtMs > nowMs + CLOCK_SKEW_MS) refuse('not-yet-valid');
     if (expiresAtMs <= nowMs) refuse('expired');
+    if (claims.startBy !== undefined && Date.parse(claims.startBy) <= nowMs) refuse('expired');
     return Math.max(1, Math.ceil((expiresAtMs - nowMs) / MILLISECONDS_PER_SECOND));
 }
 
@@ -329,6 +359,7 @@ export async function consumeExecutionAdmission(input: {
         ...(claims.artifactCorrection === undefined ? {} : { artifactCorrection: claims.artifactCorrection }),
         ...(claims.typedWork === undefined ? {} : { typedWork: claims.typedWork }),
         ...(claims.comment === undefined ? {} : { comment: claims.comment }),
+        ...(claims.startBy === undefined ? {} : { startBy: claims.startBy }),
     });
     if (!await input.store.consumeAndIssue(consumedKey, receiptKey, receiptValue, ttlSeconds)) refuse('replayed-admission');
     return { claims, receipt: { ...(claims.delegatedAuthority ? { delegatedAuthority: claims.delegatedAuthority } : {}), ...(claims.route ? {route:claims.route} : {}), admissionId: claims.admissionId, operationId: claims.operationId, storyId: claims.storyId, receiptKey } };

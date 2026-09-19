@@ -33,7 +33,8 @@ export function requireExecutionCheckpointRef(value: unknown): string {
   return value;
 }
 
-function requireCheckpoint(value: unknown): ExecutionRecoveryCheckpoint {
+/** Validates an exact `{ ref, sha }` checkpoint pair (no other fields). */
+export function requireExecutionRecoveryCheckpoint(value: unknown): ExecutionRecoveryCheckpoint {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('EXECUTION_RECOVERY_CONTEXT_INVALID');
   const checkpoint = value as ExecutionRecoveryCheckpoint;
   if (Object.keys(checkpoint).some(key => !CHECKPOINT_FIELDS.includes(key as typeof CHECKPOINT_FIELDS[number])) ||
@@ -54,5 +55,5 @@ export function requireExecutionRecoveryContext(value: unknown): ExecutionRecove
     throw Error('EXECUTION_RECOVERY_CONTEXT_INVALID');
   return { sourceTaskId: context.sourceTaskId, evidenceDigest: context.evidenceDigest, action: context.action,
     checkpointText: context.checkpointText, instructions: context.instructions,
-    ...(context.checkpoint === undefined ? {} : { checkpoint: requireCheckpoint(context.checkpoint) }) };
+    ...(context.checkpoint === undefined ? {} : { checkpoint: requireExecutionRecoveryCheckpoint(context.checkpoint) }) };
 }

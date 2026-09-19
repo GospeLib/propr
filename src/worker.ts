@@ -28,7 +28,7 @@ import {
     attachPRCommentTaskStateFinalizers,
     type PRCommentTaskStateFinalizers,
 } from './jobs/prCommentTaskStateFinalizers.js';
-import { startWorkerTaskStateRecovery } from './workerTaskStateRecovery.js';
+import { startWorkerBackgroundTasks } from './workerBackgroundTasks.js';
 
 process.on('uncaughtException', (error: Error) => {
     logger.fatal({ error: error.message, stack: error.stack }, 'Uncaught exception in worker');
@@ -335,7 +335,7 @@ async function startWorker(options: WorkerOptions = {}): Promise<StartedWorker> 
     });
     if (!taskStateFinalizers) throw new Error('PR comment task state finalizers were not attached');
     const attachedTaskStateFinalizers = taskStateFinalizers;
-    const taskStateRecovery = await startWorkerTaskStateRecovery({ stateManager });
+    const backgroundTasks = await startWorkerBackgroundTasks({ stateManager });
 
     const runtimeBuildWorker = new Worker<AgentRuntimeBuildJobData>(
         AGENT_RUNTIME_BUILD_QUEUE_NAME,
@@ -368,7 +368,7 @@ async function startWorker(options: WorkerOptions = {}): Promise<StartedWorker> 
 
     const close = async (): Promise<void> => {
         clearInterval(heartbeatInterval);
-        await taskStateRecovery.close();
+        await backgroundTasks.close();
         await worker.close();
         await attachedTaskStateFinalizers.close();
         await closeStateManager();

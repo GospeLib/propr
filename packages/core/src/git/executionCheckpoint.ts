@@ -9,19 +9,16 @@
  * name that exact ref and SHA in `recovery.checkpoint`; its worktree then
  * starts from the checkpoint's in-scope changes as uncommitted work.
  */
-import { execFile } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import { requireStoryExecutionContract, type StoryExecutionContract } from '../admission/storyExecutionContract.js';
 import { EXECUTION_CHECKPOINT_REF_PREFIX, requireExecutionCheckpointRef } from '../admission/executionRecoveryContext.js';
-import { createHooklessGit, DISABLED_GIT_HOOKS_PATH } from './hooklessGit.js';
-import { redactAuthenticatedGitUrl, setupAuthenticatedRemote } from './repoBranching.js';
+import { redactAuthenticatedGitUrl } from './repoBranching.js';
+import { pinExecutionCheckpoint, publishPinnedExecutionCheckpoint, runCheckpointGit as git,
+    type CheckpointGitEnvironment as GitEnvironment } from './executionCheckpointRetention.js';
 
-const runFile = promisify(execFile);
 const NUL = '\0';
-const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024;
 const TASK_SEGMENT_UNSAFE = /[^A-Za-z0-9._-]+/g;
 const MAX_ERROR_CHARACTERS = 2_000;
 
@@ -38,6 +35,11 @@ export interface ExecutionCheckpointRecord {
     featureBranch: string;
     ref?: string;
     sha?: string;
+    /**
+     * Local ref pinning `sha` while it is not verified on the remote (push failed), so the
+     * commit is never unreferenced. Absent once published.
+     */
+    localRef?: string;
     /** Every changed path in the worktree, in or out of scope. Names only. */
     changedPaths: string[];
     /** Changed paths outside `allowedPaths`: reported by name, never committed or pushed. */
@@ -61,15 +63,6 @@ export interface RestoredExecutionCheckpoint {
     sha: string;
     restoredPaths: string[];
     ignoredPaths: string[];
-}
-
-type GitEnvironment = Record<string, string | undefined>;
-
-async function git(cwd: string, args: string[], env?: GitEnvironment): Promise<string> {
-    const { stdout } = await runFile('git', ['-c', `core.hooksPath=${DISABLED_GIT_HOOKS_PATH}`, ...args], {
-        cwd, env: env ?? process.env, maxBuffer: MAX_GIT_OUTPUT_BYTES,
-    });
-    return stdout;
 }
 
 function splitNul(output: string): string[] {
@@ -151,13 +144,14 @@ export async function preserveExecutionCheckpoint(options: PreserveExecutionChec
             '-m', checkpointMessage(options, inScopePaths)], identity)).trim();
         record.ref = ref;
         record.sha = sha;
+        // Pin before pushing: if the push fails, the commit stays referenced locally.
+        record.localRef = await pinExecutionCheckpoint(options.worktreePath, ref, sha);
 
-        if (options.repoUrl && options.authToken)
-            await setupAuthenticatedRemote(createHooklessGit(options.worktreePath), options.repoUrl, options.authToken);
         // Never forced: an existing checkpoint for this exact task attempt is kept, not replaced.
-        await git(options.worktreePath, ['push', remote, `${sha}:${ref}`]);
-        const remoteSha = (await git(options.worktreePath, ['ls-remote', remote, ref])).trim().split(/\s+/)[0];
-        if (remoteSha !== sha) throw Error('EXECUTION_CHECKPOINT_REMOTE_MISMATCH');
+        // The pin is released only once the remote is verified to hold this exact SHA.
+        await publishPinnedExecutionCheckpoint({ repoPath: options.worktreePath, ref, sha, remote,
+            repoUrl: options.repoUrl, authToken: options.authToken });
+        delete record.localRef;
         record.status = 'preserved';
         return record;
     } catch (error) {

@@ -6,7 +6,7 @@
  */
 import type { Logger } from 'pino';
 import type { ClaudeCodeResponse } from '@propr/core';
-import { preserveExecutionCheckpoint, type ExecutionCheckpointRecord, type StoryExecutionContract } from '@propr/core';
+import { preserveExecutionCheckpoint, resolveRepositoryGitDir, type ExecutionCheckpointRecord, type StoryExecutionContract } from '@propr/core';
 import type { WorktreeInfo, WorkerStateManager } from '@propr/core';
 import { resolveAgentTerminationReason } from '@propr/core';
 import { safeUpdateLabels } from '@propr/core';
@@ -20,6 +20,7 @@ import { AI_COMMIT_AUTHOR } from './commitAuthor.js';
 import type { GitHubToken } from './githubTypes.js';
 import { classifyExecutionFailure } from './executionOutcome.js';
 import { markTaskTerminalState } from './terminalTaskState.js';
+import { saveRetainedCheckpoint } from './checkpointRetentionStore.js';
 
 export function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
@@ -175,6 +176,24 @@ export type ErrorWithExecutionCheckpoint = Error & {
 };
 
 /**
+ * Hands the retained worktree to the recurring checkpoint-retention reconciler, which
+ * retries publication and bounds retained disk. Registration failure is logged, never
+ * thrown: the checkpoint commit is already pinned locally and cleanup still retains.
+ */
+async function registerRetainedWorktree(taskId: string, worktreeInfo: WorktreeInfo, correlatedLogger: Logger): Promise<void> {
+    try {
+        await saveRetainedCheckpoint({
+            taskId, worktreePath: worktreeInfo.worktreePath, branchName: worktreeInfo.branchName,
+            gitDir: await resolveRepositoryGitDir(worktreeInfo.worktreePath),
+            retainedAt: new Date().toISOString(), publishAttempts: 0,
+        });
+    } catch (error) {
+        correlatedLogger.error({ taskId, worktreePath: worktreeInfo.worktreePath, error: getErrorMessage(error) },
+            'Could not register retained checkpoint worktree for reconciliation');
+    }
+}
+
+/**
  * Preserves a stopped admitted execution's partial work, then durably records the failed
  * terminal task entry naming that checkpoint BEFORE anything else can fail or the worktree
  * is removed. Label updates and cleanup come after, so a crash past this point can never
@@ -199,6 +218,7 @@ export async function handleStoppedAdmittedExecution(options: PostProcessOptions
     // copy of the partial work. Cleanup must retain it, and recovery must be able to find
     // it, regardless of what happens past this point.
     const retainedWorktreePath = executionCheckpoint.status === 'failed' ? worktreeInfo.worktreePath : undefined;
+    if (retainedWorktreePath) await registerRetainedWorktree(taskId, worktreeInfo, correlatedLogger);
     const stopped: PostProcessingResult = {
         success: false, pr: null, updatedLabels: [], executionCheckpoint,
         ...(retainedWorktreePath ? { retainedWorktreePath } : {}),

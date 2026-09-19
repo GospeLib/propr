@@ -91,7 +91,7 @@ export { setupAuthenticatedRemote, ensureBranchAndPush, pushBranch, redactAuthen
 export { ensureRepoCloned, createWorktreeForIssue, getRepoUrl, fetchLatestChanges } from './git/repoManager.js';
 export type { WorktreeResult, WorktreeInfo, FetchLatestChangesOptions, FetchLatestChangesResult } from './git/repoManager.js';
 export { cleanupExistingBranch, createWorktreeFromExistingBranch } from './git/worktreeCreation.js';
-export { cleanupWorktree, cleanupExpiredWorktrees, safePruneWorktrees, setupWorktreePermissions, addToSafeDirectories, verifyWorktreeCreation, setupWorktreeRemote, getWorktreePath } from './git/worktreeOperations.js';
+export { cleanupWorktree, cleanupExpiredWorktrees, getWorktreesBasePath, safePruneWorktrees, setupWorktreePermissions, addToSafeDirectories, verifyWorktreeCreation, setupWorktreeRemote, getWorktreePath } from './git/worktreeOperations.js';
 export type { CleanupOptions } from './git/worktreeOperations.js';
 export { isGitCorruptionError, GIT_CORRUPTION_PATTERNS, getCorruptionPatternStrings } from './git/gitCorruption.js';
 export { mergeBaseIntoBranch } from './git/mergeOperations.js';
@@ -458,4 +458,6 @@ export { requireStoryExecutionContract, type StoryExecutionContract } from './ad
 export { requireAuthorizedPublicationMetadata, publicationMetadataDigest, type AuthorizedPublicationMetadata } from './admission/authorizedPublicationMetadata.js';
 export { verifyStoryPublication } from './git/storyPublication.js';
 export { preserveExecutionCheckpoint, restoreExecutionCheckpoint, executionCheckpointRef, EXECUTION_CHECKPOINT_REF_PREFIX, type ExecutionCheckpointRecord, type ExecutionFailureClassification, type RestoredExecutionCheckpoint } from './git/executionCheckpoint.js';
+export { publishPinnedExecutionCheckpoint, pinExecutionCheckpoint, resolveRepositoryGitDir, snapshotWorktreeToLocalRef, readLocalRef, executionCheckpointPinRef, LOCAL_CHECKPOINT_PIN_PREFIX, LOCAL_WORKTREE_SNAPSHOT_PREFIX } from './git/executionCheckpointRetention.js';
+export { requireExecutionRecoveryCheckpoint } from './admission/executionRecoveryContext.js';
 export { type ExecutionRecoveryCheckpoint, type ExecutionRecoveryContext } from './admission/executionRecoveryContext.js';

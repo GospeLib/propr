@@ -13,6 +13,9 @@ import { join } from 'node:path';
 const runFile = promisify(execFile);
 
 const { cleanupWorktree } = await import('../packages/core/src/git/worktreeOperations.js');
+// Retained-worktree registrations live in an isolated directory, never the worker default.
+const retentionStoreDir = await mkdtemp(join(tmpdir(), 'propr-retention-store-'));
+process.env.CHECKPOINT_RETENTION_DIR = retentionStoreDir;
 const publicationPolicy = await import('../packages/core/src/publication/index.js');
 const { requireAuthorizedPublicationMetadata } = await import('../packages/core/src/admission/authorizedPublicationMetadata.js');
 
@@ -21,6 +24,8 @@ await mock.module('@propr/core', {
         ...publicationPolicy,
         requireAuthorizedPublicationMetadata,
         cleanupWorktree,
+        getWorktreesBasePath: () => tmpdir(),
+        resolveRepositoryGitDir: mock.fn(async () => '/tmp/repo/.git'),
         cleanupPreparedVisualPreviewEvidence: mock.fn(async () => undefined),
         commitChanges: mock.fn(async () => null),
         loadRepositoryVisualPreviewSettings: mock.fn(async () => ({ enabled: false, types: ['image'] })),
@@ -129,6 +134,30 @@ test('a successful checkpoint still allows normal cleanup to delete the worktree
 
         await assert.rejects(access(worktreePath));
     } finally {
+        await rm(base, { recursive: true, force: true });
+    }
+});
+
+test('a worktree registered for checkpoint retention is kept even when no post-processing result reached cleanup', async () => {
+    const { base, repoPath, worktreePath } = await makeRepoWithWorktree();
+    const { saveRetainedCheckpoint, removeRetainedCheckpoint } = await import('../src/jobs/checkpointRetentionStore.js');
+    await saveRetainedCheckpoint({ taskId: 't3', worktreePath, branchName: 'task-branch', gitDir: join(repoPath, '.git'),
+        retainedAt: new Date().toISOString(), publishAttempts: 0 });
+    try {
+        await cleanupWorktreeIfExists({
+            worktreeInfo: { worktreePath, branchName: 'task-branch' } as never,
+            localRepoPath: repoPath,
+            claudeResult: { success: false } as never,
+            // An error thrown after the checkpoint attempt leaves no post-processing result.
+            postProcessingResult: null,
+            jobId: 'job-3',
+            issueRef: { repoOwner: 'o', repoName: 'r', number: 3 } as never,
+            correlatedLogger: logger,
+        });
+        await access(worktreePath);
+    } finally {
+        await removeRetainedCheckpoint(worktreePath);
+        await runFile('git', ['-C', repoPath, 'worktree', 'remove', worktreePath, '--force']).catch(() => {});
         await rm(base, { recursive: true, force: true });
     }
 });

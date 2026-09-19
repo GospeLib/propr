@@ -6,6 +6,7 @@ import type { RepoValidationResult } from '@propr/core';
 import type { IssueJobData } from '@propr/core';
 import type { PostProcessingResult } from './issueJobHelpers.js';
 import { handlePRValidation } from './issueJobPRValidation.js';
+import { isRetainedCheckpointWorktree } from './checkpointRetentionStore.js';
 
 type RepoValidation = RepoValidationResult;
 
@@ -23,10 +24,12 @@ export async function cleanupWorktreeIfExists(options: CleanupOptions): Promise<
     const { worktreeInfo, localRepoPath, claudeResult, postProcessingResult, jobId, issueRef, correlatedLogger } = options;
     if (!worktreeInfo) return;
 
-    // A failed checkpoint push means the local worktree is the only surviving copy of the
-    // partial work: it must never be deleted, regardless of WORKTREE_RETENTION_STRATEGY.
-    const retain = postProcessingResult?.executionCheckpoint?.status === 'failed';
+    // A failed checkpoint push hands the worktree to the checkpoint-retention reconciler: it
+    // is never deleted here, regardless of WORKTREE_RETENTION_STRATEGY. The registry check
+    // also covers error paths where no post-processing result reached this point.
     try {
+        const retain = postProcessingResult?.executionCheckpoint?.status === 'failed' ||
+            await isRetainedCheckpointWorktree(worktreeInfo.worktreePath);
         const wasSuccessful = claudeResult?.success && postProcessingResult?.pr;
         await cleanupWorktree(localRepoPath, worktreeInfo.worktreePath, worktreeInfo.branchName, {
             deleteBranch: !wasSuccessful, success: !!wasSuccessful,
@@ -35,7 +38,7 @@ export async function cleanupWorktreeIfExists(options: CleanupOptions): Promise<
         });
         if (retain) {
             correlatedLogger.warn({ jobId, issueNumber: issueRef.number, worktreePath: worktreeInfo.worktreePath },
-                'Retained worktree: checkpoint push failed, partial work is only recoverable locally');
+                'Retained worktree: checkpoint not yet published; the checkpoint-retention reconciler owns it');
         }
     } catch (cleanupError) {
         correlatedLogger.warn({ jobId, issueNumber: issueRef.number, error: (cleanupError as Error).message }, 'Failed to cleanup worktree');

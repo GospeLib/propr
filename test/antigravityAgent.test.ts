@@ -6,6 +6,7 @@ import path from 'node:path';
 import { closeConnection } from '../packages/core/src/db/connection.js';
 import { AntigravityAgent } from '../packages/core/src/agents/impl/AntigravityAgent.js';
 import { toAntigravityCliModelId } from '../packages/core/src/agents/impl/antigravityModelIds.js';
+import { resolveTokenUsage } from '../packages/core/src/agents/impl/antigravityAgentSupport.js';
 import type { AgentConfig } from '../packages/core/src/agents/types.js';
 
 process.env.NODE_ENV = 'test';
@@ -149,19 +150,8 @@ describe('toAntigravityCliModelId', () => {
 });
 
 describe('AntigravityAgent token estimation', () => {
-    type Estimate = { input_tokens?: number; output_tokens?: number } | undefined;
-    interface TokenAgent {
-        resolveTokenUsage(
-            reported: { input_tokens?: number; output_tokens?: number },
-            prompt: string,
-            summary: string | undefined,
-            conversationLog: unknown[]
-        ): Estimate;
-    }
-    const agent = createAgent('/tmp/nonexistent') as unknown as TokenAgent;
-
     test('reported counts always win', () => {
-        const usage = agent.resolveTokenUsage({ input_tokens: 1000, output_tokens: 200 }, 'p', 's', []);
+        const usage = resolveTokenUsage({ input_tokens: 1000, output_tokens: 200 }, 'p', 's', []);
         assert.deepStrictEqual(usage, { input_tokens: 1000, output_tokens: 200 });
     });
 
@@ -173,7 +163,7 @@ describe('AntigravityAgent token estimation', () => {
             { source: 'MODEL', type: 'PLANNER_RESPONSE', content: 'a'.repeat(800) },     // output
             { source: 'MODEL', type: 'CODE_ACTION', content: 'b'.repeat(1200) },         // output
         ];
-        const usage = agent.resolveTokenUsage({}, 'prompt', 'summary', events)!;
+        const usage = resolveTokenUsage({}, 'prompt', 'summary', events)!;
         assert.ok(usage, 'should produce an estimate');
         // Input dominates (file view + grep ~12.4K chars) and far exceeds the old
         // prompt-only estimate; output reflects planner + code (~2K chars).
@@ -183,7 +173,7 @@ describe('AntigravityAgent token estimation', () => {
     });
 
     test('falls back to prompt + summary when no transcript content (plain-text output)', () => {
-        const usage = agent.resolveTokenUsage({}, 'p'.repeat(4000), 's'.repeat(800), [])!;
+        const usage = resolveTokenUsage({}, 'p'.repeat(4000), 's'.repeat(800), [])!;
         assert.ok(usage.input_tokens! > usage.output_tokens!, 'prompt is input, summary is output');
         assert.ok(usage.output_tokens! > 0);
     });

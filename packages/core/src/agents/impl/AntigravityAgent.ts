@@ -19,11 +19,9 @@ import {
     convertEventToClaudeFormat,
     parseAntigravityJsonl,
     filterAntigravityAnalysisEvents,
-    normalizeAntigravityModelId,
     type AntigravityOutputEvent
 } from './utils/antigravityOutputParser.js';
-import { estimateTokens } from '../../utils/tokenCalculation.js';
-import { antigravityModelIdsMatch, toAntigravityCliModelId } from './antigravityModelIds.js';
+import { toAntigravityCliModelId } from './antigravityModelIds.js';
 import { resolveAntigravityProtocolError } from './utils/antigravityProtocol.js';
 import fs from 'fs';
 import path from 'path';
@@ -36,6 +34,19 @@ import {
     buildAntigravityRepositoryScoutPermissions,
     REPOSITORY_SCOUT_CONTAINER_ROOT,
 } from './utils/repositoryScoutMcpServer.js';
+import {
+    isSuccessfulAnalysisResult,
+    resolveAntigravityModelIdentity,
+    resolveAntigravityExecutionError,
+    resolveAntigravityEvidenceConflict,
+    buildAgentEnvironmentArgs,
+    assertRepositoryInspectionMode,
+    getAntigravityTranscriptRoot,
+    mergeTokenUsage,
+    resolveTokenUsage,
+    buildAntigravityShellCommand,
+    buildContainerName,
+} from './antigravityAgentSupport.js';
 
 // Re-export UsageLimitError for convenience
 export { UsageLimitError };
@@ -43,47 +54,6 @@ export { UsageLimitError };
 const ANALYSIS_AGENT_TANK_TIMEOUT_MS = parseInt(process.env.ANALYSIS_AGENT_TANK_TIMEOUT_MS || '2000', 10);
 
 const ANTIGRAVITY_CONTAINER_SOURCE_CONFIG_PATH = '/home/node/.gemini-source';
-const DEFAULT_ANTIGRAVITY_TRANSCRIPT_ROOT = '/tmp/git-processor/propr-cache/transcripts/antigravity';
-const GITHUB_CREDENTIAL_ENV_PATTERN = /^(?:GH|GITHUB)_.*(?:TOKEN|KEY|SECRET|PASSWORD|PAT|PRIVATE_KEY)$/;
-
-function isSuccessfulAnalysisResult(
-    result: { timedOut?: boolean; exitCode: number | null },
-    summary: string | undefined,
-    protocolError?: string,
-): boolean {
-    return !protocolError && !result.timedOut && (result.exitCode === 0 || !!summary);
-}
-
-function resolveAntigravityModelIdentity(reportedModel: string | undefined, requestedModel: string | undefined, requireReportedModel: boolean): { modelUsed: string; error?: string } { const reported = reportedModel || undefined; const requested = requestedModel ? normalizeAntigravityModelId(requestedModel) : undefined; const missingReported = requireReportedModel && !!requested && !reported; const matches = !reported || !requested || antigravityModelIdsMatch(requested, reported); return { modelUsed: missingReported ? 'unknown' : matches && requested ? requested : reported ?? requested ?? 'unknown', error: missingReported ? `Antigravity stream did not report a model identity for requested model "${requested}"` : matches ? undefined : `Antigravity reported model "${reported}" but "${requested}" was requested` }; }
-
-function resolveAntigravityExecutionError(terminalStatus: 'success' | 'error' | undefined, protocolError: string | undefined, hasStreamEnvelopes: boolean, modelIdentityError: string | undefined): string | undefined { return resolveAntigravityProtocolError(terminalStatus, protocolError, hasStreamEnvelopes) ?? modelIdentityError; }
-
-function resolveAntigravityEvidenceConflict(stdoutModel: string | undefined, transcriptModel: string | undefined, stdoutConversation: string | undefined, transcriptConversation: string | undefined): string | undefined { if (stdoutConversation && transcriptConversation && stdoutConversation !== transcriptConversation) return `Conflicting Antigravity conversation identities: stdout reported "${stdoutConversation}" but transcript reported "${transcriptConversation}"`; const stdout = stdoutModel && normalizeAntigravityModelId(stdoutModel); const transcript = transcriptModel && normalizeAntigravityModelId(transcriptModel); return stdout && transcript && stdout !== transcript ? `Conflicting Antigravity model identities: stdout reported "${stdout}" but transcript reported "${transcript}"` : undefined; }
-
-function buildAgentEnvironmentArgs(
-    repositoryInspection: boolean,
-    ...sources: Array<Record<string, string> | undefined>
-): string[] {
-    const args: string[] = [];
-    for (const source of sources) {
-        if (!source) continue;
-        for (const [key, value] of Object.entries(source)) {
-            if (repositoryInspection && GITHUB_CREDENTIAL_ENV_PATTERN.test(key.toUpperCase())) continue;
-            args.push('-e', `${key}=${value}`);
-        }
-    }
-    return args;
-}
-
-function assertRepositoryInspectionMode(repositoryInspection: boolean, readOnlyWorkspace: boolean): void {
-    if (repositoryInspection && !readOnlyWorkspace) {
-        throw new Error('Repository inspection requires a read-only workspace');
-    }
-}
-
-function getAntigravityTranscriptRoot(): string {
-    return process.env.PROPR_ANTIGRAVITY_TRANSCRIPT_ROOT || DEFAULT_ANTIGRAVITY_TRANSCRIPT_ROOT;
-}
 
 export class AntigravityAgent implements Agent {
     readonly config: AgentConfig;
@@ -177,7 +147,7 @@ export class AntigravityAgent implements Agent {
         const parsed = this.resolveSessionOutput(result.stdout, transcriptPath, onSessionId);
         const { response } = await parsed;
 
-        const finalTokenUsage = this.resolveTokenUsage(response.tokenUsage, prompt, response.summary, response.rawConversationLog);
+        const finalTokenUsage = resolveTokenUsage(response.tokenUsage, prompt, response.summary, response.rawConversationLog);
         const modelIdentity = resolveAntigravityModelIdentity(response.modelUsed, effectiveModel, response.hasStreamEnvelopes); const resolvedModel = modelIdentity.modelUsed;
         const terminationReason = resolveAgentTerminationReason({ timedOut: result.timedOut, error: result.stderr });
         const executionError = resolveAntigravityExecutionError(response.terminalStatus, response.protocolError, response.hasStreamEnvelopes, modelIdentity.error);
@@ -209,7 +179,7 @@ export class AntigravityAgent implements Agent {
         const rawConversationLog = sessionOutput.conversationLog.length > 0 ? sessionOutput.conversationLog : parsedOutput.conversationLog;
         const conversationLog = filterAntigravityAnalysisEvents(aggregateDeltaMessages(rawConversationLog))
             .map(convertEventToClaudeFormat);
-        const tokenUsage = this.mergeTokenUsage(parsedOutput.tokenUsage, sessionOutput.tokenUsage);
+        const tokenUsage = mergeTokenUsage(parsedOutput.tokenUsage, sessionOutput.tokenUsage);
         const evidenceConflict = resolveAntigravityEvidenceConflict(parsedOutput.modelUsed, sessionOutput.modelUsed, parsedOutput.conversationId, sessionOutput.conversationId); const modelUsed = evidenceConflict ? undefined : parsedOutput.modelUsed || sessionOutput.modelUsed;
         const terminalStatus: 'success' | 'error' | undefined = parsedOutput.terminalStatus === 'error' || sessionOutput.terminalStatus === 'error' ? 'error' : parsedOutput.terminalStatus || sessionOutput.terminalStatus;
         const protocolError = resolveAntigravityProtocolError(parsedOutput.terminalStatus, parsedOutput.protocolError, parsedOutput.hasStreamEnvelopes) ?? resolveAntigravityProtocolError(sessionOutput.terminalStatus, sessionOutput.protocolError, sessionOutput.hasStreamEnvelopes) ?? evidenceConflict; const hasStreamEnvelopes = parsedOutput.hasStreamEnvelopes || sessionOutput.hasStreamEnvelopes;
@@ -260,71 +230,6 @@ export class AntigravityAgent implements Agent {
         }
     }
 
-    private mergeTokenUsage(
-        primary: TokenUsage,
-        fallback?: TokenUsage
-    ): TokenUsage {
-        return {
-            input_tokens: primary.input_tokens ?? fallback?.input_tokens,
-            output_tokens: primary.output_tokens ?? fallback?.output_tokens,
-            cache_creation_input_tokens: primary.cache_creation_input_tokens ?? fallback?.cache_creation_input_tokens,
-            cache_read_input_tokens: primary.cache_read_input_tokens ?? fallback?.cache_read_input_tokens,
-            reasoning_output_tokens: primary.reasoning_output_tokens ?? fallback?.reasoning_output_tokens,
-        };
-    }
-
-    /**
-     * Older/plain agy output reports no token usage, so estimate from the full transcript. The model
-     * AUTHORS planner responses, code edits, and assistant messages (output); it
-     * CONSUMES the prompt, file views, search results, command output, and history
-     * (input). Counting only the prompt + final messages undercounts agentic runs
-     * by ~10-100x. Reported counts win when present. This is an estimate (it can't
-     * capture cumulative re-read context across agentic turns), but it lands in the
-     * right order of magnitude instead of near zero.
-     */
-    private resolveTokenUsage(
-        reported: TokenUsage,
-        prompt: string,
-        summary: string | undefined,
-        conversationLog: AntigravityOutputEvent[]
-    ): TokenUsage | undefined {
-        if (reported.input_tokens || reported.output_tokens || reported.cache_read_input_tokens || reported.reasoning_output_tokens) return reported;
-
-        let inputText = '';
-        let outputText = '';
-        for (const event of conversationLog) {
-            const content = 'content' in event && typeof event.content === 'string' ? event.content : '';
-            if (!content) continue;
-            if (this.isModelAuthoredEvent(event)) outputText += `${content}\n`;
-            else inputText += `${content}\n`;
-        }
-
-        // Fallbacks when the transcript has no usable content (e.g. plain-text
-        // --print output, as in the analyze path): estimate from prompt + summary.
-        if (!inputText && !outputText) {
-            inputText = prompt;
-            outputText = summary || '';
-        } else if (!inputText) {
-            inputText = prompt; // transcript had only model output; still count the prompt
-        }
-
-        const inputTokens = estimateTokens(inputText);
-        const outputTokens = estimateTokens(outputText);
-        return inputTokens || outputTokens
-            ? { input_tokens: inputTokens, output_tokens: outputTokens }
-            : undefined;
-    }
-
-    /** Whether a transcript event's content was authored by the model (output) vs consumed by it (input). */
-    private isModelAuthoredEvent(event: AntigravityOutputEvent): boolean {
-        const role = (event as { role?: string }).role;
-        if (role === 'assistant') return true;
-        const type = (event as { type?: string }).type;
-        // PLANNER_RESPONSE = model's text; CODE_ACTION = edits the model wrote.
-        // VIEW_FILE / GREP_SEARCH / RUN_COMMAND content is dominated by results the
-        // model reads, so treat those as input.
-        return type === 'PLANNER_RESPONSE' || type === 'CODE_ACTION';
-    }
 
     private async persistImplementationLog(opts: {
         executionTime: number; issueRef: { number: number; repoOwner: string; repoName: string };
@@ -385,7 +290,7 @@ export class AntigravityAgent implements Agent {
                 // full prompt and the response so reviews / summaries / pr-comments
                 // still report (estimated) token counts and cost, matching the
                 // executeTask path. Reported counts win when present.
-                const antigravityTokenUsage = this.resolveTokenUsage(tokenUsage, fullPrompt, analysisText, []);
+                const antigravityTokenUsage = resolveTokenUsage(tokenUsage, fullPrompt, analysisText, []);
                 logger.info({ agentAlias: this.config.alias, responseLength: analysisText.length, model: resolvedModel, executionTimeMs, inputTokens: antigravityTokenUsage?.input_tokens, outputTokens: antigravityTokenUsage?.output_tokens, estimatedTokens: !(tokenUsage.input_tokens || tokenUsage.output_tokens), usageMetrics: usageMetrics ? { delta: usageMetrics.delta } : null }, 'Lightweight analysis completed');
 
                 if (!suppressLlmLog) {
@@ -423,18 +328,6 @@ export class AntigravityAgent implements Agent {
         }
     }
 
-    private buildAntigravityShellCommand(repositoryInspection = false): string {
-        // With no prompt flag, agy detects non-TTY stdin and enters print mode.
-        // This is required because repo-context prompts routinely exceed Linux's
-        // 128 KiB per-argument limit (MAX_ARG_STRLEN). Passing `--print -` does
-        // not read stdin: agy treats `-` as the literal prompt. `"$@"` carries
-        // only CLI flags such as `--model`, so all flags precede the stdin prompt.
-        const safetyArgs = repositoryInspection
-            ? '--sandbox --disable-slash-commands'
-            : '--dangerously-skip-permissions';
-        return ['set -e', `exec ${this.getCliCommand()} ${safetyArgs} "$@"`].join('\n');
-    }
-
     private buildDockerArgs(params: { worktreePath: string; githubToken: string; modelName?: string; issueNumber: number; environment?: Record<string, string>; taskId?: string; executionType?: string; transcriptPath?: string; readOnlyWorkspace?: boolean; repositoryInspection?: boolean }): string[] {
         const { worktreePath, githubToken, modelName, issueNumber, environment, taskId, executionType, transcriptPath, readOnlyWorkspace = false, repositoryInspection = false } = params;
         assertRepositoryInspectionMode(repositoryInspection, readOnlyWorkspace);
@@ -443,7 +336,7 @@ export class AntigravityAgent implements Agent {
         const shortTaskId = createContainerExecutionId(taskId);
         const taskType = executionType || (issueNumber === 0 ? 'analysis' : `issue-${issueNumber}`);
         const runtimeName = this.getRuntimeName();
-        const containerName = this.buildContainerName(this.config.alias || runtimeName, taskType, shortTaskId, modelName);
+        const containerName = buildContainerName(this.config.alias || runtimeName, taskType, shortTaskId, modelName);
         const dockerArgs: string[] = [
             'run', '--rm', '-i', '--name', containerName, '--security-opt', 'no-new-privileges', '--cap-add', 'CHOWN', '--network', 'bridge', '--user', '0:0',
             '-v', `${worktreePath}:${repositoryInspection ? REPOSITORY_SCOUT_CONTAINER_ROOT : '/home/node/workspace'}:${readOnlyWorkspace ? 'ro' : 'rw'}`,
@@ -460,7 +353,7 @@ export class AntigravityAgent implements Agent {
             ] : []),
             ...(transcriptPath ? ['-e', `PROPR_ANTIGRAVITY_TRANSCRIPT_PATH=${transcriptPath}`] : []),
             ...envVars, '-w', '/home/node/workspace',
-            this.config.dockerImage, '/bin/bash', '-lc', this.buildAntigravityShellCommand(repositoryInspection), 'propr-antigravity'
+            this.config.dockerImage, '/bin/bash', '-lc', buildAntigravityShellCommand(this.getCliCommand(), repositoryInspection), 'propr-antigravity'
         ];
         // The prompt is delivered through non-TTY stdin, not as an argv element,
         // to avoid spawn E2BIG on large repo-context prompts. Only CLI flags such
@@ -475,16 +368,6 @@ export class AntigravityAgent implements Agent {
         } else { logger.debug({ issueNumber, agentAlias: this.config.alias }, 'No model specified, Antigravity agent will use default'); }
         logger.info({ issueNumber, agentAlias: this.config.alias }, 'Docker args built for Antigravity agent');
         return wrapDockerRunArgsWithRepoSetup(dockerArgs, this.config.dockerImage, runtimeName);
-    }
-
-    private buildContainerName(alias: string, taskType: string, shortTaskId: string, modelName?: string): string {
-        const suffix = `-${shortTaskId}`;
-        const rawPrefix = modelName
-            ? `${alias}-${taskType}-${modelName}`
-            : `${alias}-${taskType}`;
-        const maxPrefixLength = Math.max(1, 120 - suffix.length);
-        const sanitizedPrefix = rawPrefix.replace(/[^a-zA-Z0-9_.-]/g, '-').replace(/^[^a-zA-Z0-9]+/, '').slice(0, maxPrefixLength).replace(/[^a-zA-Z0-9]+$/, '');
-        return `${sanitizedPrefix || 'antigravity'}${suffix}`.slice(0, 128);
     }
 
 }

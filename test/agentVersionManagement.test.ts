@@ -161,13 +161,15 @@ describe('agent version management', () => {
 
     test('shared agent entrypoint recognizes raw dispatcher commands', () => {
         const entrypoint = fs.readFileSync('scripts/agent-entrypoint.sh', 'utf8');
-        const vibeAgent = fs.readFileSync('packages/core/src/agents/impl/VibeAgent.ts', 'utf8');
+        // The PROPR_AGENT_TYPE=vibe docker-env-arg literal lives in VibeAgent's
+        // extracted docker-args helper module, not the class file itself.
+        const vibeAgentDockerArgsHelpers = fs.readFileSync('packages/core/src/agents/impl/vibeAgentDockerArgsHelpers.ts', 'utf8');
 
         assert.match(entrypoint, /opencode-run\|\/usr\/local\/bin\/opencode-run\) agent_type=opencode/);
         assert.match(entrypoint, /\/home\/node\/antigravity-entrypoint\.sh/);
         assert.match(entrypoint, /exec "\$1" "\$\{@:2\}"/);
         assert.match(entrypoint, /bash\|sh\|\/bin\/bash\|\/bin\/sh/);
-        assert.match(vibeAgent, /PROPR_AGENT_TYPE=vibe/);
+        assert.match(vibeAgentDockerArgsHelpers, /PROPR_AGENT_TYPE=vibe/);
     });
 
     test('records proprietary release artifact provenance in the unified agent image', () => {

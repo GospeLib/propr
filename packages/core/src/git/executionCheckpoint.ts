@@ -38,7 +38,9 @@ export interface ExecutionCheckpointRecord {
     featureBranch: string;
     ref?: string;
     sha?: string;
+    /** Every changed path in the worktree, in or out of scope. Names only. */
     changedPaths: string[];
+    /** Changed paths outside `allowedPaths`: reported by name, never committed or pushed. */
     outOfScopePaths: string[];
     error?: string;
 }
@@ -81,7 +83,7 @@ export function executionCheckpointRef(featureBranch: string, taskId: string): s
     return requireExecutionCheckpointRef(`${EXECUTION_CHECKPOINT_REF_PREFIX}${featureBranch}/${taskSegment}`);
 }
 
-function checkpointMessage(options: PreserveExecutionCheckpointOptions, changedPaths: string[]): string {
+function checkpointMessage(options: PreserveExecutionCheckpointOptions, preservedPaths: string[]): string {
     return [
         `chore(checkpoint): preserve partial work for ${options.execution.featureBranch}`,
         '',
@@ -92,13 +94,26 @@ function checkpointMessage(options: PreserveExecutionCheckpointOptions, changedP
         `ProPR-Checkpoint-Task: ${options.taskId}`,
         `ProPR-Checkpoint-Failure: ${options.failureClassification}`,
         `ProPR-Checkpoint-Base: ${options.execution.baseSha}`,
-        `ProPR-Checkpoint-Paths: ${changedPaths.length}`,
+        `ProPR-Checkpoint-Paths: ${preservedPaths.length}`,
     ].join('\n');
 }
 
 /**
- * Commits every worktree change (tracked, staged, and untracked non-ignored) on top
- * of the admitted base using a private index, then pushes only the checkpoint ref.
+ * Every path whose worktree content differs from the admitted base: tracked changes
+ * and deletions plus untracked non-ignored files. Names only; no content is hashed
+ * into the object store, so an out-of-scope file never becomes a blob here.
+ */
+async function listChangedPaths(worktreePath: string, env: GitEnvironment): Promise<string[]> {
+    const tracked = splitNul(await git(worktreePath, ['diff', '--name-only', '--no-renames', '-z'], env));
+    const untracked = splitNul(await git(worktreePath, ['ls-files', '--others', '--exclude-standard', '-z'], env));
+    return [...new Set([...tracked, ...untracked])].sort();
+}
+
+/**
+ * Commits the in-scope worktree changes (paths in `allowedPaths`: tracked, staged,
+ * and untracked non-ignored) on top of the admitted base using a private index, then
+ * pushes only the checkpoint ref. Out-of-scope changes are reported by name only and
+ * never enter the checkpoint tree, so nothing outside the contract is published.
  * The worktree, its index, and the feature branch are left untouched.
  */
 export async function preserveExecutionCheckpoint(options: PreserveExecutionCheckpointOptions): Promise<ExecutionCheckpointRecord> {
@@ -111,13 +126,16 @@ export async function preserveExecutionCheckpoint(options: PreserveExecutionChec
     const indexDirectory = await mkdtemp(join(tmpdir(), 'propr-checkpoint-index-'));
     try {
         const env: GitEnvironment = { ...process.env, GIT_INDEX_FILE: join(indexDirectory, 'index') };
-        await git(options.worktreePath, ['read-tree', 'HEAD'], env);
-        await git(options.worktreePath, ['add', '-A', '--', '.'], env);
+        await git(options.worktreePath, ['read-tree', execution.baseSha], env);
+        record.changedPaths = await listChangedPaths(options.worktreePath, env);
+        const allowed = new Set(execution.allowedPaths);
+        record.outOfScopePaths = record.changedPaths.filter(path => !allowed.has(path));
+        const inScopePaths = record.changedPaths.filter(path => allowed.has(path));
+        // Stage only exact in-scope paths; literal pathspecs keep a path from acting as a glob.
+        if (inScopePaths.length > 0)
+            await git(options.worktreePath, ['--literal-pathspecs', 'add', '-A', '--', ...inScopePaths], env);
         const tree = (await git(options.worktreePath, ['write-tree'], env)).trim();
         const baseTree = (await git(options.worktreePath, ['rev-parse', `${execution.baseSha}^{tree}`])).trim();
-        record.changedPaths = splitNul(await git(options.worktreePath,
-            ['diff-tree', '-r', '--name-only', '--no-renames', '-z', baseTree, tree])).sort();
-        record.outOfScopePaths = record.changedPaths.filter(path => !execution.allowedPaths.includes(path));
         if (tree === baseTree) {
             record.status = 'no_changes';
             return record;
@@ -130,7 +148,7 @@ export async function preserveExecutionCheckpoint(options: PreserveExecutionChec
             GIT_COMMITTER_NAME: options.author.name, GIT_COMMITTER_EMAIL: options.author.email,
         };
         const sha = (await git(options.worktreePath, ['commit-tree', '--no-gpg-sign', tree, '-p', execution.baseSha,
-            '-m', checkpointMessage(options, record.changedPaths)], identity)).trim();
+            '-m', checkpointMessage(options, inScopePaths)], identity)).trim();
         record.ref = ref;
         record.sha = sha;
 

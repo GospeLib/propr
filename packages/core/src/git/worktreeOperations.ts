@@ -9,11 +9,18 @@ import { redactAuthenticatedGitUrl } from './repoBranching.js';
 
 const WORKTREES_BASE_PATH = process.env.GIT_WORKTREES_BASE_PATH || "/tmp/git-processor/worktrees";
 
-interface CleanupOptions {
+export interface CleanupOptions {
     deleteBranch?: boolean;
     success?: boolean;
     retentionStrategy?: string;
     retentionHours?: number;
+    /**
+     * Unconditionally keep the worktree, its index, and its local branch — ignoring
+     * `retentionStrategy` and `success` entirely. Set this when a checkpoint push failed:
+     * the local commit is the only surviving copy of the partial work, so it must never
+     * be deleted, regardless of the configured retention policy.
+     */
+    retain?: boolean;
 }
 
 interface CleanupResult {
@@ -34,7 +41,8 @@ export async function cleanupWorktree(localRepoPath: string, worktreePath: strin
         deleteBranch = false,
         success = true,
         retentionStrategy = process.env.WORKTREE_RETENTION_STRATEGY || 'always_delete',
-        retentionHours = parseInt(process.env.WORKTREE_RETENTION_HOURS || '24', 10)
+        retentionHours = parseInt(process.env.WORKTREE_RETENTION_HOURS || '24', 10),
+        retain = false
     } = options;
 
     logger.info({
@@ -43,8 +51,16 @@ export async function cleanupWorktree(localRepoPath: string, worktreePath: strin
         deleteBranch,
         success,
         retentionStrategy,
-        retentionHours
+        retentionHours,
+        retain
     }, 'Cleaning up Git worktree...');
+
+    if (retain) {
+        logger.warn({ worktreePath, branchName },
+            'Retaining worktree unconditionally: it holds the only recoverable copy of a partial-work checkpoint that failed to push');
+        await createRetentionMarker(worktreePath, parseInt(process.env.WORKTREE_RETENTION_HOURS || '24', 10));
+        return;
+    }
 
     if (!success && retentionStrategy === 'keep_on_failure') {
         logger.info({ worktreePath, branchName, retentionStrategy }, 'Keeping worktree due to failure and retention strategy');

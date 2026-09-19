@@ -4,6 +4,8 @@ import { db } from '../db/connection.js';
 import { getAnalysisQueue } from '../queue/taskQueue.js';
 import { extractMetricsFromClaudeResult, calculateTokens, calculateCost } from './llmMetricsTokens.js';
 import { processConversationLog } from './llmMetricsConversation.js';
+import { LEGACY_TOTAL_TURNS_KEY, legacyModelTurnsKey, KNOWN_TOTAL_TURNS_KEY, KNOWN_TOTAL_TURNS_COUNT_KEY,
+    knownModelTurnsKey, knownModelTurnsCountKey } from './llmMetricsTurnKeys.js';
 import type { RedisConnectionOptions, ClaudeResult, IssueRef, RecordMetricsOptions, AggregatedMetrics, CostCheckMetrics, PersistMetrics, HighCostAlert, LLMMetricsData, TokenUsage } from './llmMetrics.types.js';
 
 export { getLLMMetricsSummary, getLLMMetricsByCorrelationId, getTotalMetrics, getModelMetrics } from './llmMetricsSummary.js';
@@ -29,12 +31,14 @@ export async function updateAggregatedMetrics(metricsRedis: InstanceType<typeof 
         incrAndAdd(`llm:metrics:model:${model}:costUsd`, costUsd, true), incrAndAdd('llm:metrics:total:executionTimeMs', executionTimeMs),
         incrAndAdd(`llm:metrics:model:${model}:executionTimeMs`, executionTimeMs)
     ];
-    // Only a proven turn count is added to the sum, and only then does its divisor advance:
-    // an unknown count must never silently pull the average down.
+    // Only a proven turn count is added to the sums, and only then does the versioned divisor
+    // advance: an unknown count must never silently pull the average down. The legacy sums
+    // keep reporting total turns; the average reads only the versioned pair.
     if (typeof numTurns === 'number') {
         ops.push(
-            incrAndAdd('llm:metrics:total:turns', numTurns), incrAndAdd(`llm:metrics:model:${model}:turns`, numTurns),
-            metricsRedis.incr('llm:metrics:total:turnsKnownCount'), metricsRedis.incr(`llm:metrics:model:${model}:turnsKnownCount`)
+            incrAndAdd(LEGACY_TOTAL_TURNS_KEY, numTurns), incrAndAdd(legacyModelTurnsKey(model), numTurns),
+            incrAndAdd(KNOWN_TOTAL_TURNS_KEY, numTurns), incrAndAdd(knownModelTurnsKey(model), numTurns),
+            metricsRedis.incr(KNOWN_TOTAL_TURNS_COUNT_KEY), metricsRedis.incr(knownModelTurnsCountKey(model))
         );
     }
     await Promise.all(ops);

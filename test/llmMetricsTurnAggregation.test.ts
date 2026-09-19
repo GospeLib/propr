@@ -93,3 +93,28 @@ test('a high-cost alert omits numTurns rather than reporting a fabricated 0', as
         delete process.env.LLM_COST_THRESHOLD_USD;
     }
 });
+
+test('legacy turn aggregates written without a known-turn count never distort the new average', async () => {
+    const redis = fakeRedis();
+    const dateKey = '2026-09-19';
+    // A deployment upgraded from the pre-versioned writer: nonzero legacy turn sums and
+    // request counts, and no known-turn count at all.
+    await redis.set('llm:metrics:total:successful', '50');
+    await redis.set('llm:metrics:total:turns', '500');
+    await redis.sadd('llm:metrics:models:used', 'claude-legacy');
+    await redis.set('llm:metrics:model:claude-legacy:successful', '50');
+    await redis.set('llm:metrics:model:claude-legacy:turns', '500');
+
+    // Before any new evidence the average is unknown (0), not the legacy sum over nothing.
+    assert.equal((await getTotalMetrics(redis)).avgTurnsPerRequest, 0);
+
+    await updateAggregatedMetrics(redis, { model: 'claude-legacy', success: true, costUsd: 1, numTurns: 10, executionTimeMs: 1000, dateKey });
+
+    // One known run of 10 turns: the average is 10, never (500 + 10) / 1 = 510.
+    const summary = await getTotalMetrics(redis);
+    assert.equal(summary.avgTurnsPerRequest, 10);
+    assert.equal(summary.totalTurns, 510);
+    const model = (await getModelMetrics(redis))['claude-legacy'];
+    assert.equal(model.avgTurnsPerRequest, 10);
+    assert.equal(model.totalTurns, 510);
+});

@@ -9,8 +9,13 @@ const SECRET = 'story-authority-test-secret-at-least-32-bytes';
 const SHA = 'a'.repeat(40);
 const EXECUTION = { baseSha: SHA, featureBranch: 'task/approved-story', targetBranch: 'stage', allowedPaths: ['docs/approved.md'] };
 const EXPECTED = { repository: 'GospeLib/main', issueNumber: 9001, target: 'stage' };
+const GRANT_MS = 60_000;
+const ATTEMPT = 1;
 const DELEGATION = { grantId: 'exact-grant', delegatePrincipalId: 'bootstrap-agent',
-  delegateSessionId: 'delegated-session', approvalPrincipalId: 'owner' };
+  delegateSessionId: 'delegated-session', approvalPrincipalId: 'owner',
+  grantIssuedAt: new Date(Date.now() - GRANT_MS).toISOString(), grantExpiresAt: new Date(Date.now() + GRANT_MS).toISOString(),
+  scope: { epicId: 'EP-story', storyId: 'EP-story-S01', repository: EXPECTED.repository, issueNumber: EXPECTED.issueNumber,
+    attemptOrdinal: ATTEMPT, targetBranch: EXECUTION.targetBranch, allowedPaths: EXECUTION.allowedPaths } };
 test('preserves exact authorized conventional publication metadata across signed admission and worker receipt', async () => {
   const taskId = 'EP-story-S01-T01';
   const artifacts = ['tasks.md', 'link.md'].map(name => {
@@ -68,7 +73,7 @@ test('ordinary worker receives only the exact signed stored contract, once', asy
     requireStoryExecution: true }), /missing-worker-receipt/);
 });
 test('signed delegated identity survives admission and cannot be substituted on a worker receipt', async () => {
-  const f = fixture({ delegatedAuthority: DELEGATION });
+  const f = fixture({ delegatedAuthority: DELEGATION, attemptOrdinal: ATTEMPT, startBy: DELEGATION.grantExpiresAt });
   const result = await consumeExecutionAdmission({ ...f, signingSecret: SECRET, expected: EXPECTED });
   assert.deepEqual((result.claims as any).delegatedAuthority, DELEGATION);
   assert.deepEqual((result.receipt as any).delegatedAuthority, DELEGATION);

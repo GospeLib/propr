@@ -19,7 +19,7 @@ import type { StoryExecutionContract } from '../packages/core/src/admission/stor
 import { requireIssueRecordedCheckpoint } from '../src/jobs/recordedExecutionCheckpoint.js';
 
 const FIXTURE_BYTES = readFileSync(new URL('./fixtures/ezer-lane-admission.json', import.meta.url));
-const FIXTURE_SHA256 = '911022c8021935e53171fb558db1c8b2377e187ea0c70d0b2c865a9d79af6ab3';
+const FIXTURE_SHA256 = 'f5e8cffabfdedb3f759a35ad405f638cc011d67501bb796ba46d58ec0bf034d6';
 const FIXTURE = JSON.parse(FIXTURE_BYTES.toString('utf8')) as { hmacSecret: string; token: string };
 const CLAIMS = JSON.parse(Buffer.from(FIXTURE.token.split('.')[0] ?? '', 'base64url').toString('utf8'));
 const STORY = 'EP-binding-fixture-S02';
@@ -64,6 +64,7 @@ describe('Ezer lane admission contract', () => {
     assert.equal(createHash('sha256').update(FIXTURE_BYTES).digest('hex'), FIXTURE_SHA256);
     assert.equal(CLAIMS.storyId, STORY);
     assert.equal(CLAIMS.unitId, LANE);
+    assert.equal(CLAIMS.attemptOrdinal, CLAIMS.delegatedAuthority.scope.attemptOrdinal);
   });
 
   test('accepts Ezer’s exact signed lane recovery and carries the lane checkpoint to the worker', async () => {
@@ -92,6 +93,43 @@ describe('Ezer lane admission contract', () => {
   ];
   for (const [name, change, reason] of refusals)
     test(`refuses ${name}`, async () => { await assert.rejects(() => consume(mutated(change)), reason); });
+
+  // Every security-defining field of a delegated lane admission, deleted one at a time.
+  const DELEGATION_FIELDS = ['grantIssuedAt', 'grantExpiresAt', 'scope'];
+  const SCOPE_FIELDS = ['epicId', 'storyId', 'repository', 'issueNumber', 'attemptOrdinal', 'targetBranch', 'allowedPaths'];
+  const deletions: Array<[string, (claims: any) => void]> = [
+    ...DELEGATION_FIELDS.map((field): [string, (claims: any) => void] => [`delegatedAuthority.${field}`, claims => { delete claims.delegatedAuthority[field]; }]),
+    ...SCOPE_FIELDS.map((field): [string, (claims: any) => void] => [`delegatedAuthority.scope.${field}`, claims => { delete claims.delegatedAuthority.scope[field]; }]),
+    ['startBy', claims => { delete claims.startBy; }],
+    ['the signed executing attempt', claims => { delete claims.attemptOrdinal; }],
+    ['the story execution', claims => { delete claims.storyExecution; }],
+  ];
+  for (const [field, change] of deletions)
+    test(`refuses a delegated lane admission without ${field}`, async () => {
+      await assert.rejects(() => consume(mutated(change)), /ezer-execution-admission-refused|STORY_EXECUTION/);
+    });
+
+  test('refuses a legacy identity-only delegation', async () => {
+    await assert.rejects(() => consume(mutated(claims => {
+      const { grantId, delegatePrincipalId, delegateSessionId, approvalPrincipalId } = claims.delegatedAuthority;
+      claims.delegatedAuthority = { grantId, delegatePrincipalId, delegateSessionId, approvalPrincipalId };
+    })), /invalid-delegation-grant-window/);
+  });
+
+  const OTHER_ATTEMPT = 999;
+  const attemptMismatches: Array<[string, (claims: any) => void, RegExp]> = [
+    ['a grant for another attempt', claims => { claims.delegatedAuthority.scope.attemptOrdinal = OTHER_ATTEMPT; }, /delegation-attempt-mismatch/],
+    ['an executing attempt the grant does not name', claims => { claims.attemptOrdinal = OTHER_ATTEMPT; }, /delegation-attempt-mismatch/],
+    ['a selected route for another attempt', claims => { claims.route = { selectionId: 's', routeId: 'claude:opus', agentId: 'a',
+      agentAlias: 'claude', provider: 'anthropic', model: 'opus', attemptOrdinal: OTHER_ATTEMPT }; }, /route-attempt-mismatch/],
+  ];
+  for (const [name, change, reason] of attemptMismatches)
+    test(`refuses ${name}`, async () => { await assert.rejects(() => consume(mutated(change)), reason); });
+
+  test('accepts a selected route for the executing attempt', async () => {
+    await assert.doesNotReject(() => consume(mutated(claims => { claims.route = { selectionId: 's', routeId: 'claude:opus', agentId: 'a',
+      agentAlias: 'claude', provider: 'anthropic', model: 'opus', attemptOrdinal: claims.attemptOrdinal }; })));
+  });
 
   test('refuses consumption once the grant has expired', async () => {
     const afterGrant = Date.parse(CLAIMS.delegatedAuthority.grantExpiresAt) + 1;

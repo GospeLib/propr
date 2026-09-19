@@ -1,11 +1,15 @@
 /**
  * The delegated authority an Ezer execution admission may be issued under, in the exact shape
- * Ezer signs (services/ezer/src/upstreams/propr-admission.ts `ExecutionDelegation`).
+ * Ezer signs (services/ezer/src/upstreams/propr-admission-delegation.ts `ExecutionDelegation`).
  *
- * The four identity fields are the original shape. The grant window, provenance references and
- * scope are optional only because admissions minted before them still parse; when present they
- * bind: the admission may be consumed only inside the grant window, and only for the exact unit,
- * repository, issue, target and paths the grant names. A lane's grant never widens to its story.
+ * Every security-defining field is required: the grant window, and a scope naming the exact unit,
+ * epic, repository, issue, attempt, target branch and paths. A delegation missing any of them is
+ * refused outright, never read as "unconstrained". There is no legacy form: Ezer mints only the
+ * complete shape, and a delegated admission always carries a story execution.
+ *
+ * The attempt the grant names is checked against the executing attempt Ezer signs outside the
+ * delegation (`attemptOrdinal`), and against the selected route's attempt when one is signed; an
+ * admission with no signed executing attempt cannot be held to its grant and is refused.
  */
 import { ADMISSION_CLOCK_SKEW_MS, refuse, requiredString, requireIsoTimestamp } from './admissionBindings.js';
 
@@ -17,8 +21,8 @@ export interface ExecutionDelegationScope {
     repository: string;
     issueNumber: number;
     attemptOrdinal: number;
-    targetBranch?: string;
-    allowedPaths?: string[];
+    targetBranch: string;
+    allowedPaths: string[];
 }
 
 export interface ExecutionDelegation {
@@ -26,36 +30,39 @@ export interface ExecutionDelegation {
     delegatePrincipalId: string;
     delegateSessionId: string;
     approvalPrincipalId: string;
-    grantIssuedAt?: string;
-    grantExpiresAt?: string;
+    grantIssuedAt: string;
+    grantExpiresAt: string;
     provenance?: string;
     approvalEventId?: string;
     proposalEventId?: string;
     authorizationReference?: string;
-    scope?: ExecutionDelegationScope;
+    scope: ExecutionDelegationScope;
 }
 
 const OPTIONAL_REFERENCES = ['provenance', 'approvalEventId', 'proposalEventId', 'authorizationReference'] as const;
 const INVALID_SCOPE = 'invalid-delegation-scope';
+const INVALID_WINDOW = 'invalid-delegation-grant-window';
+const MINIMUM_ORDINAL = 1;
 
-function positiveInteger(value: unknown): number {
-    if (!Number.isSafeInteger(value) || Number(value) < 1) refuse(INVALID_SCOPE);
+/** A positive safe integer, or refusal with `reason`. */
+export function requirePositiveOrdinal(value: unknown, reason: string): number {
+    if (!Number.isSafeInteger(value) || Number(value) < MINIMUM_ORDINAL) refuse(reason);
     return Number(value);
 }
 
 function parseScope(input: unknown): ExecutionDelegationScope {
     if (!input || typeof input !== 'object' || Array.isArray(input)) refuse(INVALID_SCOPE);
     const value = input as Record<string, unknown>;
-    if (value.allowedPaths !== undefined && (!Array.isArray(value.allowedPaths) || value.allowedPaths.length === 0 ||
-        value.allowedPaths.some(path => typeof path !== 'string' || path.trim() === ''))) refuse(INVALID_SCOPE);
+    if (!Array.isArray(value.allowedPaths) || value.allowedPaths.length === 0 ||
+        value.allowedPaths.some(path => typeof path !== 'string' || path.trim() === '')) refuse(INVALID_SCOPE);
     return {
         epicId: requiredString(value.epicId, INVALID_SCOPE),
         storyId: requiredString(value.storyId, INVALID_SCOPE),
         repository: requiredString(value.repository, INVALID_SCOPE),
-        issueNumber: positiveInteger(value.issueNumber),
-        attemptOrdinal: positiveInteger(value.attemptOrdinal),
-        ...(value.targetBranch === undefined ? {} : { targetBranch: requiredString(value.targetBranch, INVALID_SCOPE) }),
-        ...(value.allowedPaths === undefined ? {} : { allowedPaths: [...(value.allowedPaths as string[])] }),
+        issueNumber: requirePositiveOrdinal(value.issueNumber, INVALID_SCOPE),
+        attemptOrdinal: requirePositiveOrdinal(value.attemptOrdinal, INVALID_SCOPE),
+        targetBranch: requiredString(value.targetBranch, INVALID_SCOPE),
+        allowedPaths: [...(value.allowedPaths as string[])],
     };
 }
 
@@ -65,21 +72,28 @@ export function parseDelegation(input: unknown): ExecutionDelegation {
     const references: Partial<Pick<ExecutionDelegation, typeof OPTIONAL_REFERENCES[number]>> = {};
     for (const field of OPTIONAL_REFERENCES)
         if (value[field] !== undefined) references[field] = requiredString(value[field], `invalid-delegation-${field}`);
+    const grantIssuedAt = requireIsoTimestamp(value.grantIssuedAt, INVALID_WINDOW);
+    const grantExpiresAt = requireIsoTimestamp(value.grantExpiresAt, INVALID_WINDOW);
+    if (Date.parse(grantExpiresAt) <= Date.parse(grantIssuedAt)) refuse(INVALID_WINDOW);
     return {
         grantId: requiredString(value.grantId, 'missing-delegation-grant'),
         delegatePrincipalId: requiredString(value.delegatePrincipalId, 'missing-delegation-principal'),
         delegateSessionId: requiredString(value.delegateSessionId, 'missing-delegation-session'),
         approvalPrincipalId: requiredString(value.approvalPrincipalId, 'missing-delegation-approval-principal'),
-        ...(value.grantIssuedAt === undefined ? {} : { grantIssuedAt: requireIsoTimestamp(value.grantIssuedAt, 'invalid-delegation-grant-window') }),
-        ...(value.grantExpiresAt === undefined ? {} : { grantExpiresAt: requireIsoTimestamp(value.grantExpiresAt, 'invalid-delegation-grant-window') }),
+        grantIssuedAt,
+        grantExpiresAt,
         ...references,
-        ...(value.scope === undefined ? {} : { scope: parseScope(value.scope) }),
+        scope: parseScope(value.scope),
     };
 }
 
 /** The claims a delegated grant is checked against. */
 export interface DelegatedAdmission {
     delegatedAuthority?: ExecutionDelegation;
+    storyExecution?: unknown;
+    /** The executing attempt Ezer signs outside the delegation. */
+    attemptOrdinal?: number;
+    route?: { attemptOrdinal: number };
     unit: string;
     epicId: string;
     repository: string;
@@ -90,24 +104,25 @@ export interface DelegatedAdmission {
 }
 
 /**
- * A delegated admission may be consumed only while its grant authorizes a start, and only for the
- * exact work the grant names. `unit` is the admission's Ezer unit, never its parent story.
+ * A delegated admission may be consumed only while its grant authorizes a start, only for the
+ * exact work the grant names, and only for the attempt the grant names. `unit` is the admission's
+ * Ezer unit, never its parent story.
  */
 export function requireDelegationWithinAdmission(admission: DelegatedAdmission, nowMs: number): void {
     const delegation = admission.delegatedAuthority;
     if (!delegation) return;
     const { grantIssuedAt, grantExpiresAt, scope } = delegation;
-    if (grantIssuedAt !== undefined && grantExpiresAt !== undefined && Date.parse(grantExpiresAt) <= Date.parse(grantIssuedAt))
-        refuse('invalid-delegation-grant-window');
-    if (grantIssuedAt !== undefined && Date.parse(grantIssuedAt) > nowMs + ADMISSION_CLOCK_SKEW_MS) refuse('not-yet-valid');
-    if (grantExpiresAt !== undefined) {
-        if (Date.parse(grantExpiresAt) <= nowMs) refuse('expired');
-        if (admission.startBy === undefined || Date.parse(admission.startBy) > Date.parse(grantExpiresAt))
-            refuse('delegation-start-unbounded');
-    }
-    if (scope && (scope.epicId !== admission.epicId || scope.storyId !== admission.unit ||
+    if (!admission.storyExecution) refuse('delegation-requires-story-execution');
+    if (Date.parse(grantIssuedAt) > nowMs + ADMISSION_CLOCK_SKEW_MS) refuse('not-yet-valid');
+    if (Date.parse(grantExpiresAt) <= nowMs) refuse('expired');
+    if (admission.startBy === undefined || Date.parse(admission.startBy) > Date.parse(grantExpiresAt))
+        refuse('delegation-start-unbounded');
+    if (admission.attemptOrdinal === undefined) refuse('delegation-attempt-unknown');
+    if (scope.attemptOrdinal !== admission.attemptOrdinal ||
+        (admission.route !== undefined && admission.route.attemptOrdinal !== admission.attemptOrdinal))
+        refuse('delegation-attempt-mismatch');
+    if (scope.epicId !== admission.epicId || scope.storyId !== admission.unit ||
         scope.repository !== admission.repository || scope.issueNumber !== admission.issueNumber ||
-        (scope.targetBranch !== undefined && scope.targetBranch !== admission.target) ||
-        (scope.allowedPaths !== undefined && JSON.stringify(scope.allowedPaths) !== JSON.stringify(admission.scope))))
+        scope.targetBranch !== admission.target || JSON.stringify(scope.allowedPaths) !== JSON.stringify(admission.scope))
         refuse('delegation-scope-mismatch');
 }

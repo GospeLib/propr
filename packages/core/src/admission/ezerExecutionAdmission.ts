@@ -7,7 +7,7 @@ import {
     type CommentAdmissionBinding, type ExecutionRouteBinding, type StopAdmissionBinding, type TypedArtifactCorrection,
     type TypedInvestigationAdmission,
 } from './admissionBindings.js';
-import { parseDelegation, requireDelegationWithinAdmission, type ExecutionDelegation } from './executionDelegation.js';
+import { parseDelegation, requireDelegationWithinAdmission, requirePositiveOrdinal, type ExecutionDelegation } from './executionDelegation.js';
 import { admissionUnitId, requireAdmissionUnitId, requireUnitWithinAdmission } from './admissionUnit.js';
 
 export { requireTypedArtifactCorrection, requireTypedInvestigation };
@@ -44,6 +44,8 @@ export interface ExecutionAdmissionClaims {
     storyId: string;
     /** Present only for a repository lane unit `<storyId>-T<nn>`; absent means the unit is the story. */
     unitId?: string;
+    /** The executing attempt Ezer establishes from its own journal, outside any delegation. Required when delegated. */
+    attemptOrdinal?: number;
     featureThread: string;
     epicId: string;
     repository: string;
@@ -151,6 +153,7 @@ function parseClaims(encodedPayload: string): ExecutionAdmissionClaims {
         operationId: requiredString(candidate.operationId, 'missing-operation-id'),
         storyId: requiredString(candidate.storyId, 'missing-story-id'),
         ...(candidate.unitId === undefined ? {} : { unitId: requireAdmissionUnitId(candidate.unitId, String(candidate.storyId)) }),
+        ...(candidate.attemptOrdinal === undefined ? {} : { attemptOrdinal: requirePositiveOrdinal(candidate.attemptOrdinal, 'invalid-attempt-ordinal') }),
         featureThread: requiredString(candidate.featureThread, 'missing-feature-thread'),
         epicId: requiredString(candidate.epicId, 'missing-epic-id'),
         repository: requiredString(candidate.repository, 'missing-repository'),
@@ -183,6 +186,7 @@ function validateClaims(claims: ExecutionAdmissionClaims, expected: ExpectedExec
         refuse('story-execution-authority-mismatch');
     if(JSON.stringify(claims.control)!==JSON.stringify(expected.control===undefined?undefined:parseStopBinding(expected.control)))refuse('wrong-stop-control');
     if(claims.route&&(claims.control||claims.comment||claims.artifactCorrection))refuse('route-authority-mismatch');
+    if(claims.route&&claims.attemptOrdinal!==undefined&&claims.route.attemptOrdinal!==claims.attemptOrdinal)refuse('route-attempt-mismatch');
     if(claims.route&&claims.typedWork&&(claims.typedWork.provider!==claims.route.provider||claims.typedWork.model!==claims.route.model))refuse('route-typed-mismatch');
     if(claims.control && (claims.typedWork || claims.comment || claims.artifactCorrection))refuse('stop-authority-mismatch');
     requireUnitWithinAdmission(claims);
@@ -231,6 +235,7 @@ export async function consumeExecutionAdmission(input: {
         operationId: claims.operationId,
         storyId: claims.storyId,
         ...(claims.unitId === undefined ? {} : { unitId: claims.unitId }),
+        ...(claims.attemptOrdinal === undefined ? {} : { attemptOrdinal: claims.attemptOrdinal }),
         repository: claims.repository,
         issueNumber: claims.issueNumber,
         target: claims.target,

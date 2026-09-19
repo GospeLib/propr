@@ -8,6 +8,7 @@ import { fetchIssueComments } from './github.js';
 import { executeAgentAndRecordMetrics } from './agent.js';
 import { performPostProcessing } from '../issueJobPostProcessing.js';
 import { requireStoryPublicationPolicy } from '../storyPublicationPolicy.js';
+import { requireIssueRecordedCheckpoint } from '../recordedExecutionCheckpoint.js';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
@@ -20,6 +21,8 @@ export async function executeWorktreeOperations(params: ExecuteWorktreeParams): 
     const prior = await octokit.request('GET /repos/{owner}/{repo}/pulls', { owner: issueRef.repoOwner,
       repo: issueRef.repoName, state: 'all', head: `${issueRef.repoOwner}:${execution.featureBranch}` });
     if (prior.data.length) throw Error('STORY_EXECUTION_PR_EXISTS');
+    // A signed recovery checkpoint resumes only work ProPR recorded for this very issue's task.
+    await requireIssueRecordedCheckpoint(stateManager, issueRef, execution);
   }
   const worktreeInfo = await createWorktreeForIssue(localRepoPath, { issueId: issueRef.number, issueTitle: currentIssueData.data.title, owner: issueRef.repoOwner, repoName: issueRef.repoName }, { baseBranch: issueRef.baseBranch || null, octokit, modelName, execution });
   if (execution) {

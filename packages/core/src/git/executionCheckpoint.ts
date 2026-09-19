@@ -13,13 +13,12 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { requireStoryExecutionContract, type StoryExecutionContract } from '../admission/storyExecutionContract.js';
-import { EXECUTION_CHECKPOINT_REF_PREFIX, requireExecutionCheckpointRef } from '../admission/executionRecoveryContext.js';
+import { EXECUTION_CHECKPOINT_REF_PREFIX, executionCheckpointTaskSegment, requireExecutionCheckpointRef } from '../admission/executionRecoveryContext.js';
 import { redactAuthenticatedGitUrl } from './repoBranching.js';
 import { pinExecutionCheckpoint, publishPinnedExecutionCheckpoint, runCheckpointGit as git,
     type CheckpointGitEnvironment as GitEnvironment } from './executionCheckpointRetention.js';
 
 const NUL = '\0';
-const TASK_SEGMENT_UNSAFE = /[^A-Za-z0-9._-]+/g;
 const MAX_ERROR_CHARACTERS = 2_000;
 
 export { EXECUTION_CHECKPOINT_REF_PREFIX };
@@ -71,9 +70,7 @@ function splitNul(output: string): string[] {
 
 /** The exact checkpoint ref for one task attempt; distinct from every publication branch. */
 export function executionCheckpointRef(featureBranch: string, taskId: string): string {
-    const taskSegment = taskId.replace(TASK_SEGMENT_UNSAFE, '-').replace(/^[.-]+|[.-]+$/g, '');
-    if (!taskSegment) throw Error('EXECUTION_CHECKPOINT_TASK_INVALID');
-    return requireExecutionCheckpointRef(`${EXECUTION_CHECKPOINT_REF_PREFIX}${featureBranch}/${taskSegment}`);
+    return requireExecutionCheckpointRef(`${EXECUTION_CHECKPOINT_REF_PREFIX}${featureBranch}/${executionCheckpointTaskSegment(taskId)}`);
 }
 
 function checkpointMessage(options: PreserveExecutionCheckpointOptions, preservedPaths: string[]): string {

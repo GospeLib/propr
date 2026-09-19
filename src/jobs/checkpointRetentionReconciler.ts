@@ -14,12 +14,13 @@
 import type { Logger } from 'pino';
 import {
     AI_COMMIT_AUTHOR, TaskStates, cleanupWorktree, getAuthenticatedOctokit, getRepoUrl, getWorktreesBasePath, logger as coreLogger,
-    pinExecutionCheckpoint, publishPinnedExecutionCheckpoint, redactSecrets, requireExecutionRecoveryCheckpoint, snapshotWorktreeToLocalRef,
+    pinExecutionCheckpoint, publishPinnedExecutionCheckpoint, redactSecrets, snapshotWorktreeToLocalRef,
 } from '@propr/core';
 import type { IssueRef, TaskStateData, WorkerStateManager, ExecutionCheckpointRecord } from '@propr/core';
 import path from 'node:path';
 import { boundedInteger } from '../shared/boundedInteger.js';
 import type { GitHubToken } from './githubTypes.js';
+import { recordedExecutionCheckpoint } from './recordedExecutionCheckpoint.js';
 import { listRetainedCheckpoints, removeRetainedCheckpoint, saveRetainedCheckpoint, type RetainedCheckpointEntry } from './checkpointRetentionStore.js';
 
 const MINUTE_MS = 60_000;
@@ -101,16 +102,7 @@ function errorText(error: unknown): string {
 /** The checkpoint and repository as recorded on the durable failed terminal entry. */
 function readAuthority(state: TaskStateData | null): Authority | undefined {
     if (!state) return undefined;
-    const entry = [...state.history].reverse().find(item => item.state === TaskStates.FAILED && item.metadata?.executionCheckpoint);
-    const recorded = entry?.metadata?.executionCheckpoint as ExecutionCheckpointRecord | undefined;
-    let checkpoint: Authority['checkpoint'];
-    try {
-        if (recorded?.ref && recorded.sha) {
-            requireExecutionRecoveryCheckpoint({ ref: recorded.ref, sha: recorded.sha });
-            checkpoint = recorded as Authority['checkpoint'];
-        }
-    } catch { checkpoint = undefined; }
-    return { issueRef: state.issueRef, checkpoint, retainedWorktreePath: entry?.metadata?.retainedWorktreePath };
+    return { issueRef: state.issueRef, ...recordedExecutionCheckpoint(state) };
 }
 
 function removableWorktree(entry: RetainedCheckpointEntry, authority: Authority | undefined, basePath: string): boolean {

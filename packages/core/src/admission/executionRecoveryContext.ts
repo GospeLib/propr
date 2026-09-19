@@ -11,6 +11,9 @@ const CHECKPOINT_FIELDS = ['ref', 'sha'] as const;
 export const EXECUTION_CHECKPOINT_REF_PREFIX = 'refs/propr/checkpoints/';
 const CHECKPOINT_REF_TAIL = /^[A-Za-z0-9_][A-Za-z0-9_./-]*[A-Za-z0-9_]$/;
 const UNSAFE_REF_SEQUENCE = /\/\/|\.\.|\/\.|\.lock(?:\/|$)/;
+const TASK_SEGMENT_UNSAFE = /[^A-Za-z0-9._-]+/g;
+const TASK_SEGMENT_EDGES = /^[.-]+|[.-]+$/g;
+const TASK_SEGMENT_SEPARATOR = '-';
 
 /** Exact prior partial-work checkpoint a fresh attempt starts from; the ref and SHA both bind. */
 export interface ExecutionRecoveryCheckpoint {
@@ -31,6 +34,13 @@ export function requireExecutionCheckpointRef(value: unknown): string {
   const tail = value.slice(EXECUTION_CHECKPOINT_REF_PREFIX.length);
   if (!CHECKPOINT_REF_TAIL.test(tail) || UNSAFE_REF_SEQUENCE.test(tail)) throw Error('EXECUTION_CHECKPOINT_REF_INVALID');
   return value;
+}
+
+/** The ref segment naming the ProPR task whose stopped attempt a checkpoint preserves. */
+export function executionCheckpointTaskSegment(taskId: string): string {
+  const segment = taskId.replace(TASK_SEGMENT_UNSAFE, TASK_SEGMENT_SEPARATOR).replace(TASK_SEGMENT_EDGES, '');
+  if (!segment) throw Error('EXECUTION_CHECKPOINT_TASK_INVALID');
+  return segment;
 }
 
 /** Validates an exact `{ ref, sha }` checkpoint pair (no other fields). */

@@ -25,10 +25,13 @@
  *   only the code inside that branch. It does NOT protect what follows, because the branch may not
  *   have been taken. Only an acquisition in the straight-line body of the enclosing function
  *   dominates the statements after it.
- * - CLOSURES INHERIT ONLY IN ARGUMENT POSITION. A function expression passed directly as an
- *   argument runs as part of that call — `run(() => agent.analyze(...))` — so it inherits the
- *   state at that call. A function stored anywhere else may be invoked at any later time, possibly
- *   after the lease is gone, so it starts unleased.
+ * - CLOSURES ARE UNLEASED UNLESS A VERIFIED WRAPPER RUNS THEM. Argument position proves nothing:
+ *   `setTimeout(() => agent.analyze(...), 0)` is an argument too, and so is every `.then`,
+ *   every event registration and every helper that stores a callback for later. Only the wrappers
+ *   in `SYNCHRONOUS_CALLBACK_WRAPPERS` — each read and each recorded with the parameter position
+ *   it actually invokes — pass the state at the call into the callback. Everything else starts
+ *   unleased, because a deferred paid call certified as protected is the failure this ledger
+ *   exists to make impossible.
  * - AN EXPORTED FUNCTION IS ALWAYS ENTERED UNLEASED. A helper called only from leased positions is
  *   credited with that through the call graph, but only if nothing outside the analysed sources
  *   could call it. Anything exported could, so it is not credited.
@@ -44,6 +47,53 @@ const REPOSITORY_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 /** The declaration file of the interface whose methods ARE the paid provider surface. */
 const AGENT_INTERFACE_FILE = 'agents/types.ts';
 const AGENT_INTERFACE = 'Agent';
+/**
+ * Paid execution primitives that are NOT methods of `Agent`.
+ *
+ * The previous ledger counted one interface's methods and called the result the paid-provider
+ * SINK count. It was the Agent-SURFACE count. `runLightweightLLMAnalysis` falls back to
+ * `executeClaudeAnalysis` whenever the requested model has no agent alias, and that path calls
+ * `executeClaudeCode`, which builds the Docker arguments and spawns the Claude Code CLI itself —
+ * the same billable run, reached without touching `Agent` at all and with no execution lease
+ * anywhere in front of it. A ledger built around one interface cannot see it, so the sinks are
+ * enumerated as EXECUTION PRIMITIVES and this one is named here explicitly.
+ *
+ * `rawProviderSpawnSites` is what keeps this list honest: it enumerates every raw container spawn
+ * in the sources and classifies each one, so a future primitive added outside this list fails the
+ * audit instead of quietly becoming the next invisible bypass.
+ */
+const STANDALONE_PROVIDER_PRIMITIVES: readonly { module: string; name: string }[] = [
+    { module: 'claude/claudeService.ts', name: 'executeClaudeCode' },
+];
+/**
+ * Wrappers whose callback argument really does run inside the call, verified one at a time.
+ *
+ * A function expression passed as an argument was previously assumed to run synchronously, and
+ * JavaScript guarantees nothing of the kind: `setTimeout`, `queueMicrotask`, `Promise.prototype
+ * .then`, event registration and any ordinary helper that merely stores a callback all run it
+ * later, possibly long after the lease is gone. Inheriting the leased state into those would
+ * certify a deferred paid call as protected, which is the one direction an audit about money may
+ * not fail in. So argument callbacks are UNLEASED by default, and inheritance is granted only
+ * here, only to a symbol resolved to its declaration, and only at the parameter position that is
+ * actually invoked — the same function passed anywhere else in the same call is not covered.
+ *
+ * - `runWithPlannerAbortContext(draftId, runId, operation)` is `plannerAbortContext.run({…},
+ *   operation)`. `AsyncLocalStorage.prototype.run` invokes its callback synchronously, within the
+ *   call, and returns its result; the wrapper returns that promise, so the caller's `await` is an
+ *   await of the callback itself.
+ * - `runWithExecutionAbortSignal(signal, operation, attemptGeneration)` is the same shape over
+ *   `executionOwnershipContext.run({…}, operation)`.
+ */
+const SYNCHRONOUS_CALLBACK_WRAPPERS: readonly { module: string; name: string; parameterIndex: number }[] = [
+    { module: 'docker/dockerAbortController.ts', name: 'runWithPlannerAbortContext', parameterIndex: 2 },
+    { module: 'docker/dockerExecutionOwnership.ts', name: 'runWithExecutionAbortSignal', parameterIndex: 1 },
+];
+/** The raw container spawn every paid execution primitive in this repository ultimately goes through. */
+const RAW_SPAWN_MODULE = 'docker/dockerExecutor.ts';
+const RAW_SPAWN = 'executeDockerCommand';
+/** The billing wrapper a model run is measured by, and which a management command never uses. */
+const USAGE_TRACKING_MODULE = 'usageTrackingWrapper.ts';
+const USAGE_TRACKING = 'executeWithUsageTracking';
 /** The declaration file of the only call that takes the durable right to run. */
 const LEASE_MODULE = 'executionLease.ts';
 const LEASE_ACQUISITION = 'acquireExecutionLease';
@@ -150,17 +200,42 @@ export function analyzeProviderCallSites(program: ts.Program, rootDirectory: str
         if (ts.isPropertyAccessExpression(call.expression)) return call.expression.name;
         return undefined;
     };
-    /** A call whose callee symbol IS a method declared on `Agent`. Nothing else is a paid call. */
+    /**
+     * A call that reaches a PAID EXECUTION PRIMITIVE: a method declared on `Agent` that returns a
+     * model result, or one of the standalone primitives that bypass `Agent` entirely.
+     */
     const providerMethod = (call: ts.CallExpression): string | undefined => {
         const node = calleeNode(call);
         if (!node) return undefined;
         for (const declaration of declaredSymbol(node)?.getDeclarations() ?? []) {
-            if (declaration.parent !== agentInterface || !ts.isMethodSignature(declaration)) continue;
-            const returns = declaration.type?.getText(declaration.getSourceFile()) ?? '';
-            if (!MODEL_RESULT_TYPES.some(candidate => returns.includes(candidate))) continue;
-            return declaration.name.getText(declaration.getSourceFile());
+            if (declaration.parent === agentInterface && ts.isMethodSignature(declaration)) {
+                const returns = declaration.type?.getText(declaration.getSourceFile()) ?? '';
+                if (!MODEL_RESULT_TYPES.some(candidate => returns.includes(candidate))) continue;
+                return declaration.name.getText(declaration.getSourceFile());
+            }
+            const file = declaration.getSourceFile().fileName;
+            const primitive = STANDALONE_PROVIDER_PRIMITIVES.find(candidate =>
+                file.endsWith(candidate.module) && unitName(declaration) === candidate.name);
+            if (primitive) return primitive.name;
         }
         return undefined;
+    };
+    /**
+     * Whether this function expression is the callback an ALLOWLISTED wrapper invokes and awaits
+     * within its own call — the only case in which a callback inherits the state at that call.
+     */
+    const inheritsLeasedState = (functionExpression: ts.Node): boolean => {
+        const call = functionExpression.parent;
+        if (!ts.isCallExpression(call)) return false;
+        const node = calleeNode(call);
+        if (!node) return false;
+        for (const declaration of declaredSymbol(node)?.getDeclarations() ?? []) {
+            const file = declaration.getSourceFile().fileName;
+            const wrapper = SYNCHRONOUS_CALLBACK_WRAPPERS.find(candidate =>
+                file.endsWith(candidate.module) && unitName(declaration) === candidate.name);
+            if (wrapper && call.arguments[wrapper.parameterIndex] === functionExpression) return true;
+        }
+        return false;
     };
     const takesLease = (call: ts.CallExpression): boolean => {
         const node = calleeNode(call);
@@ -246,9 +321,9 @@ export function analyzeProviderCallSites(program: ts.Program, rootDirectory: str
 
             const walkExpression = (node: ts.Node, leased: boolean): boolean => {
                 if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
-                    const inArgumentPosition = ts.isCallExpression(node.parent)
-                        && node.parent.arguments.some(argument => argument === node);
-                    walkNested(node.body, inArgumentPosition && leased);
+                    // DEFERRED UNLESS PROVEN OTHERWISE. Being an argument says only that the
+                    // callee received the function, never that it ran it before returning.
+                    walkNested(node.body, inheritsLeasedState(node) && leased);
                     return leased;
                 }
                 if (ts.isConditionalExpression(node)) {
@@ -374,15 +449,146 @@ export function analyzeProviderCallSites(program: ts.Program, rootDirectory: str
     return round.sites.sort((left, right) => left.path.localeCompare(right.path) || left.line - right.line);
 }
 
-/** The repository's own ledger, built from the real `tsconfig.json` program. */
-export function repositoryProviderCallSites(): ProviderCallSite[] {
+/**
+ * ONE RAW CONTAINER SPAWN, AND WHETHER IT RUNS A MODEL.
+ *
+ * The call-site ledger above answers "is this sink protected"; this answers the question that has
+ * to be settled BEFORE that one — "is the list of sinks complete". Every paid run in this
+ * repository, whichever primitive starts it, ends at `executeDockerCommand`, so enumerating that
+ * one symbol's call sites bounds the whole surface: a new bypass cannot avoid appearing here.
+ *
+ * A model run is told apart from a management command by `executeWithUsageTracking`, the billing
+ * wrapper the token accounting is collected through. Every spawn that runs a model is inside one;
+ * `docker images`, `image inspect`, `pull`, `rmi`, a Dockerfile build and a `chown` are not.
+ */
+export interface RawProviderSpawnSite {
+    path: string;
+    line: number;
+    enclosing: string;
+    /** Inside the billing wrapper, i.e. a spawn that runs a model and is charged for it. */
+    modelRun: boolean;
+}
+
+/**
+ * Every raw container spawn in the analysed sources, classified.
+ *
+ * Deliberately exhaustive rather than filtered: a frozen list of ALL of them is what makes a new
+ * one fail the audit, whether or not this analysis would have called it a model run.
+ */
+export function analyzeRawProviderSpawns(program: ts.Program, rootDirectory: string): RawProviderSpawnSite[] {
+    const checker = program.getTypeChecker();
+    const sources = program.getSourceFiles().filter(file =>
+        !file.isDeclarationFile && !file.fileName.includes('node_modules'));
+    const declaredSymbol = (node: ts.Node): ts.Symbol | undefined => {
+        const symbol = checker.getSymbolAtLocation(node);
+        if (!symbol) return undefined;
+        return symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
+    };
+    const resolvesTo = (call: ts.CallExpression, module: string, name: string): boolean => {
+        const node = ts.isIdentifier(call.expression) ? call.expression
+            : ts.isPropertyAccessExpression(call.expression) ? call.expression.name : undefined;
+        if (!node || node.getText(node.getSourceFile()) !== name) return false;
+        return (declaredSymbol(node)?.getDeclarations() ?? [])
+            .some(declaration => declaration.getSourceFile().fileName.endsWith(module));
+    };
+    const enclosingName = (node: ts.Node): string => {
+        // Only a declaration that IS a function counts: `const result = await spawn(...)` is a
+        // variable declaration too, and reporting the call as enclosed by `result` names nothing.
+        for (let current: ts.Node | undefined = node.parent; current; current = current.parent) {
+            const named = unitName(current);
+            if (named && unitBody(current)) return named;
+        }
+        return '<module>';
+    };
+    const sites: RawProviderSpawnSite[] = [];
+    for (const file of sources) {
+        // The declaring module is not a call site of its own surface, and a test that drives the
+        // spawn directly is not production money.
+        if (file.fileName.endsWith(RAW_SPAWN_MODULE)) continue;
+        const relativePath = path.relative(rootDirectory, file.fileName) || file.fileName;
+        if (relativePath.startsWith('test/') || relativePath.includes('/test/')) continue;
+        let billed = 0;
+        const visit = (node: ts.Node): void => {
+            const isUsageTracking = ts.isCallExpression(node) && resolvesTo(node, USAGE_TRACKING_MODULE, USAGE_TRACKING);
+            if (isUsageTracking) billed += 1;
+            if (ts.isCallExpression(node) && resolvesTo(node, RAW_SPAWN_MODULE, RAW_SPAWN)) {
+                sites.push({
+                    path: relativePath,
+                    line: file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1,
+                    enclosing: enclosingName(node),
+                    modelRun: billed > 0,
+                });
+            }
+            ts.forEachChild(node, visit);
+            if (isUsageTracking) billed -= 1;
+        };
+        visit(file);
+    }
+    return sites.sort((left, right) => left.path.localeCompare(right.path) || left.line - right.line);
+}
+
+/**
+ * Every module declaring a class that IMPLEMENTS `Agent`, resolved by symbol.
+ *
+ * This is what makes the containment claim checkable rather than asserted: a raw model-running
+ * spawn is accounted for only if it lives in a module that implements the enumerated provider
+ * surface, or in one of the standalone primitives named above. Anything else is a paid path the
+ * ledger does not cover, and the audit fails on it.
+ */
+export function agentImplementationModules(program: ts.Program, rootDirectory: string): string[] {
+    const checker = program.getTypeChecker();
+    const found = new Set<string>();
+    for (const file of program.getSourceFiles()) {
+        if (file.isDeclarationFile || file.fileName.includes('node_modules')) continue;
+        for (const statement of file.statements) {
+            if (!ts.isClassDeclaration(statement)) continue;
+            for (const heritage of statement.heritageClauses ?? []) {
+                if (heritage.token !== ts.SyntaxKind.ImplementsKeyword) continue;
+                for (const type of heritage.types) {
+                    const symbol = checker.getSymbolAtLocation(type.expression);
+                    const resolved = symbol && symbol.flags & ts.SymbolFlags.Alias
+                        ? checker.getAliasedSymbol(symbol) : symbol;
+                    const implementsAgent = (resolved?.getDeclarations() ?? []).some(declaration =>
+                        ts.isInterfaceDeclaration(declaration) && declaration.name.text === AGENT_INTERFACE
+                        && declaration.getSourceFile().fileName.endsWith(AGENT_INTERFACE_FILE));
+                    if (implementsAgent) found.add(path.relative(rootDirectory, file.fileName) || file.fileName);
+                }
+            }
+        }
+    }
+    return [...found].sort();
+}
+
+/** The program the repository's own ledgers are derived from. Built once; it is not cheap. */
+let repositoryProgramCache: ts.Program | undefined;
+function repositoryProgram(): ts.Program {
+    if (repositoryProgramCache) return repositoryProgramCache;
     const configPath = path.join(REPOSITORY_ROOT, 'tsconfig.json');
     const config = ts.readConfigFile(configPath, ts.sys.readFile);
     if (config.error) throw new Error('the repository tsconfig could not be read, so nothing may be claimed about it');
     const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, REPOSITORY_ROOT);
-    const program = ts.createProgram(parsed.fileNames, { ...parsed.options, noEmit: true });
-    return analyzeProviderCallSites(program, REPOSITORY_ROOT);
+    repositoryProgramCache = ts.createProgram(parsed.fileNames, { ...parsed.options, noEmit: true });
+    return repositoryProgramCache;
 }
+
+/** The repository's own ledger, built from the real `tsconfig.json` program. */
+export function repositoryProviderCallSites(): ProviderCallSite[] {
+    return analyzeProviderCallSites(repositoryProgram(), REPOSITORY_ROOT);
+}
+
+/** The repository's own raw-spawn inventory, from the same program. */
+export function repositoryRawProviderSpawns(): RawProviderSpawnSite[] {
+    return analyzeRawProviderSpawns(repositoryProgram(), REPOSITORY_ROOT);
+}
+
+/** The repository's `Agent` implementations, from the same program. */
+export function repositoryAgentImplementationModules(): string[] {
+    return agentImplementationModules(repositoryProgram(), REPOSITORY_ROOT);
+}
+
+/** The modules the enumerated standalone primitives are declared in. */
+export const standaloneProviderPrimitiveModules: readonly string[] =
+    STANDALONE_PROVIDER_PRIMITIVES.map(primitive => primitive.module);
 
 const FIXTURE_ROOT = '/fixture';
 
@@ -401,6 +607,23 @@ export function fixtureProviderCallSites(files: Record<string, string>): Provide
         'executionLease.ts': `
             export async function acquireExecutionLease(request: { leaseKey: string }): Promise<{ outcome: string }> {
                 return { outcome: request.leaseKey };
+            }
+        `,
+        // The standalone paid primitive, so a fixture can exercise a sink that bypasses `Agent`.
+        'claude/claudeService.ts': `
+            export async function executeClaudeCode(options: { prompt: string }): Promise<{ success: boolean }> {
+                return { success: options.prompt.length > 0 };
+            }
+        `,
+        // The two allowlisted synchronous wrappers, under the module names the allowlist resolves.
+        'claude/docker/dockerAbortController.ts': `
+            export function runWithPlannerAbortContext<T>(draftId: string, runId: string, operation: () => Promise<T>): Promise<T> {
+                return operation();
+            }
+        `,
+        'claude/docker/dockerExecutionOwnership.ts': `
+            export function runWithExecutionAbortSignal<T>(signal: unknown, operation: () => Promise<T>, generation?: string): Promise<T> {
+                return operation();
             }
         `,
         ...files,

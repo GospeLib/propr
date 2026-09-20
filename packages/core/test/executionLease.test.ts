@@ -412,3 +412,90 @@ describe('recording a verified executor stop refuses every mistake the database 
         assert.deepEqual(await declare(), { recorded: false, refusal: 'the named generation no longer holds this lease' });
     });
 });
+
+/**
+ * A PROOF SAYS "THAT GENERATION STOPPED". A RENEWAL SAYS "THAT GENERATION IS ALIVE".
+ *
+ * Both were previously allowed to stand at once: a proof recorded against a lapsed term survived
+ * the holder waking up and renewing, and waited, unspent, to admit a successor beside an execution
+ * that had told the database it was still running. These assert the two statements now exclude
+ * each other, whichever arrives first.
+ */
+describe('a stop proof and the holder\'s own liveness fence each other', () => {
+    test('proof recorded, holder renews, term lapses again, successor takes over', async () => {
+        const key = leaseKey();
+        const holder = randomUUID();
+        await acquireExecutionLease(request(key, holder));
+        const lease = { leaseKey: key, generation: holder, expiresAt: '' };
+        // 1. The term lapses and an operator records that this exact generation stopped.
+        await lapseTerm(key);
+        await stopProof(key, holder);
+        // 2. The holder is not gone after all and tries to extend its term. It loses to the
+        //    proof: the renewal matches no row and reports the fence as lost, which is the
+        //    existing signal for "stop executing at once".
+        assert.equal(await renewExecutionLease(lease, TTL_MS), false,
+            'a generation declared stopped may not go on extending its own term');
+        const row = await database('task_execution_leases').where({ lease_key: key }).first();
+        assert.ok(row.expires_at <= await databaseNow(),
+            '3. so the term is still lapsed — the refused renewal changed nothing');
+        // 4. The successor is admitted on the proof, exactly once, and the holder that tried to
+        //    renew is fenced out for good.
+        const successor = randomUUID();
+        const takeover = await acquireExecutionLease(request(key, successor));
+        assert.equal(takeover.outcome, 'acquired');
+        assert.equal(takeover.outcome === 'acquired' ? takeover.takenOverFrom : undefined, holder);
+        assert.equal((await proofRow(key, holder)).consumed_at !== null, true, 'the proof is spent');
+        assert.equal(await renewExecutionLease(lease, TTL_MS), false);
+        assert.equal((await acquireExecutionLease(request(key, randomUUID()))).outcome, 'held',
+            'and one proof admits one successor, never a second');
+    });
+
+    test('a proof is refused outright while the lease says the holder is alive', async () => {
+        const key = leaseKey();
+        const holder = randomUUID();
+        await acquireExecutionLease(request(key, holder));
+        // The term has NOT lapsed. The refusal is the INSERT's own `where exists`, not a check
+        // this process did a moment earlier: asked at the instant of the write, the database says
+        // the holder still holds a live term, and the proof contradicts it.
+        assert.equal(await recordExecutorStopProof({ leaseKey: key, generation: holder,
+            proof: 'the operator believed the container was gone', recordedBy: 'operator:test' }), 'holder_is_live');
+        assert.equal(await database('task_execution_lease_stop_proofs')
+            .where({ lease_key: key, lease_generation: holder }).first(), undefined,
+            'and nothing is on file to be spent later');
+        assert.deepEqual(await recordVerifiedExecutorStop({ leaseKey: key, generation: holder,
+            confirmGeneration: holder, proof: 'the operator believed the container was gone',
+            recordedBy: 'operator:test' }),
+        { recorded: false, refusal: 'the term has not lapsed, so the executor is still reporting itself alive' });
+    });
+
+    test('a proof about a settled lease is refused by the same condition', async () => {
+        const key = leaseKey();
+        const holder = randomUUID();
+        await acquireExecutionLease(request(key, holder));
+        await lapseTerm(key);
+        await settleExecutionLease({ leaseKey: key, generation: holder, expiresAt: '' }, 'completed');
+        assert.equal(await recordExecutorStopProof({ leaseKey: key, generation: holder,
+            proof: 'the operator confirmed the container exited', recordedBy: 'operator:test' }), 'holder_is_live',
+        'a settled operation is finished; nothing about it may be admitted again');
+    });
+
+    test('a renewal with no proof against it still succeeds, so a live holder is not starved', async () => {
+        const key = leaseKey();
+        const holder = randomUUID();
+        await acquireExecutionLease(request(key, holder));
+        assert.equal(await renewExecutionLease({ leaseKey: key, generation: holder, expiresAt: '' }, TTL_MS), true);
+        const other = leaseKey();
+        const otherHolder = randomUUID();
+        await acquireExecutionLease(request(other, otherHolder));
+        await lapseTerm(other);
+        await stopProof(other, otherHolder);
+        // A proof about a DIFFERENT lease, and about a different generation of this one, fences
+        // nothing here: the condition names both columns.
+        await database('task_execution_lease_stop_proofs').insert({
+            lease_key: key, lease_generation: randomUUID(), proof: 'about some older generation',
+            recorded_by: 'operator:test', recorded_at: await databaseNow(),
+            consumed_at: null, consumed_by_generation: null,
+        });
+        assert.equal(await renewExecutionLease({ leaseKey: key, generation: holder, expiresAt: '' }, TTL_MS), true);
+    });
+});

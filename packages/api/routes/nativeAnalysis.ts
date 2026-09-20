@@ -51,6 +51,20 @@ export const NATIVE_ANALYSIS_OPERATION_UNRECONCILED = 'NATIVE_ANALYSIS_OPERATION
  * lapsed without ever reaching the provider: the first may already have been billed and must be
  * reconciled by someone who checks, the second is simply free to retry.
  */
+/**
+ * This attempt stopped BEFORE the provider was invoked, because it could not prove its right to.
+ *
+ * It is not a failure of the operation — nothing ran, nothing was charged and nothing is settled —
+ * so it is deliberately distinguished from one: a `failed` terminal record here would make the
+ * operation permanently unrunnable under its own identity, which is a worse answer than the
+ * transient fault that caused it. The lease is handed back on the way out and the same operation
+ * may be delivered again.
+ */
+export const NATIVE_ANALYSIS_PROVIDER_NOT_STARTED = 'NATIVE_ANALYSIS_PROVIDER_INVOCATION_NOT_STARTED';
+
+/** The sentinel carrying {@link NATIVE_ANALYSIS_PROVIDER_NOT_STARTED} out of the execution body. */
+class ProviderInvocationNotStarted extends Error {}
+
 export const PROVIDER_REACHED_WITHOUT_OUTCOME =
     'the provider was invoked and no terminal record of the outcome is durable, so this operation '
     + 'may already have been billed; run `npx tsx scripts/reconcile-execution-lease.ts` and record '
@@ -300,15 +314,43 @@ export async function nativeAnalysis(
         }, binding?.operationId, { requireDurableHistory: true });
         await state.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, { historyMetadata: evidence, requireDurableHistory: true });
         const result = await runWithPlannerAbortContext(taskId, attemptGeneration, () => runWithExecutionAbortSignal(signal, async () => {
-            // Set BEFORE the call, and durably too, so a crash inside the provider still leaves
-            // the fact behind. A marker written afterwards would be absent for exactly the
-            // failures it exists to describe. The durable write failing does not stop the run and
-            // does not loosen the rule: the in-process flag already holds this attempt to it, and
-            // turning a transient database fault into a permanently unrunnable operation would be
-            // a worse answer than recording the fault and carrying on.
+            // THE PROVIDER IS REACHED ONLY ON A DURABLE `true`, AND ON NOTHING ELSE.
+            //
+            // This one statement answers two different questions before any money is spent, and
+            // both of its failure answers were previously carried on from.
+            //
+            // `false` is not a bookkeeping hiccup. The UPDATE is conditional on THIS generation
+            // still holding an unsettled lease, so `false` means this attempt has been fenced out
+            // — its term lapsed, it was reconciled, and a successor was admitted. Invoking anyway
+            // starts a SECOND paid execution beside that successor, which is exactly the outcome
+            // the lease exists to prevent. It is fence loss, and fence loss stops the run.
+            //
+            // A THROW is not an absence either. The write may have committed with the answer lost
+            // on the way back, or it may never have landed, and carrying on leaves the database
+            // saying `false` while the provider runs — so a later reconciliation is told this
+            // attempt never reached the provider and that a retry is free, at the exact moment it
+            // is not. Stopping BEFORE the call is what keeps that stored `false` true.
+            //
+            // Not starting is recoverable and a duplicate charge is not, so the refusal is
+            // deliberately NOT a terminal outcome: it is a sentinel the handler below recognises,
+            // no `failed` record is written for an operation that never ran, and the lease goes
+            // back through the rule that already asks whether the provider was reached — which is
+            // still answering `false`, truthfully, because nothing was invoked.
+            let providerInvocationPermitted: boolean;
+            try { providerInvocationPermitted = await markProviderInvocationStarted(lease); }
+            catch (error) {
+                throw new ProviderInvocationNotStarted(
+                    `${NATIVE_ANALYSIS_PROVIDER_NOT_STARTED}: the provider-invocation marker could not be written`
+                    + ` (${(error as Error).message}), so the provider was not invoked`);
+            }
+            if (!providerInvocationPermitted) {
+                leaseFenceErrors.push('the execution lease was no longer this attempt\'s to mark, so the provider was not invoked');
+                throw new ProviderInvocationNotStarted(
+                    `${NATIVE_ANALYSIS_PROVIDER_NOT_STARTED}: the execution lease is held by another attempt,`
+                    + ' so the provider was not invoked');
+            }
+            // Only now — on a durable `true` this attempt owns — is it an attempt that may be billed.
             providerInvocationStarted = true;
-            try { await markProviderInvocationStarted(lease); }
-            catch (error) { leaseFenceErrors.push(`the provider-invocation marker could not be written: ${(error as Error).message}`); }
             return agent.analyze(prompt, {
                 ...options, taskId, executionType: 'plan-generation', correlationId: binding?.operationId,
                 repository: binding?.repository,
@@ -393,6 +435,17 @@ export async function nativeAnalysis(
                 ? { completionDurabilityUnverifiable: true } : {}) } };
     } catch (error) {
         await cancellationCheckpoint;
+        // An attempt that stopped before the provider was invoked has no terminal outcome to
+        // record. Writing one would settle the operation under its own durable identity and
+        // refuse every later delivery of it — a permanent loss produced by a transient fault, and
+        // by an attempt that spent nothing. So the sentinel leaves without settling anything, and
+        // the `finally` below hands the lease back under the rule it already applies.
+        if (error instanceof ProviderInvocationNotStarted) {
+            throw Object.assign(new Error(error.message, { cause: error }), {
+                execution: { ...evidence, childStopped, containerStopped, providerInvocationStarted: false,
+                    ...(leaseFenceErrors.length === 0 ? {} : { leaseFenceErrors: [...leaseFenceErrors] }) },
+            });
+        }
         let settlementError: string | undefined;
         const terminalState = signal.aborted ? TaskStates.CANCELLED : TaskStates.FAILED;
         try {

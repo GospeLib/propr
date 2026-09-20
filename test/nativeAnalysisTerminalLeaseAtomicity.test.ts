@@ -87,6 +87,17 @@ const { publishCompletedWithDurableExecutionEvidence, certifyDurableCompletion, 
     await import('../packages/core/src/utils/durableCompletionBarrier.js');
 const executionLease = await import('../packages/core/src/utils/executionLease.js');
 
+/**
+ * The one statement that decides whether the provider may be reached, with a seam for each of its
+ * two failure answers. Both were previously carried on from, and both end in a second charge.
+ */
+let providerMarker: 'real' | 'fenced-out' | 'unwritable' = 'real';
+const markProviderInvocationStarted = async (lease: { leaseKey: string; generation: string; expiresAt: string }) => {
+    if (providerMarker === 'unwritable') throw new Error('the provider-invocation marker write could not be completed');
+    if (providerMarker === 'fenced-out') return false;
+    return executionLease.markProviderInvocationStarted(lease);
+};
+
 class SyntheticAgent {}
 
 /** The history read the release rule depends on, with a seam for "the database would not answer". */
@@ -108,7 +119,7 @@ await mock.module('@propr/core', {
         durableExecutionCompletionGuard, nonExecutingCompletionGuard, isCompletionGuard, assertCompletionGuarded,
         publishCompletedWithDurableExecutionEvidence, certifyDurableCompletion, isDurableCompletionAbsent,
         COMPLETION_PERSISTENCE_FAILED_SUFFIX,
-        ...executionLease,
+        ...executionLease, markProviderInvocationStarted,
         COMPLETION_DURABILITY_UNVERIFIABLE, CompletionDurabilityUnverifiableError, isCompletionDurabilityUnverifiable,
         buildPlannerAbortSignalKey: (draftId: string) => `planner:abort:${draftId}`,
         buildPlannerAbortRedisOptions: () => ({}),
@@ -184,9 +195,10 @@ before(async () => {
 beforeEach(() => {
     redisStore.clear();
     historyReadFailure = undefined;
+    providerMarker = 'real';
     operationId = `admitted-${randomUUID()}`;
 });
-afterEach(() => { historyReadFailure = undefined; });
+afterEach(() => { historyReadFailure = undefined; providerMarker = 'real'; });
 after(async () => { await database.destroy(); await rm(databaseDirectory, { recursive: true, force: true }); });
 
 /**
@@ -365,5 +377,63 @@ describe('a terminal native-analysis outcome and its execution lease settle toge
         const reconciled = await runAnalysis(agentThat(() => { analyses++; }), new WorkerStateManager());
         assert.equal((reconciled.execution as { terminalRecorded: boolean }).terminalRecorded, true);
         assert.equal(analyses, 1, 'the refused attempt paid nothing; only the admitted one ran');
+    });
+});
+
+/**
+ * THE PROVIDER IS REACHED ONLY ON A DURABLE `true`.
+ *
+ * The marker was written BEFORE the call, which is right, and then both of its failure answers
+ * were ignored, which is not. `false` is the conditional UPDATE saying this generation no longer
+ * holds the lease — a paused holder that lapsed, was reconciled and was replaced reads exactly
+ * that, and invoking anyway runs a second paid execution beside its own successor. A rejection is
+ * an UNKNOWN, and carrying on leaves the row saying `false` while the provider runs, so a later
+ * reconciliation is told the provider was never reached and that a retry is free.
+ *
+ * Both now stop the run before `analyze`, and neither writes a terminal record: an operation that
+ * never ran must not be made permanently unrunnable by the fault that stopped it.
+ */
+describe('a provider invocation needs a durable, still-owned right to run', () => {
+    const terminalRowsForThisOperation = async () => {
+        const taskId = `native-analysis-${createHash('sha256').update(operationId).digest('hex').slice(0, 32)}`;
+        return database('task_history').where({ task_id: taskId })
+            .whereIn('state', [TASK_STATES.COMPLETED, TASK_STATES.FAILED, TASK_STATES.CANCELLED]);
+    };
+
+    test('a marker that reports the lease is no longer this attempt\'s never reaches the provider', async () => {
+        let analyses = 0;
+        providerMarker = 'fenced-out';
+        await assert.rejects(() => runAnalysis(agentThat(() => { analyses++; }), new WorkerStateManager()),
+            /NATIVE_ANALYSIS_PROVIDER_INVOCATION_NOT_STARTED/,
+            'the fence is lost, so this attempt stops instead of running beside its successor');
+        assert.equal(analyses, 0, 'the provider was never invoked, which is the whole point');
+        assert.deepEqual(await terminalRowsForThisOperation(), [],
+            'and nothing terminal was recorded for an operation that never ran');
+    });
+
+    test('a marker write that will not land never reaches the provider either', async () => {
+        let analyses = 0;
+        providerMarker = 'unwritable';
+        await assert.rejects(() => runAnalysis(agentThat(() => { analyses++; }), new WorkerStateManager()),
+            /NATIVE_ANALYSIS_PROVIDER_INVOCATION_NOT_STARTED/,
+            '"the database would not answer" is never permission to spend');
+        assert.equal(analyses, 0);
+        assert.deepEqual(await terminalRowsForThisOperation(), []);
+    });
+
+    test('stopping there is recoverable: the lease goes back and the operation runs once', async () => {
+        let analyses = 0;
+        providerMarker = 'unwritable';
+        await assert.rejects(() => runAnalysis(agentThat(() => { analyses++; }), new WorkerStateManager()),
+            /NATIVE_ANALYSIS_PROVIDER_INVOCATION_NOT_STARTED/);
+        // Nothing was invoked, so the row's `provider_invocation_started` is still TRUE to the
+        // facts, and the DELETE's own condition — not this process's opinion — hands the lease
+        // back. A transient fault costs a delivery, not the operation.
+        assert.equal(await leaseRow(), undefined, 'the right to run is available again');
+        providerMarker = 'real';
+        const retried = await runAnalysis(agentThat(() => { analyses++; }), new WorkerStateManager());
+        assert.equal((retried.execution as { terminalRecorded: boolean }).terminalRecorded, true);
+        assert.equal(analyses, 1, 'and that retry is the FIRST paid execution, not a second one');
+        assert.equal((await leaseRow()).settled_state, TASK_STATES.COMPLETED);
     });
 });

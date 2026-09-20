@@ -12,6 +12,7 @@ import {
 } from '@propr/core';
 import type { ClaudeCodeResponse, JobResult, WorkerStateManager, WorktreeInfo } from '@propr/core';
 import { createContainerIdCallbackForPR, createSessionIdCallbackForPR } from './prCommentJobHelpers.js';
+import { recordFinalClaudeExecutionResult } from './claudeExecutionResult.js';
 import { AI_COMMIT_AUTHOR } from './commitAuthor.js';
 import { agentResultToClaudeResponse, toClaudeResult } from './prCommentJobUtils.js';
 import {
@@ -161,9 +162,14 @@ export async function handleMergeWithAgent(options: {
     const claudeResult: ClaudeCodeResponse = agentResultToClaudeResponse(agentResult);
     await recordLLMMetrics(toClaudeResult(claudeResult), { number: pullRequestNumber, repoOwner, repoName }, { jobType: 'merge_conflict', correlationId, taskId });
     await createLogFiles(claudeResult as unknown, { number: pullRequestNumber, repoOwner, repoName });
+    // Supersede the start-time provisional record before appending the completed entry, so the
+    // history entry that describes this execution carries its real outcome.
+    const executionSummary = await recordFinalClaudeExecutionResult(stateManager, taskId,
+        { success: claudeResult.success, sessionId: claudeResult.sessionId, conversationId: claudeResult.conversationId, executionTime: claudeResult.executionTime },
+        correlatedLogger);
     await stateManager.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, {
         reason: `${agent.config.type} agent execution completed for merge conflict resolution`,
-        claudeResult: { success: claudeResult.success, sessionId: claudeResult.sessionId, conversationId: claudeResult.conversationId, executionTime: claudeResult.executionTime },
+        claudeResult: executionSummary,
         historyMetadata: { sessionId: claudeResult.sessionId, conversationId: claudeResult.conversationId, model: claudeResult.model },
     });
     if (!claudeResult.success) {

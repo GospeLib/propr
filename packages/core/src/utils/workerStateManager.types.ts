@@ -33,8 +33,21 @@ export interface LastError {
     timestamp: string;
 }
 
+/**
+ * Which record of an execution a `ClaudeResultSummary` is.
+ *
+ * `provisional` is written the moment the agent starts, before any outcome exists: its
+ * `success: false` is the absence of a result, never a failure. `final` is written once the
+ * execution has returned and carries the real outcome. A reader holding only the task history
+ * must treat a genuine failure as `final` + `success: false`; a `provisional` record that is
+ * later superseded by a `final` one is not a failure.
+ */
+export type ClaudeResultPhase = 'provisional' | 'final';
+
 export interface ClaudeResultSummary {
     success: boolean;
+    /** Provisional start-time placeholder vs. the execution's real outcome. Absent on legacy records. */
+    resultPhase?: ClaudeResultPhase;
     sessionId?: string | null;
     executionTime?: number;
     conversationId?: string | null;

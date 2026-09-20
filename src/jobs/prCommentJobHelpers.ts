@@ -9,6 +9,7 @@ import { filterCommentByAuthor } from '@propr/core';
 import type { UnprocessedComment, CommentJobData } from '@propr/core';
 import { isReasoningLevelLabel, parseReasoningLevelFromLabels } from '@propr/shared';
 import type { ReasoningLevel, ReasoningLevelLabel } from '@propr/shared';
+import { provisionalClaudeExecutionResult } from './claudeExecutionResult.js';
 
 interface ValidationComment {
     id: number;
@@ -354,7 +355,7 @@ export function createSessionIdCallbackForPR(
                 // Transition to claude_execution state
                 await stateManager.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, {
                     reason: 'Claude execution started',
-                    claudeResult: { success: false, sessionId, conversationId },
+                    claudeResult: provisionalClaudeExecutionResult(sessionId, conversationId),
                     historyMetadata: { sessionId, conversationId, model: llm, ...options.verifiedExecutionCorrelation }
                 });
             }

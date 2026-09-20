@@ -22,6 +22,7 @@ import { redisClient } from './config.js';
 import { buildAdmittedWorkerEnvironment } from '../ezerAdmittedWorkerEnvironment.js';
 import { verifyConfiguredEzerAdmission } from '../ezerExecutionAdmission.js';
 import { buildAgentOutcome } from '../executionOutcome.js';
+import { recordFinalClaudeExecutionResult } from '../claudeExecutionResult.js';
 
 export function toClaudeResult(response: AgentExecutionResult): ClaudeResult {
   return {
@@ -240,9 +241,16 @@ export async function executeAgentAndRecordMetrics(executionParams: ExecutionPar
   const claudeResult = agentResultToClaudeResponse(agentResult);
 
 
+  // Supersede the start-time provisional record before appending the completed entry, so the
+  // history entry that describes this execution carries its real outcome.
+  const executionSummary = await recordFinalClaudeExecutionResult(
+    stateManager, taskId,
+    buildExecutionStateSummary(claudeResult, Boolean(context.storyExecution)),
+    correlatedLogger,
+  );
   await stateManager.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, {
     reason: `${agent.config.type} agent execution completed`,
-    claudeResult: buildExecutionStateSummary(claudeResult, Boolean(context.storyExecution)),
+    claudeResult: executionSummary,
     historyMetadata: {
       sessionId: claudeResult.sessionId,
       conversationId: claudeResult.conversationId,

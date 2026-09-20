@@ -4,6 +4,7 @@ import { TaskStates } from '@propr/core';
 import fs from 'fs-extra';
 import type { Redis } from 'ioredis';
 import type { IssueJobData } from '@propr/core';
+import { provisionalClaudeExecutionResult } from './claudeExecutionResult.js';
 
 export interface SessionIdCallback {
     (sessionId: string, conversationId?: string): Promise<void>;
@@ -61,7 +62,7 @@ export function createSessionIdCallback(
                 // Transition to claude_execution state
                 await stateManager.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, {
                     reason: 'Claude execution started',
-                    claudeResult: { success: false, sessionId, conversationId },
+                    claudeResult: provisionalClaudeExecutionResult(sessionId, conversationId),
                     historyMetadata: { sessionId, conversationId, model: modelName, ...verifiedExecutionCorrelation }
                 });
             }

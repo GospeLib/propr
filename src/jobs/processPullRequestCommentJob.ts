@@ -29,6 +29,7 @@ import { pickUpPendingCommentsWithClaim, applyPendingCommentCommandContext } fro
 import { executeReviewProcessing } from './prCommentReviewJob.js';
 import { generateSummaryTitle, resolveAndExecuteAgent, resolvePRCommentModelName } from './prCommentAgentUtils.js';
 import { isReviewComment } from './reviewCommentFormatter.js';
+import { recordFinalClaudeExecutionResult } from './claudeExecutionResult.js';
 import { hasAuthorizedFixFeedback, prepareFixReviewFeedback } from './reviewFindingSelector.js';
 import { retainOriginalScope } from './ultrafixOrchestrationService.js';
 import {
@@ -399,9 +400,14 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
 
     await recordLLMMetrics(toClaudeResult(state.claudeResult), { number: pullRequestNumber, repoOwner, repoName }, { jobType: 'pr_comment', correlationId, taskId });
     await createLogFiles(state.claudeResult as unknown, { number: pullRequestNumber, repoOwner, repoName });
+    // Supersede the start-time provisional record before appending the completed entry, so the
+    // history entry that describes this execution carries its real outcome.
+    const executionSummary = await recordFinalClaudeExecutionResult(stateManager, taskId,
+        { success: state.claudeResult.success, sessionId: state.claudeResult.sessionId, conversationId: state.claudeResult.conversationId, executionTime: state.claudeResult.executionTime },
+        correlatedLogger);
     await stateManager.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, {
         reason: `${agentType} agent execution completed`,
-        claudeResult: { success: state.claudeResult.success, sessionId: state.claudeResult.sessionId, conversationId: state.claudeResult.conversationId, executionTime: state.claudeResult.executionTime },
+        claudeResult: executionSummary,
         historyMetadata: {
             sessionId: state.claudeResult.sessionId,
             conversationId: state.claudeResult.conversationId,

@@ -14,7 +14,7 @@ export { WorkerStateManager, getStateManager, closeStateManager, TaskStates } fr
 export { taskStateExpectation, MAX_ATOMIC_UPDATE_ATTEMPTS, waitForAtomicUpdateRetry } from './utils/workerStateTransition.js';
 export { hashTaskAttemptToken } from './utils/taskAttemptGeneration.js';
 export { getEventPublisher, closeEventPublisher, EventPublisher } from './utils/eventPublisher.js';
-export type { TaskState, IssueRef, HistoryEntry, LastError, ClaudeResultSummary, PRResult, TaskStateData, TaskStateExpectation, TaskStatePublicationResult, TaskStateUpdateResult, UpdateMetadata, TaskResult, ResumableTaskInfo, NonTerminalTaskScanResult, WorkerStateManagerOptions } from './utils/workerStateManager.types.js';
+export type { TaskState, IssueRef, HistoryEntry, LastError, ClaudeResultSummary, ClaudeResultPhase, PRResult, TaskStateData, TaskStateExpectation, TaskStatePublicationResult, TaskStateUpdateResult, UpdateMetadata, TaskResult, ResumableTaskInfo, NonTerminalTaskScanResult, WorkerStateManagerOptions } from './utils/workerStateManager.types.js';
 export { validatePRCreation, generateEnhancedClaudePrompt, validateRepositoryInfo } from './utils/prValidation.js';
 export type { PRValidationResult, PRInfo, ValidatePRCreationOptions, CurrentIssueData, GenerateEnhancedClaudePromptOptions, RepoData, RepoValidationResult } from './utils/prValidation.js';
 export { IdempotentGitHubOps, IdempotentGitOps } from './utils/idempotentOps.js';

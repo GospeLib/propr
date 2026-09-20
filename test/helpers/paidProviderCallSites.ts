@@ -450,32 +450,75 @@ export function analyzeProviderCallSites(program: ts.Program, rootDirectory: str
 }
 
 /**
- * ONE RAW CONTAINER SPAWN, AND WHETHER IT RUNS A MODEL.
+ * EVERY PROCESS CREATION IN THE PRODUCTION SOURCES, AND WHETHER IT RUNS A MODEL.
  *
  * The call-site ledger above answers "is this sink protected"; this answers the question that has
- * to be settled BEFORE that one — "is the list of sinks complete". Every paid run in this
- * repository, whichever primitive starts it, ends at `executeDockerCommand`, so enumerating that
- * one symbol's call sites bounds the whole surface: a new bypass cannot avoid appearing here.
+ * to be settled BEFORE that one — "is the list of sinks complete".
+ *
+ * WHAT THIS REPLACES, AND WHY. The previous inventory asked only for calls whose callee symbol
+ * resolved directly to `executeDockerCommand`, and it SKIPPED that symbol's own declaring module.
+ * It therefore advertised a fail-closed containment guarantee it did not deliver: three ways of
+ * starting a paid process left the frozen list completely unchanged.
+ *
+ * - AN ALIAS. `const run = executeDockerCommand; run(...)` — the callee identifier is `run`, the
+ *   name test rejected it, and nothing was recorded.
+ * - A DIRECT PROCESS CREATION. `spawn('docker', ['run', …])` from `node:child_process` reaches the
+ *   same container without the repository's own wrapper being involved at all.
+ * - A NEW PRIMITIVE INSIDE THE EXECUTOR MODULE. Anything added beside `executeDockerCommand` in
+ *   `dockerExecutor.ts` was invisible, because that whole file was skipped.
+ *
+ * So the unit here is PROCESS CREATION ITSELF, not one wrapper's name. A site is recorded when an
+ * identifier RESOLVES, through import aliases and through local `const` aliases, to either
+ * `executeDockerCommand` or one of Node's process-creation APIs — and it is recorded for a VALUE
+ * REFERENCE, not only for a direct call, so `promisify(execFile)` and `const run = spawn` are
+ * inventoried where they are written rather than wherever the resulting function is later invoked.
+ * No module is skipped, including the executor's own.
  *
  * A model run is told apart from a management command by `executeWithUsageTracking`, the billing
  * wrapper the token accounting is collected through. Every spawn that runs a model is inside one;
- * `docker images`, `image inspect`, `pull`, `rmi`, a Dockerfile build and a `chown` are not.
+ * `docker images`, `image inspect`, `pull`, `rmi`, a Dockerfile build, a `chown`, a `git` call and
+ * a `gh` call are not.
+ *
+ * WHAT IS PROVEN AND WHAT IS NOT. This is a static inventory over the sources in the repository's
+ * own `tsconfig.json` program. It proves that no NEW syntactic process creation can be added to
+ * those sources without this list changing. It does NOT prove the absence of a paid path reached
+ * dynamically — `eval`, a string-indexed property, a native addon, an HTTP request to a provider
+ * API, or a dependency spawning on the repository's behalf. Those are outside what a syntactic
+ * analysis can see, and the claim is narrowed to match.
  */
-export interface RawProviderSpawnSite {
+export interface ProcessCreationSite {
     path: string;
     line: number;
     enclosing: string;
-    /** Inside the billing wrapper, i.e. a spawn that runs a model and is charged for it. */
+    /** `executeDockerCommand`, or `child_process.<api>` for a direct process creation. */
+    primitive: string;
+    /** Inside the billing wrapper, i.e. a process creation that runs a model and is charged for it. */
     modelRun: boolean;
 }
 
+/** Node's process-creation surface. Every one of these starts an OS process that could run a model. */
+const PROCESS_CREATION_APIS: readonly string[] =
+    ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork'];
+/** Where the type checker says those APIs are declared. */
+const NODE_CHILD_PROCESS_DECLARATION = 'child_process.d.ts';
+/** How the same module is named when it is destructured out of a dynamic import or a `require`. */
+const CHILD_PROCESS_SPECIFIERS: readonly string[] = ['child_process', 'node:child_process'];
 /**
- * Every raw container spawn in the analysed sources, classified.
+ * The module every paid run in this repository is expected to funnel through.
+ *
+ * It is accounted for by name rather than by implementing `Agent`, because it is the shared bottom
+ * of BOTH kinds of run — a model execution and a `docker images` — and so it is the one place a
+ * process creation is expected to live without belonging to a single provider.
+ */
+export const providerProcessBoundaryModule = RAW_SPAWN_MODULE;
+
+/**
+ * Every process creation in the analysed production sources, classified.
  *
  * Deliberately exhaustive rather than filtered: a frozen list of ALL of them is what makes a new
  * one fail the audit, whether or not this analysis would have called it a model run.
  */
-export function analyzeRawProviderSpawns(program: ts.Program, rootDirectory: string): RawProviderSpawnSite[] {
+export function analyzeProcessCreationSites(program: ts.Program, rootDirectory: string): ProcessCreationSite[] {
     const checker = program.getTypeChecker();
     const sources = program.getSourceFiles().filter(file =>
         !file.isDeclarationFile && !file.fileName.includes('node_modules'));
@@ -483,6 +526,79 @@ export function analyzeRawProviderSpawns(program: ts.Program, rootDirectory: str
         const symbol = checker.getSymbolAtLocation(node);
         if (!symbol) return undefined;
         return symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
+    };
+    /**
+     * A name being BOUND, or a name being used as a TYPE — neither creates a process.
+     *
+     * `executor: typeof executeDockerCommand = executeDockerCommand` mentions the primitive twice
+     * and starts nothing with the first one; counting the type query would put the same injection
+     * point in the ledger two and three times over, which makes the frozen list unreadable and its
+     * diffs meaningless. The DEFAULT VALUE is kept, because that reference is how the primitive is
+     * actually handed to the function.
+     */
+    const bindingSite = (node: ts.Node): boolean =>
+        (ts.isImportSpecifier(node.parent) && node.parent.name === node)
+        || ts.isImportClause(node.parent) || ts.isNamespaceImport(node.parent)
+        || (ts.isExportSpecifier(node.parent) && node.parent.name === node)
+        || (ts.isBindingElement(node.parent) && node.parent.name === node)
+        || (ts.isVariableDeclaration(node.parent) && node.parent.name === node)
+        || (ts.isParameter(node.parent) && node.parent.name === node)
+        || ((ts.isFunctionDeclaration(node.parent) || ts.isMethodDeclaration(node.parent)
+            || ts.isClassDeclaration(node.parent)) && node.parent.name === node)
+        || (ts.isPropertyAccessExpression(node.parent) && node.parent.name !== node)
+        || inTypePosition(node);
+    const inTypePosition = (node: ts.Node): boolean => {
+        for (let current: ts.Node | undefined = node.parent; current && !ts.isSourceFile(current); current = current.parent) {
+            if (ts.isTypeNode(current)) return true;
+        }
+        return false;
+    };
+    /** Whether this destructuring came out of `child_process`, however it was imported. */
+    const destructuredFromChildProcess = (declaration: ts.BindingElement): boolean => {
+        let current: ts.Node = declaration;
+        while (current.parent && !ts.isVariableDeclaration(current.parent)) current = current.parent;
+        const variable = current.parent;
+        if (!variable || !ts.isVariableDeclaration(variable) || !variable.initializer) return false;
+        const initializer = ts.isAwaitExpression(variable.initializer)
+            ? variable.initializer.expression : variable.initializer;
+        if (!ts.isCallExpression(initializer)) return false;
+        const isImport = initializer.expression.kind === ts.SyntaxKind.ImportKeyword
+            || (ts.isIdentifier(initializer.expression) && initializer.expression.text === 'require');
+        const specifier = initializer.arguments[0];
+        return isImport && specifier !== undefined && ts.isStringLiteralLike(specifier)
+            && CHILD_PROCESS_SPECIFIERS.includes(specifier.text);
+    };
+    /**
+     * What this identifier ultimately names, following import aliases AND local `const` aliases.
+     *
+     * The alias chase is the whole point: `const run = executeDockerCommand` produces a symbol
+     * whose name is `run` and whose declaration is an ordinary variable, which a name test and a
+     * declaring-file test both miss. Following the initializer one hop at a time — with a `seen`
+     * guard, because `const a = b; const b = a` is syntactically writable — resolves it to the
+     * thing it is a name for.
+     */
+    const primitiveOf = (node: ts.Node, seen = new Set<ts.Symbol>()): string | undefined => {
+        const symbol = declaredSymbol(node);
+        if (!symbol || seen.has(symbol)) return undefined;
+        seen.add(symbol);
+        const name = symbol.getName();
+        for (const declaration of symbol.getDeclarations() ?? []) {
+            const file = declaration.getSourceFile().fileName;
+            if (file.endsWith(RAW_SPAWN_MODULE) && unitName(declaration) === RAW_SPAWN) return RAW_SPAWN;
+            if (!PROCESS_CREATION_APIS.includes(name)) { /* fall through to the alias chase */ }
+            else if (file.endsWith(NODE_CHILD_PROCESS_DECLARATION)) return `child_process.${name}`;
+            else if (ts.isBindingElement(declaration) && destructuredFromChildProcess(declaration)) {
+                return `child_process.${name}`;
+            }
+            if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
+                const target = ts.isIdentifier(declaration.initializer) ? declaration.initializer
+                    : ts.isPropertyAccessExpression(declaration.initializer) ? declaration.initializer.name
+                        : undefined;
+                const through = target && primitiveOf(target, seen);
+                if (through) return through;
+            }
+        }
+        return undefined;
     };
     const resolvesTo = (call: ts.CallExpression, module: string, name: string): boolean => {
         const node = ts.isIdentifier(call.expression) ? call.expression
@@ -500,31 +616,35 @@ export function analyzeRawProviderSpawns(program: ts.Program, rootDirectory: str
         }
         return '<module>';
     };
-    const sites: RawProviderSpawnSite[] = [];
+    const sites: ProcessCreationSite[] = [];
     for (const file of sources) {
-        // The declaring module is not a call site of its own surface, and a test that drives the
-        // spawn directly is not production money.
-        if (file.fileName.endsWith(RAW_SPAWN_MODULE)) continue;
         const relativePath = path.relative(rootDirectory, file.fileName) || file.fileName;
+        // A test that drives a spawn directly is not production money. Nothing else is skipped —
+        // in particular the executor module is inventoried like any other.
         if (relativePath.startsWith('test/') || relativePath.includes('/test/')) continue;
         let billed = 0;
         const visit = (node: ts.Node): void => {
             const isUsageTracking = ts.isCallExpression(node) && resolvesTo(node, USAGE_TRACKING_MODULE, USAGE_TRACKING);
             if (isUsageTracking) billed += 1;
-            if (ts.isCallExpression(node) && resolvesTo(node, RAW_SPAWN_MODULE, RAW_SPAWN)) {
-                sites.push({
-                    path: relativePath,
-                    line: file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1,
-                    enclosing: enclosingName(node),
-                    modelRun: billed > 0,
-                });
+            if (ts.isIdentifier(node) && !bindingSite(node)) {
+                const primitive = primitiveOf(node);
+                if (primitive) {
+                    sites.push({
+                        path: relativePath,
+                        line: file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1,
+                        enclosing: enclosingName(node),
+                        primitive,
+                        modelRun: billed > 0,
+                    });
+                }
             }
             ts.forEachChild(node, visit);
             if (isUsageTracking) billed -= 1;
         };
         visit(file);
     }
-    return sites.sort((left, right) => left.path.localeCompare(right.path) || left.line - right.line);
+    return sites.sort((left, right) => left.path.localeCompare(right.path) || left.line - right.line
+        || left.primitive.localeCompare(right.primitive));
 }
 
 /**
@@ -576,9 +696,9 @@ export function repositoryProviderCallSites(): ProviderCallSite[] {
     return analyzeProviderCallSites(repositoryProgram(), REPOSITORY_ROOT);
 }
 
-/** The repository's own raw-spawn inventory, from the same program. */
-export function repositoryRawProviderSpawns(): RawProviderSpawnSite[] {
-    return analyzeRawProviderSpawns(repositoryProgram(), REPOSITORY_ROOT);
+/** The repository's own process-creation inventory, from the same program. */
+export function repositoryProcessCreationSites(): ProcessCreationSite[] {
+    return analyzeProcessCreationSites(repositoryProgram(), REPOSITORY_ROOT);
 }
 
 /** The repository's `Agent` implementations, from the same program. */
@@ -599,6 +719,23 @@ const FIXTURE_ROOT = '/fixture';
  * the repository does not contain a convenient pair. These fixtures do, by construction.
  */
 export function fixtureProviderCallSites(files: Record<string, string>): ProviderCallSite[] {
+    return analyzeProviderCallSites(fixtureProgram(files), FIXTURE_ROOT);
+}
+
+/**
+ * The containment rule, applied to sources written to defeat it.
+ *
+ * The repository contains no alias binding, no direct `child_process` creation on a paid path and
+ * no second primitive inside the executor module — which is exactly why the previous inventory
+ * could advertise a guarantee it did not have and still come up green. These fixtures write each
+ * bypass by hand, so the rule is shown REJECTING it rather than merely not encountering it.
+ */
+export function fixtureProcessCreationSites(files: Record<string, string>): ProcessCreationSite[] {
+    return analyzeProcessCreationSites(fixtureProgram(files), FIXTURE_ROOT);
+}
+
+/** The fixture program both analyses are pointed at, with the modules they resolve against. */
+function fixtureProgram(files: Record<string, string>): ts.Program {
     const all: Record<string, string> = {
         'agents/types.ts': `
             export interface AnalysisResult { success: boolean }
@@ -626,6 +763,19 @@ export function fixtureProviderCallSites(files: Record<string, string>): Provide
                 return operation();
             }
         `,
+        // The process-creation boundary and the billing wrapper, under the module names the
+        // containment inventory resolves. A fixture may add its own code to the executor module
+        // by supplying this path itself.
+        'claude/docker/dockerExecutor.ts': `
+            export async function executeDockerCommand(args: string[]): Promise<{ code: number }> {
+                return { code: args.length };
+            }
+        `,
+        'usageTrackingWrapper.ts': `
+            export async function executeWithUsageTracking<T>(label: string, operation: () => Promise<T>): Promise<T> {
+                return operation();
+            }
+        `,
         ...files,
     };
     const sources = new Map(Object.entries(all).map(([name, text]) => [
@@ -649,12 +799,11 @@ export function fixtureProviderCallSites(files: Record<string, string>): Provide
     }
     host.directoryExists = directory => directories.has(directory) || ts.sys.directoryExists(directory);
     host.realpath = fileName => fileName;
-    const program = ts.createProgram([...sources.keys()], {
+    return ts.createProgram([...sources.keys()], {
         target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext,
         moduleResolution: ts.ModuleResolutionKind.Bundler, strict: true, noEmit: true,
         allowImportingTsExtensions: true, skipLibCheck: true,
     }, host);
-    return analyzeProviderCallSites(program, FIXTURE_ROOT);
 }
 
 /** Every paid provider call site nothing excludes from running twice. */

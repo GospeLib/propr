@@ -450,6 +450,53 @@ describe('a stop proof and the holder\'s own liveness fence each other', () => {
             'and one proof admits one successor, never a second');
     });
 
+    test('a stop-fenced generation may not mark the provider, so only the successor can be billed', async () => {
+        const key = leaseKey();
+        const fenced = randomUUID();
+        await acquireExecutionLease(request(key, fenced));
+        const fencedLease = { leaseKey: key, generation: fenced, expiresAt: '' };
+        // 1. The term lapses and an operator records that THIS generation stopped. Nothing has
+        //    taken the lease over yet, so the row still names this generation and is still
+        //    unsettled — which is all the provider-start gate used to ask about.
+        await lapseTerm(key);
+        await stopProof(key, fenced);
+        // 2. The fenced generation asks for the right to reach the provider. It is refused by the
+        //    proof, exactly as its renewal is: a generation somebody has recorded as stopped may
+        //    not walk into `agent.analyze` and wait there while the successor below is admitted.
+        assert.equal(await markProviderInvocationStarted(fencedLease), false,
+            'an unconsumed proof that this generation stopped is a refusal to reach the provider');
+        const beforeTakeover = await database('task_execution_leases').where({ lease_key: key }).first();
+        assert.equal(Boolean(beforeTakeover.provider_invocation_started), false,
+            'and the row does not claim it reached the provider, so reconciliation is told the truth');
+        // 3. The successor is admitted on the proof — the order that makes the two executions
+        //    concurrent: the fenced attempt would already be inside the provider call by now.
+        const successor = randomUUID();
+        const takeover = await acquireExecutionLease(request(key, successor));
+        assert.equal(takeover.outcome, 'acquired');
+        assert.equal(takeover.outcome === 'acquired' ? takeover.takenOverFrom : undefined, fenced);
+        // 4. Only the successor may invoke, and the fenced attempt is refused again — now by the
+        //    generation itself — so exactly one of the two ever reaches the provider.
+        assert.equal(await markProviderInvocationStarted({ leaseKey: key, generation: successor, expiresAt: '' }), true);
+        assert.equal(await markProviderInvocationStarted(fencedLease), false);
+        const row = await database('task_execution_leases').where({ lease_key: key }).first();
+        assert.equal(row.lease_generation, successor);
+        assert.equal(Boolean(row.provider_invocation_started), true);
+    });
+
+    test('a marker with no proof against it still succeeds, so a live holder is not starved', async () => {
+        const key = leaseKey();
+        const holder = randomUUID();
+        await acquireExecutionLease(request(key, holder));
+        // A proof about a DIFFERENT generation of this same lease fences nothing here: the
+        // condition names both columns, exactly as the renewal's does.
+        await database('task_execution_lease_stop_proofs').insert({
+            lease_key: key, lease_generation: randomUUID(), proof: 'about some older generation',
+            recorded_by: 'operator:test', recorded_at: await databaseNow(),
+            consumed_at: null, consumed_by_generation: null,
+        });
+        assert.equal(await markProviderInvocationStarted({ leaseKey: key, generation: holder, expiresAt: '' }), true);
+    });
+
     test('a proof is refused outright while the lease says the holder is alive', async () => {
         const key = leaseKey();
         const holder = randomUUID();

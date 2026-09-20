@@ -353,16 +353,30 @@ export async function settleExecutionLease(lease: HeldExecutionLease, state: str
  * finds it set; writing it afterwards would leave exactly the window it exists to close.
  *
  * THE PROVIDER MAY BE INVOKED ONLY IF THIS RESOLVES `true`. `false` means the conditional UPDATE
- * matched nothing — this generation no longer holds an unsettled lease — so another attempt may
- * already be executing this operation, and invoking would be the second paid run. A REJECTION is
- * not an absence either: the write may have landed with the answer lost, or not landed at all, and
- * a caller that proceeds on it leaves the row saying `false` while the provider runs, which tells
- * a later reconciliation that nothing was reached. Both answers mean: do not invoke.
+ * matched nothing — this generation no longer holds an unsettled lease, or something has recorded
+ * that it stopped — so another attempt may already be executing this operation, and invoking would
+ * be the second paid run. A REJECTION is not an absence either: the write may have landed with the
+ * answer lost, or not landed at all, and a caller that proceeds on it leaves the row saying `false`
+ * while the provider runs, which tells a later reconciliation that nothing was reached. Both
+ * answers mean: do not invoke.
+ *
+ * A STOP PROOF FENCES THIS GATE EXACTLY AS IT FENCES A RENEWAL, AND FOR THE SAME REASON. Matching
+ * on `lease_generation` and `settled_at` alone is not enough while the term is lapsed: an
+ * unconsumed proof naming this generation means a successor may be admitted at any moment, and the
+ * row still names this generation until that takeover lands. Without this condition a generation
+ * already declared stopped could be granted the right to reach the provider, enter the call, and
+ * then have the successor admitted on the proof beside it — two paid executions, each of which won
+ * its own statement legitimately and in order, so statement serialization prevents nothing. The
+ * proof is the stronger statement here too: this gate loses to it, the attempt is refused before
+ * any money is spent, and the proof is left unspent for the takeover that consumes it.
  */
 export async function markProviderInvocationStarted(lease: HeldExecutionLease): Promise<boolean> {
     const marked = await db(EXECUTION_LEASES)
         .where({ lease_key: lease.leaseKey, lease_generation: lease.generation })
         .whereNull('settled_at')
+        .whereNotExists(builder => builder.select(db.raw('1')).from(EXECUTOR_STOP_PROOFS)
+            .where({ lease_key: lease.leaseKey, lease_generation: lease.generation })
+            .whereNull('consumed_at'))
         .update({ provider_invocation_started: true });
     return marked === 1;
 }

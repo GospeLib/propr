@@ -137,11 +137,13 @@ function leaseQuery() {
     let criteria: Record<string, unknown> = {};
     const nullColumns: string[] = [];
     const comparisons: [string, string, string][] = [];
+    const absences: (() => boolean)[] = [];
     const matches = (row: LeaseRow) =>
         Object.entries(criteria).every(([key, value]) => row[key as keyof LeaseRow] === value)
         && nullColumns.every(column => row[column as keyof LeaseRow] == null)
         && comparisons.every(([column, operator, value]) => operator === '<='
-            ? String(row[column as keyof LeaseRow]) <= value : String(row[column as keyof LeaseRow]) > value);
+            ? String(row[column as keyof LeaseRow]) <= value : String(row[column as keyof LeaseRow]) > value)
+        && absences.every(absent => absent());
     const append = async (row: LeaseRow) => {
         if (!leaseRows.some(existing => existing.lease_key === row.lease_key)) leaseRows.push({ ...row });
         return [leaseRows.length];
@@ -161,6 +163,16 @@ function leaseQuery() {
             return query;
         },
         whereNull: (column: string) => { nullColumns.push(column); return query; },
+        // `whereNotExists` is what fences a generation somebody has recorded as STOPPED out of
+        // renewing its term and out of the provider-start marker. It is modelled against the real
+        // proof rows rather than stubbed true: a stub would make both statements unconditional
+        // here, and this file's whole subject is a statement reporting how many rows it changed.
+        whereNotExists: (build: (builder: ReturnType<typeof subQuery>) => unknown) => {
+            const sub = subQuery();
+            build(sub);
+            absences.push(() => !sub.exists());
+            return query;
+        },
         first: async () => { const row = leaseRows.find(matches); return row ? { ...row } : undefined; },
         update: async (values: Partial<LeaseRow>) => {
             const affected = leaseRows.filter(matches);
@@ -174,6 +186,33 @@ function leaseQuery() {
         },
     };
     return query;
+}
+
+/**
+ * The correlated subquery the lease statements carry, over the stop-proof rows.
+ *
+ * It refuses any table but the stop proofs, so a statement that grew a different subquery fails
+ * loudly here instead of being answered "nothing exists" by a double that models nothing.
+ */
+function subQuery() {
+    let table = '';
+    let criteria: Record<string, unknown> = {};
+    const nullColumns: string[] = [];
+    const builder = {
+        select: () => builder,
+        from: (name: string) => { table = name; return builder; },
+        where: (value: Record<string, unknown>) => { criteria = { ...criteria, ...value }; return builder; },
+        whereNull: (column: string) => { nullColumns.push(column); return builder; },
+        exists: (): boolean => {
+            if (table !== 'task_execution_lease_stop_proofs') {
+                throw new Error(`the lease double models a stop-proof subquery, not one over ${table || '<no table>'}`);
+            }
+            return proofRows.some(row =>
+                Object.entries(criteria).every(([key, value]) => row[key as keyof ProofRow] === value)
+                && nullColumns.every(column => row[column as keyof ProofRow] == null));
+        },
+    };
+    return builder;
 }
 
 interface ProofRow {

@@ -37,10 +37,12 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import {
+    fixtureProcessCreationSites,
     fixtureProviderCallSites,
+    providerProcessBoundaryModule,
     repositoryAgentImplementationModules,
+    repositoryProcessCreationSites,
     repositoryProviderCallSites,
-    repositoryRawProviderSpawns,
     standaloneProviderPrimitiveModules,
     unprotectedProviderCallSites,
 } from './helpers/paidProviderCallSites.js';
@@ -204,54 +206,112 @@ describe('the rule distinguishes a leased call from an unleased one in the same 
     });
 });
 
-describe('the inventory of paid execution primitives is complete, not just the Agent surface', () => {
-    // Every paid run in this repository, whichever primitive starts it, ends at one raw container
-    // spawn. Freezing ALL of its call sites — not only the ones this analysis calls billable — is
-    // what makes a new paid path fail here: it cannot be added without changing this list.
-    test('every raw container spawn is listed and classified', () => {
-        assert.deepEqual(repositoryRawProviderSpawns().map(site =>
-            `${site.modelRun ? 'MODEL RUN' : 'management'} ${site.path}:${site.line} in ${site.enclosing}`), [
-            'management packages/core/src/agents/AgentRegistry.ts:127 in AgentRegistry.refreshRegistry',
-            'management packages/core/src/agents/AgentRegistry.ts:382 in AgentRegistry.registeredAgentImagesAvailable',
-            'MODEL RUN packages/core/src/agents/impl/AntigravityAgent.ts:115 in AntigravityAgent.executeTask',
-            'MODEL RUN packages/core/src/agents/impl/AntigravityAgent.ts:278 in AntigravityAgent.analyze',
-            'management packages/core/src/agents/impl/AntigravityAgent.ts:321 in AntigravityAgent.healthCheck',
-            'MODEL RUN packages/core/src/agents/impl/ClaudeAgent.ts:128 in ClaudeAgent.executeTask',
-            'MODEL RUN packages/core/src/agents/impl/ClaudeAgent.ts:219 in ClaudeAgent.analyze',
-            'management packages/core/src/agents/impl/ClaudeAgent.ts:307 in ClaudeAgent.healthCheck',
-            'MODEL RUN packages/core/src/agents/impl/CodexAgent.ts:73 in CodexAgent.executeTask',
-            'MODEL RUN packages/core/src/agents/impl/CodexAgent.ts:234 in CodexAgent.analyze',
-            'management packages/core/src/agents/impl/CodexAgent.ts:367 in CodexAgent.healthCheck',
-            'MODEL RUN packages/core/src/agents/impl/OpenCodeAgent.ts:80 in OpenCodeAgent.executeTask',
-            'MODEL RUN packages/core/src/agents/impl/OpenCodeAgent.ts:159 in OpenCodeAgent.analyze',
-            'management packages/core/src/agents/impl/OpenCodeAgent.ts:189 in OpenCodeAgent.healthCheck',
-            'MODEL RUN packages/core/src/agents/impl/VibeAgent.ts:100 in VibeAgent.executeTask',
-            'MODEL RUN packages/core/src/agents/impl/VibeAgent.ts:227 in VibeAgent.analyze',
-            'management packages/core/src/agents/impl/VibeAgent.ts:308 in VibeAgent.healthCheck',
-            'management packages/core/src/agents/runtime/agentRuntimePackageCatalog.ts:88 in loadCatalog',
-            'management packages/core/src/agents/runtime/agentRuntimePackageCatalog.ts:134 in validatePinnedPackage',
-            'management packages/core/src/agents/runtime/agentRuntimePackageCatalog.ts:155 in validatePinnedPackageBatch',
-            'management packages/core/src/agents/runtime/agentRuntimePackages.ts:162 in inspectAgentRuntimeBaseImage',
-            'management packages/core/src/agents/runtime/agentRuntimePackages.ts:176 in inspectAgentRuntimeBaseImage',
-            'management packages/core/src/agents/runtime/agentRuntimePackages.ts:240 in imageExists',
-            'management packages/core/src/agents/runtime/agentRuntimePackages.ts:257 in buildRuntimeImage',
-            'management packages/core/src/agents/runtime/agentRuntimePackages.ts:279 in cleanupRuntimeImages',
-            'management packages/core/src/agents/runtime/agentRuntimePackages.ts:293 in cleanupRuntimeImages',
-            'management packages/core/src/claude/claudeHelpers.ts:91 in setWorktreeOwnership',
-            // The legacy bypass, at the bottom of it: `executeClaudeCode` builds the Docker
-            // arguments and spawns the CLI itself, reached from `executeClaudeAnalysis`.
-            'MODEL RUN packages/core/src/claude/claudeService.ts:110 in executeClaudeCode',
-            'management packages/core/src/claude/docker/dockerImageBuilder.ts:53 in agentDockerImageExists',
-            'management packages/core/src/claude/docker/dockerImageBuilder.ts:58 in pullImage',
-            'management packages/core/src/claude/docker/dockerImageBuilder.ts:73 in buildBundle',
-            'management packages/core/src/claude/docker/dockerImageManager.ts:13 in listAgentImages',
-            'management packages/core/src/claude/docker/dockerImageManager.ts:69 in cleanupUnusedAgentImages',
-        ], 'a raw container spawn was added, moved or reclassified; say which primitive it belongs to');
+/**
+ * IS THE LIST OF SINKS COMPLETE — AND WHAT DOES "COMPLETE" MEAN HERE.
+ *
+ * The previous gate in this position advertised fail-closed containment and did not deliver it.
+ * It recognised only calls whose callee symbol resolved directly to `executeDockerCommand`, and it
+ * skipped that symbol's own declaring module, so three ways of starting a paid process left the
+ * frozen list completely unchanged: an alias binding, a direct `child_process` creation, and a new
+ * primitive added inside `dockerExecutor.ts`. No current path used any of them — which is exactly
+ * why the gate could stay green while proving less than it claimed.
+ *
+ * WHAT IS PROVEN NOW. Every SYNTACTIC process creation in the production sources of the
+ * repository's own `tsconfig.json` program is inventoried and frozen: any identifier that
+ * resolves — through import aliases and through local `const` aliases — to `executeDockerCommand`
+ * or to one of Node's process-creation APIs (`spawn`, `spawnSync`, `exec`, `execSync`, `execFile`,
+ * `execFileSync`, `fork`). Value references count, not only direct calls, so `promisify(execFile)`
+ * and `const run = executeDockerCommand` are inventoried where they are written. No module is
+ * skipped, including the executor's own. A new one cannot be added without this list changing, and
+ * the hostile fixtures below show each bypass form being caught rather than merely not occurring.
+ *
+ * WHAT IS NOT PROVEN. This is static analysis over these sources. It does not see a process
+ * created dynamically (`eval`, a string-indexed property, a native addon), a paid call made over
+ * HTTP to a provider API rather than by spawning, or a dependency spawning on this repository's
+ * behalf. It says nothing about `packages/cli` or `propr-ui`, which the program excludes. Read it
+ * as "no new process creation can be written into these sources unnoticed", never as "no paid work
+ * can happen by any other means".
+ */
+describe('every process creation in the production sources is inventoried and classified', () => {
+    // Freezing ALL of them — not only the ones this analysis calls billable — is what makes a new
+    // paid path fail here: it cannot be added without changing this list.
+    test('the process-creation inventory is the one on file', () => {
+        assert.deepEqual(repositoryProcessCreationSites().map(site =>
+            `${site.modelRun ? 'MODEL RUN' : 'management'} ${site.primitive} ${site.path}:${site.line} in ${site.enclosing}`), [
+            'management child_process.execFile packages/api/routes/agentRoutes.ts:24 in <module>',
+            'management child_process.execFileSync packages/api/routes/dockerCommandSafety.ts:18 in getDockerContainerLogs',
+            'management child_process.execFileSync packages/api/routes/dockerCommandSafety.ts:27 in getDockerContainerStatus',
+            'management executeDockerCommand packages/api/routes/plannerHelpers/operationGuard.ts:140 in hasRunningPlannerContainer',
+            'management child_process.execFile packages/api/services/agentLoginSessionManager.ts:100 in defaultRunDocker',
+            'management child_process.spawn packages/api/services/agentLoginSessionManager.ts:116 in defaultSpawnDocker',
+            'management executeDockerCommand packages/core/src/agents/AgentRegistry.ts:127 in AgentRegistry.refreshRegistry',
+            'management executeDockerCommand packages/core/src/agents/AgentRegistry.ts:382 in AgentRegistry.registeredAgentImagesAvailable',
+            'MODEL RUN executeDockerCommand packages/core/src/agents/impl/AntigravityAgent.ts:115 in AntigravityAgent.executeTask',
+            'MODEL RUN executeDockerCommand packages/core/src/agents/impl/AntigravityAgent.ts:278 in AntigravityAgent.analyze',
+            'management executeDockerCommand packages/core/src/agents/impl/AntigravityAgent.ts:321 in AntigravityAgent.healthCheck',
+            'MODEL RUN executeDockerCommand packages/core/src/agents/impl/ClaudeAgent.ts:128 in ClaudeAgent.executeTask',
+            'MODEL RUN executeDockerCommand packages/core/src/agents/impl/ClaudeAgent.ts:219 in ClaudeAgent.analyze',
+            'management executeDockerCommand packages/core/src/agents/impl/ClaudeAgent.ts:307 in ClaudeAgent.healthCheck',
+            'MODEL RUN executeDockerCommand packages/core/src/agents/impl/CodexAgent.ts:73 in CodexAgent.executeTask',
+            'MODEL RUN executeDockerCommand packages/core/src/agents/impl/CodexAgent.ts:234 in CodexAgent.analyze',
+            'management child_process.execSync packages/core/src/agents/impl/CodexAgent.ts:277 in CodexAgent.ensureAnalysisWorkspace',
+            'management child_process.execSync packages/core/src/agents/impl/CodexAgent.ts:278 in CodexAgent.ensureAnalysisWorkspace',
+            'management child_process.execSync packages/core/src/agents/impl/CodexAgent.ts:279 in CodexAgent.ensureAnalysisWorkspace',
+            'management child_process.execSync packages/core/src/agents/impl/CodexAgent.ts:281 in CodexAgent.ensureAnalysisWorkspace',
+            'management executeDockerCommand packages/core/src/agents/impl/CodexAgent.ts:367 in CodexAgent.healthCheck',
+            'MODEL RUN executeDockerCommand packages/core/src/agents/impl/OpenCodeAgent.ts:80 in OpenCodeAgent.executeTask',
+            'MODEL RUN executeDockerCommand packages/core/src/agents/impl/OpenCodeAgent.ts:159 in OpenCodeAgent.analyze',
+            'management executeDockerCommand packages/core/src/agents/impl/OpenCodeAgent.ts:189 in OpenCodeAgent.healthCheck',
+            'management child_process.execSync packages/core/src/agents/impl/OpenCodeAgent.ts:285 in OpenCodeAgent.ensureAnalysisWorkspace',
+            'management child_process.execSync packages/core/src/agents/impl/OpenCodeAgent.ts:286 in OpenCodeAgent.ensureAnalysisWorkspace',
+            'management child_process.execSync packages/core/src/agents/impl/OpenCodeAgent.ts:287 in OpenCodeAgent.ensureAnalysisWorkspace',
+            'MODEL RUN executeDockerCommand packages/core/src/agents/impl/VibeAgent.ts:100 in VibeAgent.executeTask',
+            'MODEL RUN executeDockerCommand packages/core/src/agents/impl/VibeAgent.ts:227 in VibeAgent.analyze',
+            'management executeDockerCommand packages/core/src/agents/impl/VibeAgent.ts:308 in VibeAgent.healthCheck',
+            'management executeDockerCommand packages/core/src/agents/runtime/agentRuntimePackageCatalog.ts:88 in loadCatalog',
+            'management executeDockerCommand packages/core/src/agents/runtime/agentRuntimePackageCatalog.ts:134 in validatePinnedPackage',
+            'management executeDockerCommand packages/core/src/agents/runtime/agentRuntimePackageCatalog.ts:155 in validatePinnedPackageBatch',
+            'management executeDockerCommand packages/core/src/agents/runtime/agentRuntimePackages.ts:162 in inspectAgentRuntimeBaseImage',
+            'management executeDockerCommand packages/core/src/agents/runtime/agentRuntimePackages.ts:176 in inspectAgentRuntimeBaseImage',
+            'management executeDockerCommand packages/core/src/agents/runtime/agentRuntimePackages.ts:240 in imageExists',
+            'management executeDockerCommand packages/core/src/agents/runtime/agentRuntimePackages.ts:257 in buildRuntimeImage',
+            'management executeDockerCommand packages/core/src/agents/runtime/agentRuntimePackages.ts:279 in cleanupRuntimeImages',
+            'management executeDockerCommand packages/core/src/agents/runtime/agentRuntimePackages.ts:293 in cleanupRuntimeImages',
+            'management executeDockerCommand packages/core/src/agents/runtime/agentRuntimePackageVerification.ts:419 in verifyAgentRuntimePackageProfile',
+            'management executeDockerCommand packages/core/src/claude/claudeHelpers.ts:91 in setWorktreeOwnership',
+            'MODEL RUN executeDockerCommand packages/core/src/claude/claudeService.ts:110 in executeClaudeCode',
+            'management child_process.execFile packages/core/src/claude/docker/dockerContainerControl.ts:47 in runDocker',
+            'management executeDockerCommand packages/core/src/claude/docker/dockerExecutor.ts:112 in findTaskContainer',
+            'management executeDockerCommand packages/core/src/claude/docker/dockerExecutor.ts:154 in inspectLegacyDockerContainerLivenessForTask',
+            'management child_process.spawn packages/core/src/claude/docker/dockerExecutor.ts:181 in spawnCommandProcess',
+            'management child_process.execFileSync packages/core/src/claude/docker/dockerExecutor.ts:416 in detectContainerId',
+            'management executeDockerCommand packages/core/src/claude/docker/dockerImageBuilder.ts:53 in agentDockerImageExists',
+            'management executeDockerCommand packages/core/src/claude/docker/dockerImageBuilder.ts:58 in pullImage',
+            'management executeDockerCommand packages/core/src/claude/docker/dockerImageBuilder.ts:73 in buildBundle',
+            'management executeDockerCommand packages/core/src/claude/docker/dockerImageManager.ts:13 in listAgentImages',
+            'management executeDockerCommand packages/core/src/claude/docker/dockerImageManager.ts:69 in cleanupUnusedAgentImages',
+            'management child_process.execFile packages/core/src/git/executionCheckpointRetention.ts:20 in <module>',
+            'management child_process.execFileSync packages/core/src/git/worktreeOperations.ts:297 in setupWorktreePermissions',
+            'management child_process.execFileSync scripts/reconcile-npm-artifact.mjs:30 in lookupPublishedIntegrity',
+            'management child_process.execFileSync scripts/reconcile-npm-artifact.mjs:76 in main',
+            'management child_process.spawn scripts/run-test-suite.mjs:138 in runTestProcess',
+            'management child_process.execFile src/jobs/issueJob/agent.ts:3 in <module>',
+            'management child_process.execFileSync src/jobs/mergeConflictAgentRunner.ts:76 in verifyNoConflictMarkers',
+            'management child_process.execFileSync src/jobs/processPullRequestCommentJob.ts:310 in executeProcessing',
+            'management child_process.execFileSync src/jobs/processPullRequestCommentJob.ts:394 in executeProcessing',
+            'management child_process.execFileSync src/jobs/processPullRequestCommentJob.ts:395 in executeProcessing',
+            'management child_process.execFile src/jobs/prTaskTitleDiffHelpers.ts:182 in getConflictDiffForTitle',
+            'management executeDockerCommand src/taskStateReconciler.ts:181 in inspectLegacyTaskContainerLiveness',
+        ], 'a process creation was added, moved or reclassified; say which primitive it belongs to');
     });
 
-    test('no model-running spawn lives outside the enumerated provider primitives', () => {
-        const accounted = new Set([...repositoryAgentImplementationModules(), ...standaloneProviderPrimitiveModules]);
-        const strays = repositoryRawProviderSpawns()
+    test('no model-running process creation lives outside the enumerated provider primitives', () => {
+        // `dockerExecutor.ts` is accounted for by name rather than by implementing `Agent`: it is
+        // the shared bottom of BOTH a model execution and a `docker images`, and so it is the one
+        // place a process creation is expected to live without belonging to a single provider.
+        const accounted = new Set([...repositoryAgentImplementationModules(), ...standaloneProviderPrimitiveModules,
+            providerProcessBoundaryModule]);
+        const strays = repositoryProcessCreationSites()
             .filter(site => site.modelRun)
             .filter(site => ![...accounted].some(module => site.path.endsWith(module)));
         assert.deepEqual(strays, [],
@@ -279,6 +339,108 @@ describe('the inventory of paid execution primitives is complete, not just the A
         assert.deepEqual(found.map(site => ({ method: site.method, protectedByLease: site.protectedByLease })),
             [{ method: 'executeClaudeCode', protectedByLease: false }],
             'the sink is the execution primitive, whichever interface it is or is not behind');
+    });
+});
+
+/**
+ * THE THREE BYPASSES THE PREVIOUS GATE LET THROUGH, WRITTEN OUT AND CAUGHT.
+ *
+ * Each fixture is a paid run that the old inventory would have recorded nothing about: the frozen
+ * list would not have changed, and the containment test would have found no stray. Here each one
+ * is inventoried, classified as a model run because it sits inside the billing wrapper, and lands
+ * in a module that is not an enumerated provider primitive — which is what a stray is.
+ */
+describe('the containment gate catches a process creation that avoids the wrapper', () => {
+    /** The rule the repository-level containment test applies, pointed at fixture sources. */
+    const strays = (sites: ReturnType<typeof fixtureProcessCreationSites>) => sites
+        .filter(site => site.modelRun)
+        .filter(site => !site.path.endsWith(providerProcessBoundaryModule)
+            && !standaloneProviderPrimitiveModules.some(module => site.path.endsWith(module)));
+
+    test('an alias binding of the executor is inventoried under the primitive it names', () => {
+        const found = fixtureProcessCreationSites({
+            'alias.ts': `
+                import { executeDockerCommand } from './claude/docker/dockerExecutor.js';
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const run = executeDockerCommand;
+                export async function sneaky(prompt: string) {
+                    return executeWithUsageTracking('run', async () => run(['run', prompt]));
+                }
+            `,
+        });
+        assert.deepEqual(found.filter(site => site.path === 'alias.ts').map(site =>
+            `${site.primitive} ${site.enclosing} modelRun=${site.modelRun}`), [
+            'executeDockerCommand <module> modelRun=false',
+            'executeDockerCommand sneaky modelRun=true',
+        ], 'the callee is spelled `run`, and the alias chase resolves it to the primitive anyway');
+        assert.deepEqual(strays(found).map(site => site.path), ['alias.ts'],
+            'so the paid run fails containment instead of being invisible to it');
+    });
+
+    for (const api of ['spawn', 'exec', 'execFile', 'fork'] as const) {
+        test(`a direct child_process.${api} is inventoried, wrapper or no wrapper`, () => {
+            const found = fixtureProcessCreationSites({
+                'direct.ts': `
+                    import { ${api} } from 'node:child_process';
+                    import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                    export async function direct(prompt: string) {
+                        return executeWithUsageTracking('run', async () => ${api}('docker', ['run', prompt]));
+                    }
+                `,
+            });
+            assert.deepEqual(found.filter(site => site.path === 'direct.ts').map(site =>
+                `${site.primitive} ${site.enclosing} modelRun=${site.modelRun}`),
+            [`child_process.${api} direct modelRun=true`],
+            'the repository wrapper was never involved, and the process creation is still on file');
+            assert.deepEqual(strays(found).map(site => site.path), ['direct.ts']);
+        });
+    }
+
+    test('a child_process API destructured out of a dynamic import is inventoried too', () => {
+        const found = fixtureProcessCreationSites({
+            'dynamic.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                export async function dynamic(prompt: string) {
+                    const { execFileSync } = await import('child_process');
+                    return executeWithUsageTracking('run', async () => execFileSync('docker', ['run', prompt]));
+                }
+            `,
+        });
+        assert.deepEqual(found.filter(site => site.path === 'dynamic.ts').map(site =>
+            `${site.primitive} modelRun=${site.modelRun}`), ['child_process.execFileSync modelRun=true'],
+        'a late import is still an import of the process-creation surface');
+    });
+
+    test('a new primitive inside the executor module is inventoried, because that module is not skipped', () => {
+        const found = fixtureProcessCreationSites({
+            // The fixture supplies the executor module itself, which the previous inventory
+            // skipped outright — anything added beside `executeDockerCommand` was invisible.
+            'claude/docker/dockerExecutor.ts': `
+                import { spawn } from 'node:child_process';
+                export async function executeDockerCommand(args: string[]): Promise<{ code: number }> {
+                    return { code: args.length };
+                }
+                export function executeModelDirectly(args: string[]) { return spawn('docker', args); }
+            `,
+        });
+        assert.deepEqual(found.map(site => `${site.primitive} in ${site.enclosing}`),
+            ['child_process.spawn in executeModelDirectly'],
+            'a second process-creation primitive in the boundary module is on the record');
+    });
+
+    test('an ordinary function in the same module is not mistaken for a process creation', () => {
+        // The companion to every fixture above: a rule that flagged everything would pass them
+        // all and prove nothing.
+        const found = fixtureProcessCreationSites({
+            'innocent.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                function spawn(prompt: string) { return prompt.length; }
+                export async function innocent(prompt: string) {
+                    return executeWithUsageTracking('run', async () => spawn(prompt));
+                }
+            `,
+        });
+        assert.deepEqual(found, [], 'the primitive is a resolved symbol, never the spelling');
     });
 });
 

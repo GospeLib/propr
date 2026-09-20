@@ -436,7 +436,7 @@ export class RoutingWebSocketIntakeService {
         }
 
         if (!isSupportedEventType(rawEventType)) {
-            log.debug({ eventType: rawEventType, deliveryId, sequence }, 'Ignoring unsupported routing event type');
+            log.info({ eventType: rawEventType, deliveryId, sequence }, 'Ignoring unsupported routing event type');
             this.deliveries.accept(deliveryId, IGNORED_UNSUPPORTED_DISPOSITION);
             this.sendAck(sequence, deliveryId, socket, IGNORED_UNSUPPORTED_DISPOSITION);
             return;
@@ -467,7 +467,7 @@ export class RoutingWebSocketIntakeService {
 
         let disposition: DeliveryDisposition;
         try {
-            log.debug({ eventType: rawEventType, deliveryId, sequence }, 'Dispatching routing event');
+            log.info({ eventType: rawEventType, deliveryId, sequence }, 'Dispatching routing event');
             // The dispatcher is the authority on the delivery's disposition: it may
             // report accepted/blocked/ignored (with reason/billing); a void return
             // means a plain `accepted`. A thrown error is handled below and withholds

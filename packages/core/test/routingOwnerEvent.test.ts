@@ -33,7 +33,54 @@ for(const mode of ['disabled','installation','repository','edited','missing-conf
  assert.equal(calls,mode==='refused'?1:0);
 });
 test('ordinary events and unapproved control kinds are never sent to owner relay',async()=>{
- const payload=fixture();for(const body of ['/ezer StopUnit','/ezer ApproveManifest','ordinary comment']){payload.comment.body=body;assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{enabled:true,baseUrl:'http://ezer:8791',secret,fetchImpl:async()=>{throw new Error('must not forward');}}),false);}
+ const payload=fixture();let replies=0;
+ const options={enabled:true,baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;},fetchImpl:async()=>{throw new Error('must not forward');}};
+ // Addressed to Ezer but not a command: answered, never admitted.
+ for(const body of ['/ezer StopUnit','/ezer ApproveManifest']){payload.comment.body=body;assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),true);}
+ assert.equal(replies,2);
+ // Not addressed to Ezer: ordinary handling, no reply.
+ payload.comment.body='ordinary comment';
+ assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),false);
+ assert.equal(replies,2);
+});
+test('an owner comment addressed to Ezer that is not a command is answered instead of dropped',async()=>{
+ const payload={...fixture(),repository:{full_name:'GospeLib/main'},issue:{number:2387,pull_request:{url:'pr'}}};
+ payload.comment.body='/ezer S02 is not wired up. Finish the transport: mount the projector on ProPR\'s authenticated Socket.IO channel.';
+ let replies=0;
+ const options={enabled:true,stopEnabled:true,planControlEnabled:true,pauseEnabled:true,routeEnabled:true,readEnabled:true,baseUrl:'http://ezer:8791',secret,
+  replyMalformed:async(event:Record<string,unknown>)=>{assert.deepEqual(event,payload);replies++;},
+  fetchImpl:async()=>{throw new Error('free text must never reach the owner relay');}};
+ assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),true);
+ assert.equal(replies,1);
+});
+for(const mode of ['relay-disabled','wrong-installation','wrong-repository','edited'] as const)test(`an unrecognized /ezer comment on a ${mode} delivery falls through without reply or throw`,async()=>{
+ const payload=fixture();payload.comment.body='/ezer please finish S02';
+ if(mode==='wrong-repository')payload.repository.full_name='someone-else/repo';
+ if(mode==='edited')payload.action='edited';
+ let replies=0;
+ const handled=await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,mode==='wrong-installation'?'999':installationId,
+  {enabled:mode!=='relay-disabled',baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;},fetchImpl:async()=>{throw new Error('must not forward');}});
+ assert.equal(handled,false);assert.equal(replies,0);
+});
+test('unrecognized-command feedback answers on the comment\'s own surface and is idempotent',async()=>{
+ const comment={id:5747057704,body:'/ezer S02 is not wired up.',created_at:'2026-09-20T02:30:50Z',updated_at:'2026-09-20T02:30:50Z',issue_url:'https://api.github.com/repos/GospeLib/main/issues/2387',user:{id:7,type:'User'}};
+ const event={comment,issue:{number:2387,pull_request:{url:'pr'}},repository:{full_name:'GospeLib/main'}};
+ const comments:Array<{body:string;user:{type:string}}>=[];let posts=0;
+ const api={request:async(route:string,input:Record<string,unknown>)=>{assert.equal(input.repo,'main');if(route.startsWith('GET'))return{data:comment};posts++;comments.push({body:String(input.body),user:{type:'Bot'}});return{data:{id:99}};},paginate:async()=>comments} as unknown as Pick<PaginatedOctokitInstance,'request'|'paginate'>;
+ await replyMalformedOwnerCommand(event,deliveryId,api);await replyMalformedOwnerCommand(event,deliveryId,api);
+ assert.equal(posts,1);
+ assert.match(comments[0].body,/EZER_COMMAND_NOT_RECOGNIZED/);
+ assert.match(comments[0].body,/\/ezer help/);
+ assert.match(comments[0].body,/no work was started or changed/);
+ assert.match(comments[0].body,/ezer-invalid-unknown-command-5747057704/);
+});
+test('unrecognized-command feedback refuses a surface that is not an owner command surface',async()=>{
+ const comment={id:1,body:'/ezer do the thing',created_at:'t',updated_at:'t',issue_url:'https://api.github.com/repos/someone-else/repo/issues/1',user:{id:7,type:'User'}};
+ const event={comment,issue:{number:1},repository:{full_name:'someone-else/repo'}};
+ let posts=0;
+ const api={request:async()=>{posts++;return{data:comment};},paginate:async()=>[]} as unknown as Pick<PaginatedOctokitInstance,'request'|'paginate'>;
+ await assert.rejects(()=>replyMalformedOwnerCommand(event,deliveryId,api),/OWNER_COMMAND_REPLY_UNBOUND/);
+ assert.equal(posts,0);
 });
 test('malformed checkpoint command receives an ordinary rejection, never owner admission',async()=>{
  const payload=fixture();payload.comment.body=`/ezer accept-review-stop stop:abcd ${'a'.repeat(40)} sha256:${'b'.repeat(63)}\r\n  55`;

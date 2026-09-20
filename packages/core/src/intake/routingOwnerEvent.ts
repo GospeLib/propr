@@ -24,6 +24,10 @@ const PAUSE_COMMAND_PREFIX=/^\/ezer (?:pause|resume)(?:\s|$)/i;
 const PLAN_COMMAND_PREFIX=/^\/ezer (?:approve|retry)(?:\s|$)/;
 const STOP_COMMAND=/^\/ezer stop ([^\s]+)$/;
 const OWNER_COMMAND_PREFIX=/^\/ezer accept-review-stop(?:\s|$)/;
+/** Any comment addressed to Ezer, whatever follows the address. */
+const EZER_ADDRESS_PREFIX=/^\/ezer(?:\s|$)/i;
+/** The only two surfaces an owner command is ever carried from. */
+const OWNER_SURFACE_REPOSITORIES=new Set([STOP_REPOSITORY,OWNER_RELAY_REPOSITORY]);
 const COMMENT_PAGE_SIZE=100;
 const READ_SESSION_NAMESPACE='github-issue';
 interface Options{enabled:boolean;stopEnabled?:boolean;planControlEnabled?:boolean;pauseEnabled?:boolean;routeEnabled?:boolean;readEnabled?:boolean;baseUrl:string;secret:string;fetchImpl?:typeof fetch;now?:()=>Date;replyMalformed?:(event:Record<string,unknown>,deliveryId:string)=>Promise<void>;onReadback?:(result:Record<string,unknown>)=>Promise<void>;}
@@ -45,13 +49,19 @@ export async function replyMalformedOwnerCommand(event:Record<string,unknown>,de
  const routeControl=ROUTE_COMMAND_PREFIX.test(comment.body.trim());
  const pauseControl=PAUSE_COMMAND_PREFIX.test(comment.body.trim());
  const wrongStopSurface=STOP_COMMAND.test(comment.body.trim())&&Boolean(issue.pull_request);
- const repository=(wrongStopSurface||pauseControl||routeControl)?STOP_REPOSITORY:OWNER_RELAY_REPOSITORY;
+ // A comment addressed to Ezer that matches no command shape at all. It is answered on
+ // its own surface (the owner wrote it there), never on a repository inferred from a
+ // command it does not contain — the binding check below still proves that surface.
+ const unrecognized=!routeControl&&!pauseControl&&!STOP_COMMAND.test(comment.body.trim())&&!PLAN_COMMAND_PREFIX.test(comment.body.trim())&&!OWNER_COMMAND_PREFIX.test(comment.body.trim());
+ const eventRepository=String(object(event.repository).full_name??'');
+ if(unrecognized&&!OWNER_SURFACE_REPOSITORIES.has(eventRepository))throw new Error('OWNER_COMMAND_REPLY_UNBOUND');
+ const repository=unrecognized?eventRepository:(wrongStopSurface||pauseControl||routeControl)?STOP_REPOSITORY:OWNER_RELAY_REPOSITORY;
  const [owner,repo]=repository.split('/');
  const {data:actual}=await api.request('GET /repos/{owner}/{repo}/issues/comments/{comment_id}',{owner,repo,comment_id:Number(comment.id)});
  if(actual.body!==comment.body||actual.user?.id!==actor.id||actual.created_at!==comment.created_at||actual.updated_at!==comment.updated_at||actual.created_at!==actual.updated_at||actual.issue_url!==`https://api.github.com/repos/${repository}/issues/${issue.number}`)throw new Error('OWNER_COMMAND_REPLY_COMMENT_CHANGED');
  if(wrongStopSurface){const {data:target}=await api.request('GET /repos/{owner}/{repo}/issues/{issue_number}',{owner,repo,issue_number:Number(issue.number)});if(!target.pull_request)throw new Error('OWNER_COMMAND_REPLY_TARGET_CHANGED');}
- const marker=`<!-- idempotency-key: ezer-invalid-${routeControl?'unit-route':pauseControl?'unit-pause':wrongStopSurface?'running-stop':'review-stop'}-${comment.id} -->`;
- const body=routeControl?`Could not apply the route requested in comment ${comment.id}: CHANGE_ROUTE_COMMAND_NOT_ADMITTED.\n\nUse the exact command from Ezer on the canonical unit issue, with ChangeRoute enabled. A route selects one currently configured agent/model for the next unprepared admission. It does not change running work, scope or budget. No route or execution was requested by this refusal.\n\n${marker}`:pauseControl?`Could not apply the unit pause/resume requested in comment ${comment.id}: UNIT_PAUSE_COMMAND_NOT_ADMITTED.\n\nUse the current Ezer pause/resume command on the original execution issue, with the capability enabled and exact canonical unit ID; resume also requires the full current pause-event ID. PR comments cannot authorize this control or a repository correction. Pause lets the current worker finish under its original deadline and holds canonical continuation; resume releases only that recorded hold. No pause, resume or execution was requested by this refusal.\n\n${marker}`:wrongStopSurface?`Could not stop work requested in comment ${comment.id}: STOP_COMMAND_REQUIRES_EXECUTION_ISSUE.\n\nThis is a result pull request. Use Ezer's current running-work stop command on the original execution issue while that exact task is still running. Completed work cannot be cancelled. This PR comment cannot authorize a stop or repository correction. This refusal performs no stop and requests no execution. Check the originating Ezer lifecycle for the task's actual result.\n\n${marker}`:`Could not accept the review checkpoint requested in comment ${comment.id}: INVALID_REVIEW_STOP_COMMAND.\n\nPost a fresh, unedited comment using the complete command from Ezer's planning review status on one line. It must contain the exact stop ID, 40-character revision, sha256 digest with all 64 hexadecimal characters, and review comment ID, separated by single spaces. No review stop was accepted; no approval or execution occurred.\n\n${marker}`;
+ const marker=`<!-- idempotency-key: ezer-invalid-${unrecognized?'unknown-command':routeControl?'unit-route':pauseControl?'unit-pause':wrongStopSurface?'running-stop':'review-stop'}-${comment.id} -->`;
+ const body=unrecognized?`Could not act on comment ${comment.id}: EZER_COMMAND_NOT_RECOGNIZED.\n\nComments beginning with \`/ezer\` are read as commands, not as instructions in prose. This comment matches no Ezer command, so nothing was planned, approved, paused, routed, retried or stopped, and no work was started or changed by it. Post \`/ezer help\` on a planning issue for the exact commands and their arguments. To direct new work, take it through the normal planning lifecycle rather than a free-text comment.\n\n${marker}`:routeControl?`Could not apply the route requested in comment ${comment.id}: CHANGE_ROUTE_COMMAND_NOT_ADMITTED.\n\nUse the exact command from Ezer on the canonical unit issue, with ChangeRoute enabled. A route selects one currently configured agent/model for the next unprepared admission. It does not change running work, scope or budget. No route or execution was requested by this refusal.\n\n${marker}`:pauseControl?`Could not apply the unit pause/resume requested in comment ${comment.id}: UNIT_PAUSE_COMMAND_NOT_ADMITTED.\n\nUse the current Ezer pause/resume command on the original execution issue, with the capability enabled and exact canonical unit ID; resume also requires the full current pause-event ID. PR comments cannot authorize this control or a repository correction. Pause lets the current worker finish under its original deadline and holds canonical continuation; resume releases only that recorded hold. No pause, resume or execution was requested by this refusal.\n\n${marker}`:wrongStopSurface?`Could not stop work requested in comment ${comment.id}: STOP_COMMAND_REQUIRES_EXECUTION_ISSUE.\n\nThis is a result pull request. Use Ezer's current running-work stop command on the original execution issue while that exact task is still running. Completed work cannot be cancelled. This PR comment cannot authorize a stop or repository correction. This refusal performs no stop and requests no execution. Check the originating Ezer lifecycle for the task's actual result.\n\n${marker}`:`Could not accept the review checkpoint requested in comment ${comment.id}: INVALID_REVIEW_STOP_COMMAND.\n\nPost a fresh, unedited comment using the complete command from Ezer's planning review status on one line. It must contain the exact stop ID, 40-character revision, sha256 digest with all 64 hexadecimal characters, and review comment ID, separated by single spaces. No review stop was accepted; no approval or execution occurred.\n\n${marker}`;
  const reply=makeIdempotent(
   ()=>api.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments',{owner,repo,issue_number:Number(issue.number),body}),
   async()=>{const comments=await api.paginate('GET /repos/{owner}/{repo}/issues/{issue_number}/comments',{owner,repo,issue_number:Number(issue.number),per_page:COMMENT_PAGE_SIZE});return comments.some(x=>x.user?.type==='Bot'&&x.body?.includes(marker));},
@@ -74,7 +84,19 @@ export async function forwardRoutingOwnerEvent(payload:unknown,eventType:string,
   if(options.onReadback)await options.onReadback(receipt);else log.info({deliveryId,readback:receipt},'Ezer authenticated native read settled');
   return true;
  }
- if(!isStop&&!isPlanControl&&!isPauseControl&&!isRouteControl&&!OWNER_COMMAND_PREFIX.test(body))return false;
+ if(!isStop&&!isPlanControl&&!isPauseControl&&!isRouteControl&&!OWNER_COMMAND_PREFIX.test(body)){
+  // Not addressed to Ezer at all: an ordinary comment, handled by the normal path.
+  if(!EZER_ADDRESS_PREFIX.test(body))return false;
+  // Addressed to Ezer but matching no command shape. Silence here is what leaves the
+  // owner waiting on a comment that can never be acted on, so answer it — but only on a
+  // delivery bound exactly as an owner command would have to be. An unbound or
+  // relay-disabled delivery falls through to ordinary handling rather than throwing, so
+  // stray `/ezer` chatter can never withhold an ACK and drive relay redelivery.
+  if(!options.enabled)return false;
+  if(event.action!=='created'||!OWNER_SURFACE_REPOSITORIES.has(String(repository.full_name))||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)return false;
+  await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);
+  return true;
+ }
  if(isRouteControl){
   if(event.action!=='created'||repository.full_name!==STOP_REPOSITORY||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)throw new Error('OWNER_RELAY_DELIVERY_NOT_BOUND');
   if(!options.enabled||!options.routeEnabled||!ROUTE_COMMAND.test(body)||object(event.issue).pull_request){await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);return true;}

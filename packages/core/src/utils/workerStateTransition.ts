@@ -7,6 +7,7 @@ import type {
     UpdateMetadata,
 } from './workerStateManager.types.js';
 import { db } from '../db/connection.js';
+import { assertCompletionGuarded } from './completionGuard.js';
 import { getEventPublisher } from './eventPublisher.js';
 import logger from './logger.js';
 
@@ -94,6 +95,8 @@ export function buildTaskStateTransition(
     newState: TaskState,
     metadata: UpdateMetadata,
 ): TaskStateTransition {
+    // The one boundary every completion must cross, whatever API or spelling reached it.
+    assertCompletionGuarded(newState, metadata);
     const previousState = current.state;
     const reason = metadata.reason ?? `State changed from ${previousState}`;
     const state = buildTaskStateMutation(current, (next, timestamp) => {

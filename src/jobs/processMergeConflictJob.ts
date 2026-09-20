@@ -18,6 +18,8 @@ import {
     updateMergeTaskWithKnownPRInfo,
 } from './mergeConflictHelpers.js';
 import { handleMergeWithAgent } from './mergeConflictAgentRunner.js';
+import { durableOperationIdentity } from '@propr/core';
+import { isCompletionDurabilityUnverifiable } from './completionDurabilityOutcome.js';
 import { generateSummaryTitle, resolveDefaultAgentAndModel } from './prCommentAgentUtils.js';
 import { fetchAllComments } from './prCommentJobUtils.js';
 import {
@@ -88,6 +90,14 @@ async function handleMergeJobError(error: Error, options: {
     const { octokit, startingCommentId, stateManager, taskId, repoOwner, repoName, baseBranch, headBranch, pullRequestNumber, correlatedLogger } = options;
     const errorMessage = error.message || 'Unknown error';
     correlatedLogger.error({ pullRequestNumber, error: errorMessage }, 'Merge conflict resolution job failed');
+
+    // A completion that may have committed must never be followed by `failed`: the barrier throws
+    // this precisely so no terminal state is written while durability is unknown.
+    if (isCompletionDurabilityUnverifiable(error)) {
+        correlatedLogger.error({ taskId, pullRequestNumber },
+            'Merge conflict completion durability is unverifiable; leaving the task unsettled');
+        throw error;
+    }
 
     await stateManager.updateTaskState(taskId, TaskStates.FAILED, {
         reason: 'Merge conflict resolution failed', error: { message: errorMessage },
@@ -334,6 +344,8 @@ export async function processMergeConflictJob(job: Job<MergeConflictJobData>): P
             pullRequestNumber, repoUrl, repoOwner, repoName,
             githubToken, octokit, startingCommentId,
             stateManager, taskId, correlationId, correlatedLogger, redisClient,
+            // The queue job owns this attempt and keeps its id across every redelivery.
+            operationId: durableOperationIdentity('merge-conflict-job', job.id ?? taskId),
         });
         jobSucceeded = result.status === 'complete';
         return result;

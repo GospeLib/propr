@@ -14,6 +14,7 @@ import type { CommitResult } from '@propr/core';
 import type { PostProcessingResult } from '../issueJobHelpers.js';
 import type { TaskCompletionParams } from './types.js';
 import { markTaskTerminalState } from '../terminalTaskState.js';
+import { isCompletionDurabilityUnverifiable } from '../completionDurabilityOutcome.js';
 
 export { getTaskCompletionStatus, markTaskTerminalState } from '../terminalTaskState.js';
 
@@ -81,6 +82,14 @@ export async function markTaskComplete(taskCompletionParams: TaskCompletionParam
     await persistTaskUpdateFields(taskId, updateFields, correlatedLogger);
     await closeFailedPlanIssueAndContinue(taskCompletionParams);
   } catch (stateError) {
+    // A completion that may have committed but could not be read back must not be swallowed:
+    // swallowing it leaves the job to finish "successfully" with no terminal record, and the
+    // outer handler would otherwise settle `failed` over a possibly delivered success.
+    if (isCompletionDurabilityUnverifiable(stateError)) {
+      correlatedLogger.error({ taskId, error: (stateError as Error).message },
+        'Completion durability is unverifiable; refusing to settle this task in any terminal state');
+      throw stateError;
+    }
     correlatedLogger.warn({ error: (stateError as Error).message }, 'Failed to update terminal task state');
   }
 }

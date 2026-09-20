@@ -1,4 +1,5 @@
 import { test, mock, describe, beforeEach } from 'node:test';
+import { completionCoreExports } from './helpers/completionCoreDoubles.js';
 import assert from 'node:assert';
 
 // --- Mock Setup ---
@@ -8,9 +9,16 @@ const mockOctokit = {
     auth: mock.fn(async () => ({ token: 'mock-github-token' })),
 };
 
+/** Reproduces a database that refuses the completed history row and then the read-back. */
+let refuseCompletedHistoryWrite = false;
+
 const mockStateManager = {
     createTaskState: mock.fn(async () => {}),
-    updateTaskState: mock.fn(async () => {}),
+    updateTaskState: mock.fn(async (_taskId: string, state?: string) => {
+        if (refuseCompletedHistoryWrite && state === 'completed') {
+            throw new Error('database refused the completed history row');
+        }
+    }),
     getTaskState: mock.fn(async () => null),
     updateHistoryMetadata: mock.fn(async () => {}),
     getTaskKey: mock.fn(() => 'task:test'),
@@ -151,6 +159,7 @@ const mockRegistry = {
 // Mock @propr/core
 await mock.module('@propr/core', {
     namedExports: {
+        ...completionCoreExports,
         logger: {
             info: mock.fn(),
             warn: mock.fn(),
@@ -166,7 +175,13 @@ await mock.module('@propr/core', {
         ErrorCategories: { POST_PROCESSING: 'post_processing' },
         redactSecrets: (value: string) => value,
         resolveAgentTerminationReason: (result: { terminationReason?: string }) => result.terminationReason,
-        db: () => ({ where: () => ({ first: async () => undefined, update: async () => undefined }) }),
+        db: () => ({ where: () => ({
+            first: async () => {
+                if (refuseCompletedHistoryWrite) throw new Error('database refused the history read-back');
+                return undefined;
+            },
+            update: async () => undefined,
+        }) }),
         ensureRepoCloned: mockEnsureRepoCloned,
         createWorktreeFromExistingBranch: mockCreateWorktreeFromExistingBranch,
         getRepoUrl: mockGetRepoUrl,
@@ -263,6 +278,7 @@ function resetAllMocks() {
     mockCleanupWorktree.mock.resetCalls();
     mockRedisStore.clear();
     mockSettings = {};
+    refuseCompletedHistoryWrite = false;
 }
 
 describe('processMergeConflictJob', () => {
@@ -513,5 +529,24 @@ describe('processMergeConflictJob', () => {
 
         assert.strictEqual(mockCleanupWorktree.mock.callCount(), 1);
         assert.strictEqual(mockCleanupWorktree.mock.calls[0].arguments[3].success, false);
+    });
+
+    /**
+     * End to end through the processor, not through the barrier.
+     *
+     * `handleMergeJobError` is this job's generic failure handler and wrote `failed` for every
+     * exception. The barrier raises the unverifiable outcome precisely so that no terminal state
+     * is written while a committed completion cannot be told from an absent one.
+     */
+    test('a completion whose durability cannot be established never becomes a failed record', async () => {
+        refuseCompletedHistoryWrite = true;
+
+        await assert.rejects(() => processMergeConflictJob(createMockJob()), /COMPLETION_DURABILITY_UNVERIFIABLE/);
+
+        const settled = mockStateManager.updateTaskState.mock.calls
+            .map((call: { arguments: [string, string] }) => call.arguments[1])
+            .filter((state: string) => state === 'failed' || state === 'cancelled');
+        assert.deepStrictEqual(settled, [],
+            'a task whose completion may already be durable must not be settled as failed');
     });
 });

@@ -20,6 +20,7 @@ import { AI_COMMIT_AUTHOR } from './commitAuthor.js';
 import type { GitHubToken } from './githubTypes.js';
 import { classifyExecutionFailure } from './executionOutcome.js';
 import { markTaskTerminalState } from './terminalTaskState.js';
+import { durableOperationIdentity } from '@propr/core';
 import { saveRetainedCheckpoint } from './checkpointRetentionStore.js';
 
 export function getErrorMessage(error: unknown): string {
@@ -224,8 +225,13 @@ export async function handleStoppedAdmittedExecution(options: PostProcessOptions
         ...(retainedWorktreePath ? { retainedWorktreePath } : {}),
     };
     try {
-        await markTaskTerminalState({ stateManager, taskId, claudeResult, postProcessingResult: stopped, commitResult: null },
-            { requireDurableHistory: true });
+        await markTaskTerminalState({
+            stateManager, taskId, claudeResult, postProcessingResult: stopped, commitResult: null,
+            // A stopped execution always settles on the durable `failed` branch, never through the
+            // completion barrier; the identity is supplied so the shape of the call cannot drift
+            // into an unkeyed completion if that ever changes.
+            operationId: durableOperationIdentity('issue-stopped-execution', taskId),
+        }, { requireDurableHistory: true });
     } catch (error) {
         (error as ErrorWithExecutionCheckpoint).executionCheckpoint = executionCheckpoint;
         (error as ErrorWithExecutionCheckpoint).retainedWorktreePath = retainedWorktreePath;

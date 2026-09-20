@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { completionCoreExports } from './helpers/completionCoreDoubles.js';
 import { mock, test } from 'node:test';
 import { buildVisualPreviewPrompt } from '../packages/core/src/services/visualPreviewService.js';
 
@@ -10,7 +11,17 @@ const outputPath = 'docs/spikes/report.md';
 const correction = { itemId: 'investigation', outputPath, priorRevision: head,
   deadline: new Date(Date.now() + 60_000).toISOString() };
 let admitted = true;
-const stateManager = { createTaskState: noop, updateTaskState: noop, updateHistoryMetadata: noop };
+/** Terminal writes this suite observes, so "nothing was settled" is asserted, not assumed. */
+const taskStateWrites: string[] = [];
+/** Reproduces a database that refuses the completed history row. */
+let refuseCompletedHistoryWrite = false;
+const stateManager = {
+  createTaskState: noop, updateHistoryMetadata: noop,
+  updateTaskState: async (_taskId: string, state: string) => {
+    taskStateWrites.push(state);
+    if (refuseCompletedHistoryWrite && state === 'completed') throw new Error('database refused the completed history row');
+  },
+};
 const request = async (route: string) => ({ data: route.startsWith('GET')
   ? { head: { ref: 'feature', sha: head }, body: '', labels: [{ name: 'propr' }], user: { login: 'owner' }, title: 'Change' }
   : { id: 1, html_url: 'https://example.test/comment/1', body: 'completed' } });
@@ -21,6 +32,7 @@ const agent = mock.fn(async (_options: { prompt: string }) => { throw new Error(
 await mock.module('ioredis', { namedExports: { Redis: class {} } });
 await mock.module('node:child_process', { namedExports: { execFileSync: () => head } });
 await mock.module('@propr/core', { namedExports: {
+        ...completionCoreExports,
   logger: { ...log, withCorrelation: () => log }, TaskStates: { PROCESSING: 'processing', COMPLETED: 'completed' },
   // The completed-publication durability barrier categorises its own bookkeeping failure, and
   // the terminal agentOutcome it records redacts the agent's final output.
@@ -89,6 +101,7 @@ await mock.module('../src/jobs/prCommentJobUtils.js', { namedExports: {
 await mock.module('../src/jobs/reviewCommentGatherer.js', { namedExports: { markReviewFindingsProcessed: noop } });
 const { processPullRequestCommentJob } = await import('../src/jobs/processPullRequestCommentJob.js');
 const { handlePostExecution } = await import('../src/jobs/prCommentPostExecution.js');
+const { isCompletionDurabilityUnverifiable } = await import('../src/jobs/completionDurabilityOutcome.js');
 
 for (const exactScope of [true, false]) test(`actual PR-comment prompt preserves ${exactScope ? 'exact correction scope' : 'ordinary previews'}`, async () => {
   admitted = exactScope;
@@ -112,4 +125,37 @@ for (const exactScope of [true, false]) test(`actual PR-comment publication ${ex
   ezerAdmissionVerified: exactScope,
   } as never, 'https://example.test/task');
   assert.equal(preparePreview.mock.callCount(), exactScope ? 0 : 1);
+});
+
+/**
+ * End to end on the PR-comment path: the real post-execution publishes through the real barrier,
+ * the completed write fails, the read-back cannot be performed — and the job's own outer failure
+ * handler must decline to settle. Testing the barrier alone is what let this through last time:
+ * the barrier refused to guess, and the caller wrote `failed` anyway.
+ */
+test('a PR-comment completion whose durability is unverifiable settles nothing terminal', async () => {
+  refuseCompletedHistoryWrite = true;
+  taskStateWrites.length = 0;
+  const job = { id: 'fixture-job', data: {} };
+  const error = await handlePostExecution({ state: {
+    octokit, worktreeInfo: { worktreePath: '/fixture', branchName: 'feature' },
+    claudeResult: { success: true }, authorsText: '@owner', unprocessedComments: [], startingWorkComment: { data: { id: 1 } },
+  }, job, taskId: 'fixture', stateManager,
+  context: { repoOwner: 'owner', repoName: 'repo', pullRequestNumber: 1, correlatedLogger: log },
+  unprocessedReviewComments: [], redisClient: {}, prProcessingLockKey: 'lock', prProcessingLockToken: 'attempt',
+  } as never, 'https://example.test/task').then(() => undefined, (thrown: unknown) => thrown);
+
+  assert.ok(isCompletionDurabilityUnverifiable(error), 'the barrier refuses to guess');
+  // The processor's own generic failure handler, not a stub: it must re-throw rather than settle.
+  await assert.rejects(() => utils.handleJobError(error as Error, job as never, {
+    pullRequestNumber: 1, repoOwner: 'owner', repoName: 'repo', authorsText: '@owner', unprocessedComments: [],
+    octokit, startingWorkComment: { data: { id: 1 } }, claudeResult: { success: true },
+    correlationId: 'fixture', correlatedLogger: log, stateManager, taskId: 'fixture',
+  } as never), /COMPLETION_DURABILITY_UNVERIFIABLE/);
+
+  assert.deepEqual(taskStateWrites.filter(state => ['failed', 'cancelled'].includes(state)), [],
+    'no failed or cancelled record may follow a completion that might have committed');
+  assert.ok(taskStateWrites.filter(state => state === 'completed').length > 0,
+    'the only terminal writes attempted are the completed ones the barrier retried, and none of them landed');
+  refuseCompletedHistoryWrite = false;
 });

@@ -1,4 +1,12 @@
 import { test, mock } from 'node:test';
+import { nonExecutingCompletionGuard } from '../packages/core/src/utils/completionGuard.js';
+
+/**
+ * These tests exercise the transition mechanics, not a model execution, so they present the
+ * non-executing capability. Publishing `completed` without one is refused at the boundary — which
+ * is the point: a completion can no longer be written by anything that did not say why it may.
+ */
+const TEST_COMPLETION_GUARD = nonExecutingCompletionGuard('state-manager transition mechanics under test');
 import assert from 'node:assert';
 
 // Mock Redis
@@ -836,7 +844,8 @@ test('updateTaskState stores prResult metadata', async () => {
     const prResult = { prNumber: 456, prUrl: 'https://github.com/pr-owner/pr-repo/pull/456' };
     const result = await stateManager.updateTaskState('task-pr', TaskStates.COMPLETED, {
         prResult,
-        reason: 'PR created successfully'
+        reason: 'PR created successfully',
+        completionGuard: TEST_COMPLETION_GUARD,
     });
 
     // Verify prResult was stored
@@ -1033,7 +1042,7 @@ test('updateTaskState handles database error gracefully', async () => {
     mockRedisInstance.eval.mock.resetCalls();
     mockPublishTaskUpdate.mock.resetCalls();
     await assert.rejects(stateManager.updateTaskState('task-db-error-update', TaskStates.COMPLETED,
-        { requireDurableHistory: true }), /Task history was not persisted/);
+        { requireDurableHistory: true, completionGuard: TEST_COMPLETION_GUARD }), /Task history was not persisted/);
     assert.equal(mockPublishTaskUpdate.mock.calls.length, 0, 'failed durable settlement must not publish completion');
     assert.equal(mockRedisInstance.eval.mock.calls.length, 2, 'restore only the exact failed Redis projection');
     assert.equal(mockRedisInstance.eval.mock.calls[1].arguments[3], mockRedisInstance.eval.mock.calls[0].arguments[5]);
@@ -1072,7 +1081,8 @@ test('updateTaskState includes commitHash in database metadata', async () => {
 
     await stateManager.updateTaskState('task-commit', TaskStates.COMPLETED, {
         reason: 'Task completed',
-        commitHash: 'abc123def456'
+        commitHash: 'abc123def456',
+        completionGuard: TEST_COMPLETION_GUARD,
     });
 
     // Verify commitHash is included in database metadata
@@ -2794,7 +2804,7 @@ test('updateTaskStateIfCurrent atomically updates a matching task snapshot', asy
             correlationId: current.correlationId,
         },
         TaskStates.COMPLETED,
-        { reason: 'Finalized by worker event' },
+        { reason: 'Finalized by worker event', completionGuard: TEST_COMPLETION_GUARD },
     );
 
     assert.equal(updated?.state, TaskStates.COMPLETED);
@@ -2898,7 +2908,7 @@ test('stale metadata updates retry without resurrecting a finalized task', async
             correlationId: initial.correlationId,
         },
         TaskStates.COMPLETED,
-        { reason: 'Finalized while metadata writer was paused' },
+        { reason: 'Finalized while metadata writer was paused', completionGuard: TEST_COMPLETION_GUARD },
     );
     releaseStaleWriter?.();
     const metadataState = await metadataUpdate;

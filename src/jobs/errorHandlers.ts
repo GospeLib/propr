@@ -1,4 +1,5 @@
 import type { Job } from 'bullmq';
+import { isCompletionDurabilityUnverifiable } from './completionDurabilityOutcome.js';
 import type { Logger } from 'pino';
 import {
     safeRemoveLabel,
@@ -255,6 +256,13 @@ export async function handleGenericError(
     options: GenericErrorOptions
 ): Promise<void> {
     const { octokit, claudeResult, worktreeInfo, correlatedLogger, stateManager, taskId, AI_PROCESSING_TAG } = options;
+    // The completion may have committed and could not be read back. Writing any terminal state
+    // now is the re-dispatch defect itself, so this handler declines the job entirely.
+    if (isCompletionDurabilityUnverifiable(error)) {
+        correlatedLogger.error({ taskId, error: error.message },
+            'Issue job completion durability is unverifiable; leaving the task unsettled');
+        throw error;
+    }
     const errorCategory = categorizeError(error.message);
     const isUserCancelled = error.message?.includes('aborted by user');
 

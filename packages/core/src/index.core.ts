@@ -12,6 +12,9 @@ export type { LlmLogEntry, WorkReference, WorkType } from './utils/llmLogger.js'
 export type { LLMMetricsSummary, LLMMetricsData, RecordMetricsOptions, ClaudeResult as LLMClaudeResult, IssueRef as LLMIssueRef, ModelPricing, ExtractedMetrics, AggregatedMetrics, CostCheckMetrics, PersistMetrics, ConversationDetail, LLMMetricsSummaryResult, ModelMetrics, DailyMetric, HighCostAlert, ConversationStep, TokenUsage, ExecutionType } from './utils/llmMetrics.types.js';
 export { WorkerStateManager, getStateManager, closeStateManager, TaskStates } from './utils/workerStateManager.js';
 export { taskStateExpectation, MAX_ATOMIC_UPDATE_ATTEMPTS, waitForAtomicUpdateRetry } from './utils/workerStateTransition.js';
+export { durableExecutionCompletionGuard, nonExecutingCompletionGuard, isCompletionGuard, assertCompletionGuarded, UNGUARDED_TASK_COMPLETION, COMPLETION_GUARD_IDENTITY_MISMATCH } from './utils/completionGuard.js';
+export type { CompletionGuard } from './utils/completionGuard.js';
+export { claimTerminalTransition, terminalTransitionId, durableOperationIdentity, TERMINAL_OPERATION_IDENTITY_MISSING } from './utils/terminalTransitionClaim.js';
 export { hashTaskAttemptToken } from './utils/taskAttemptGeneration.js';
 export { getEventPublisher, closeEventPublisher, EventPublisher } from './utils/eventPublisher.js';
 export type { TaskState, IssueRef, HistoryEntry, LastError, ClaudeResultSummary, ClaudeResultPhase, PRResult, TaskStateData, TaskStateExpectation, TaskStatePublicationResult, TaskStateUpdateResult, UpdateMetadata, TaskResult, ResumableTaskInfo, NonTerminalTaskScanResult, WorkerStateManagerOptions } from './utils/workerStateManager.types.js';

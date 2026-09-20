@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { completionCoreExports } from './helpers/completionCoreDoubles.js';
 import { mock, test } from 'node:test';
 
 const noOp = () => undefined;
@@ -11,7 +12,8 @@ const context = { jobId: 'job', taskId: 'task', agentAlias: 'default', modelName
     executionAdmissionReceipt: { admissionId: 'admission', operationId: 'operation', receiptKey: 'receipt' },
     issuePayload: { title: 'story', labels: [] }, repoPayload: { defaultBranch: 'stage' } },
   stateManager: { getTaskCancellation: async () => undefined, createTaskState: noOp, updateTaskState: noOp } };
-await mock.module('@propr/core', { namedExports: { ...publicationPolicy, logger: log, TaskStates: { PROCESSING: 'processing', FAILED: 'failed' },
+await mock.module('@propr/core', { namedExports: {
+        ...completionCoreExports, ...publicationPolicy, logger: log, TaskStates: { PROCESSING: 'processing', FAILED: 'failed' },
   ensureRepoCloned: async () => '/unused', getRepoUrl: () => 'https://example.invalid/repo', safeAddLabel: noOp,
   safeRemoveLabel: noOp, ensureGitRepository: noOp, UsageLimitError: class extends Error {},
   validateRepositoryInfo: noOp, addModelSpecificDelay: noOp, withRetry: noOp, retryConfigs: {}, updatePlanIssueTaskId: noOp } });

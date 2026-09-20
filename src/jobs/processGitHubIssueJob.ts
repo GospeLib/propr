@@ -9,6 +9,7 @@ import {
   UsageLimitError, validateRepositoryInfo, addModelSpecificDelay, withRetry, retryConfigs, updatePlanIssueTaskId
 } from '@propr/core';
 import { inspectConfiguredEzerAdmission } from './ezerExecutionAdmission.js';
+import { durableOperationIdentity } from '@propr/core';
 import type { IssueJobData, JobResult, WorktreeInfo, ClaudeCodeResponse, CommitResult, RepoValidationResult } from '@propr/core';
 import { handleDispatch } from './issueJobDispatcher.js';
 import { handleUsageLimitError, handleGenericError, updateTaskTitleInStorage, buildFinalResult } from './issueJobHelpers.js';
@@ -144,6 +145,11 @@ export async function processGitHubIssueJob(job: Job<IssueJobData>): Promise<Job
     await markTaskComplete({
       stateManager,
       taskId,
+      // The signed admission owns this attempt where there is one; otherwise the queue job does.
+      // Both are durable and unchanged across a crash and a redelivery, which is what the
+      // terminal transition's idempotency key needs in order to mean anything.
+      operationId: durableOperationIdentity('issue-job',
+        issueRef.executionAdmissionReceipt?.operationId ?? jobId ?? correlationId),
       issueRef,
       currentIssueLabels: currentLabels,
       claudeResult,

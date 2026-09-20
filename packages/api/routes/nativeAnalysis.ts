@@ -1,7 +1,8 @@
 import { randomUUID, createHash } from 'node:crypto';
 import {
     getStateManager, runWithExecutionAbortSignal, runWithPlannerAbortContext, TaskStates, SyntheticAgent,
-    type Agent, type AnalyzeOptions, type WorkerStateManager,
+    claimTerminalTransition, durableOperationIdentity, durableExecutionCompletionGuard,
+    type Agent, type AnalyzeOptions, type UpdateMetadata, type WorkerStateManager,
 } from '@propr/core';
 import { setAbortSignal } from './plannerAbortHandlers.js';
 const CANCELLATION_CHECKPOINT_TIMEOUT_MS = 2_000;
@@ -134,10 +135,24 @@ export async function nativeAnalysis(
         }), attemptGeneration));
         await cancellationCheckpoint;
         let settlementError: string | undefined;
-        try { await state.updateTaskState(taskId,
-            signal.aborted ? TaskStates.CANCELLED : result.success ? TaskStates.COMPLETED : TaskStates.FAILED,
-            { requireDurableHistory: true, historyMetadata: { ...evidence, ...schemaEvidence(), result, childStopped, containerStopped,
-                cancellationAcknowledged: signal.aborted, cancellationCheckpointErrors: [...cancellationCheckpointErrors] } });
+        const terminalState = signal.aborted ? TaskStates.CANCELLED : result.success ? TaskStates.COMPLETED : TaskStates.FAILED;
+        try {
+            // This route runs a model execution and publishes its own `completed`, so it claims a
+            // durable transition identity and presents the execution capability exactly as the
+            // queued paths do. A claim or write that fails leaves the terminal record unwritten
+            // and says so on the receipt; it never settles the run as something it was not.
+            let completionKey: UpdateMetadata = {};
+            if (terminalState === TaskStates.COMPLETED) {
+                const transitionId = await claimTerminalTransition(taskId, TaskStates.COMPLETED,
+                    durableOperationIdentity('native-analysis', binding.operationId));
+                completionKey = { transitionId, completionGuard: durableExecutionCompletionGuard(transitionId) };
+            }
+            await state.updateTaskState(taskId, terminalState,
+                { requireDurableHistory: true, ...completionKey,
+                    historyMetadata: { ...evidence, ...schemaEvidence(), result, childStopped, containerStopped,
+                        // The terminal outcome a value-only reader needs, beside the raw result.
+                        agentOutcome: { success: result.success, executionTimeMs: result.executionTimeMs },
+                        cancellationAcknowledged: signal.aborted, cancellationCheckpointErrors: [...cancellationCheckpointErrors] } });
         } catch (error) { settlementError = (error as Error).message; }
         // Execution already returned: bookkeeping failure is not a second model
         // outcome. Preserve its paid response, but explicitly refuse a settled receipt.

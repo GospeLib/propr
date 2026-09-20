@@ -11,7 +11,6 @@
  * be failed per state, so they assert what a reader holding only the durable history sees.
  */
 import assert from 'node:assert/strict';
-import { readdir, readFile } from 'node:fs/promises';
 import { beforeEach, describe, mock, test } from 'node:test';
 
 const TASK_STATES = {
@@ -51,6 +50,9 @@ const EXECUTION_TIME_MS = 8765;
 const PR_NUMBER = 4711;
 const PR_URL = 'https://github.com/GospeLib/main/pull/4711';
 const COMMIT_HASH = 'c0ffee1234567890';
+/** The durable logical-operation identity a caller supplies; stable across crash and redelivery. */
+const OPERATION_IDENTITY = 'issue-job:job-completion-durability';
+const OTHER_OPERATION_IDENTITY = 'issue-job:job-completion-durability-retry';
 
 // ---------------------------------------------------------------- Redis double
 
@@ -98,6 +100,55 @@ const ambiguousCommitStates = new Set<string>();
 /** Refuses the read-back, so whether a completion is durable cannot be established. */
 let failHistoryReadBack = false;
 
+/** The durable terminal-transition claims, written before any terminal history row. */
+interface ClaimRow {
+    transition_id: string;
+    task_id: string;
+    state: string;
+    operation_id: string;
+    claimed_at: string;
+}
+const claimRows: ClaimRow[] = [];
+/** Refuses the claim, so no durable identity can be established for the transition. */
+let failTransitionClaim = false;
+
+/** Deferred so nothing runs — and nothing rejects — until the caller actually awaits. */
+function lazyResult<T>(run: () => Promise<T>) {
+    return {
+        then: (resolve?: (value: T) => unknown, reject?: (error: unknown) => unknown) => run().then(resolve, reject),
+        catch: (reject?: (error: unknown) => unknown) => run().catch(reject),
+        finally: (settled?: () => void) => run().finally(settled),
+    };
+}
+
+function terminalTransitionClaimQuery() {
+    let criteria: Record<string, unknown> = {};
+    const appendClaim = async (row: ClaimRow, ignoreConflict: boolean) => {
+        if (failTransitionClaim) throw new Error('database refused the transition claim');
+        const existing = claimRows.find(candidate => candidate.transition_id === row.transition_id);
+        if (existing && !ignoreConflict) throw new Error('UNIQUE constraint failed: task_terminal_transitions.transition_id');
+        if (!existing) claimRows.push(row);
+        return [claimRows.length];
+    };
+    const query = {
+        insert: (row: ClaimRow) => Object.assign(lazyResult(() => appendClaim(row, false)), {
+            onConflict: (_column: string) => ({ ignore: () => lazyResult(() => appendClaim(row, true)) }),
+        }),
+        where: (value: Record<string, unknown>) => { criteria = { ...criteria, ...value }; return query; },
+        first: async () => {
+            if (failTransitionClaim) throw new Error('database refused the transition claim read');
+            const row = claimRows.find(candidate =>
+                Object.entries(criteria).every(([key, value]) => candidate[key as keyof ClaimRow] === value));
+            return row ? { ...row } : undefined;
+        },
+    };
+    return query;
+}
+
+function databaseTable(table: string) {
+    return table === 'task_terminal_transitions' ? terminalTransitionClaimQuery() : taskHistoryQuery();
+}
+
 function taskHistoryQuery() {
     let criteria: Record<string, unknown> = {};
     let expectedMetadata: string | null | undefined;
@@ -141,7 +192,7 @@ function taskHistoryQuery() {
 }
 
 await mock.module('../packages/core/src/db/connection.js', {
-    namedExports: { db: (_table: string) => taskHistoryQuery() },
+    namedExports: { db: (table: string) => databaseTable(table) },
 });
 
 await mock.module('../packages/core/src/utils/eventPublisher.js', {
@@ -156,12 +207,27 @@ await mock.module('../packages/core/src/utils/logger.js', {
 
 // --------------------------------------------------- Barrel double for src/jobs
 
+// The real capability module, so the brand the barrier mints is the one the transition builder
+// checks. A double here would let an unguarded completion through and prove nothing.
+const { durableExecutionCompletionGuard, nonExecutingCompletionGuard } =
+    await import('../packages/core/src/utils/completionGuard.js');
+// The real claim too, so the durable identity under test is the production one, writing through
+// the database double above rather than a stub that could not fail.
+const { claimTerminalTransition, terminalTransitionId, durableOperationIdentity, TERMINAL_OPERATION_IDENTITY_MISSING } =
+    await import('../packages/core/src/utils/terminalTransitionClaim.js');
+
 await mock.module('@propr/core', {
     namedExports: {
         TaskStates: TASK_STATES,
         ErrorCategories: ERROR_CATEGORIES,
         logger: { ...coreLogger, withCorrelation: () => coreLogger },
-        db: (_table: string) => taskHistoryQuery(),
+        db: (table: string) => databaseTable(table),
+        durableExecutionCompletionGuard,
+        nonExecutingCompletionGuard,
+        claimTerminalTransition,
+        terminalTransitionId,
+        durableOperationIdentity,
+        TERMINAL_OPERATION_IDENTITY_MISSING,
         redactSecrets: (value: string) => value,
         resolveAgentTerminationReason: () => undefined,
         filterCommentByAuthor: () => ({ shouldFilter: false }),
@@ -185,7 +251,8 @@ const { markTaskTerminalState } = await import('../src/jobs/terminalTaskState.js
 const {
     publishCompletedWithDurableExecutionEvidence,
     carriesTerminalExecutionEvidence,
-    terminalTransitionId,
+    isCompletionDurabilityUnverifiable,
+    CompletionDurabilityUnverifiableError,
     COMPLETION_WITHOUT_EXECUTION_EVIDENCE,
     COMPLETION_HISTORY_NOT_DURABLE,
     COMPLETION_DURABILITY_UNVERIFIABLE,
@@ -283,6 +350,8 @@ beforeEach(() => {
     ambiguousCommitStates.clear();
     failHistoryReadBack = false;
     failHistoryMetadataRewrite = false;
+    failTransitionClaim = false;
+    claimRows.length = 0;
     seedProcessingTask();
 });
 
@@ -295,6 +364,7 @@ describe('completed is never published without durable execution evidence', () =
             () => publishCompletedWithDurableExecutionEvidence({
                 stateManager: manager as never,
                 taskId: TASK_ID,
+                operationId: OPERATION_IDENTITY,
                 // Exactly what the paths used to publish: a reason and a GitHub comment, no outcome.
                 metadata: { reason: 'Task completed successfully', historyMetadata: { githubComment: { url: PR_URL } } },
             }),
@@ -314,7 +384,7 @@ describe('completed is never published without durable execution evidence', () =
         assert.equal(carriesTerminalExecutionEvidence({ claudeResult: provisional }), false);
         await assert.rejects(
             () => publishCompletedWithDurableExecutionEvidence({
-                stateManager: manager as never, taskId: TASK_ID,
+                stateManager: manager as never, taskId: TASK_ID, operationId: OPERATION_IDENTITY,
                 metadata: { reason: 'Task completed successfully', claudeResult: provisional },
             }),
             new RegExp(COMPLETION_WITHOUT_EXECUTION_EVIDENCE),
@@ -348,7 +418,7 @@ describe('completed is never published without durable execution evidence', () =
         // fallback failed row can land, so the error surfaces instead of a silent completion.
         failedInsertStates.add(TASK_STATES.FAILED);
         await assert.rejects(() => markTaskTerminalState({
-            stateManager: manager as never, taskId: TASK_ID, claudeResult,
+            stateManager: manager as never, taskId: TASK_ID, operationId: OPERATION_IDENTITY, claudeResult,
             postProcessingResult: POST_PROCESSING_RESULT, commitResult: COMMIT_RESULT,
         }));
 
@@ -366,7 +436,7 @@ describe('completed is never published without durable execution evidence', () =
         failedInsertStates.add(TASK_STATES.COMPLETED);
 
         await markTaskTerminalState({
-            stateManager: manager as never, taskId: TASK_ID, claudeResult: successfulClaudeResult(),
+            stateManager: manager as never, taskId: TASK_ID, operationId: OPERATION_IDENTITY, claudeResult: successfulClaudeResult(),
             postProcessingResult: POST_PROCESSING_RESULT, commitResult: COMMIT_RESULT,
         });
 
@@ -392,7 +462,7 @@ describe('completed is never published without durable execution evidence', () =
             { success: false, sessionId: SESSION_ID, executionTime: EXECUTION_TIME_MS }, jobLogger);
 
         await markTaskTerminalState({
-            stateManager: manager as never, taskId: TASK_ID, claudeResult: successfulClaudeResult(false),
+            stateManager: manager as never, taskId: TASK_ID, operationId: OPERATION_IDENTITY, claudeResult: successfulClaudeResult(false),
             postProcessingResult: null, commitResult: null,
         });
 
@@ -416,7 +486,7 @@ describe('completed is never published without durable execution evidence', () =
             { success: true, sessionId: SESSION_ID, executionTime: EXECUTION_TIME_MS }, jobLogger);
 
         await markTaskTerminalState({
-            stateManager: manager as never, taskId: TASK_ID, claudeResult: successfulClaudeResult(),
+            stateManager: manager as never, taskId: TASK_ID, operationId: OPERATION_IDENTITY, claudeResult: successfulClaudeResult(),
             postProcessingResult: POST_PROCESSING_RESULT, commitResult: COMMIT_RESULT,
         });
 
@@ -442,7 +512,7 @@ describe('completed is never published without durable execution evidence', () =
             { success: true, sessionId: SESSION_ID, executionTime: EXECUTION_TIME_MS }, jobLogger);
 
         await markTaskTerminalState({
-            stateManager: manager as never, taskId: TASK_ID, claudeResult: successfulClaudeResult(),
+            stateManager: manager as never, taskId: TASK_ID, operationId: OPERATION_IDENTITY, claudeResult: successfulClaudeResult(),
             postProcessingResult: POST_PROCESSING_RESULT, commitResult: COMMIT_RESULT,
         });
 
@@ -473,7 +543,7 @@ describe('an ambiguous commit is established, never assumed', () => {
         ambiguousCommitStates.add(TASK_STATES.COMPLETED);
 
         await markTaskTerminalState({
-            stateManager: manager as never, taskId: TASK_ID, claudeResult: successfulClaudeResult(),
+            stateManager: manager as never, taskId: TASK_ID, operationId: OPERATION_IDENTITY, claudeResult: successfulClaudeResult(),
             postProcessingResult: POST_PROCESSING_RESULT, commitResult: COMMIT_RESULT,
         });
 
@@ -495,7 +565,7 @@ describe('an ambiguous commit is established, never assumed', () => {
         failHistoryReadBack = true;
 
         await assert.rejects(() => publishCompletedWithDurableExecutionEvidence({
-            stateManager: manager as never, taskId: TASK_ID,
+            stateManager: manager as never, taskId: TASK_ID, operationId: OPERATION_IDENTITY,
             metadata: { reason: 'Task completed successfully', historyMetadata: { agentOutcome: { success: true } } },
         }), new RegExp(COMPLETION_DURABILITY_UNVERIFIABLE));
 
@@ -505,14 +575,25 @@ describe('an ambiguous commit is established, never assumed', () => {
         await manager.close();
     });
 
-    test('the idempotency key is stable across retries and never collides across transitions', async () => {
-        assert.notEqual(terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED), terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED),
-            'two genuinely different terminal transitions of one task get different keys');
-        assert.notEqual(terminalTransitionId(TASK_ID, TASK_STATES.FAILED), terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED));
+    test('the idempotency key is derived from the durable operation, so a queue retry recomputes it', async () => {
+        // The property that matters: the SAME logical operation always addresses the same row,
+        // including from a different process after a crash. A per-attempt random value did not.
+        assert.equal(terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED, OPERATION_IDENTITY),
+            terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED, OPERATION_IDENTITY),
+            'one logical operation always derives one key');
+        assert.notEqual(terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED, OPERATION_IDENTITY),
+            terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED, OTHER_OPERATION_IDENTITY),
+            'a genuinely different operation gets a different key');
+        assert.notEqual(terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED, OPERATION_IDENTITY),
+            terminalTransitionId(TASK_ID, TASK_STATES.FAILED, OPERATION_IDENTITY),
+            'and so does a different target state');
+        assert.notEqual(terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED, OPERATION_IDENTITY),
+            terminalTransitionId(`${TASK_ID}-other`, TASK_STATES.COMPLETED, OPERATION_IDENTITY),
+            'and so does a different task');
 
         // At the database: a retry of ONE transition is rejected, two different ones both land.
-        const first = terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED);
-        const second = terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED);
+        const first = terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED, OPERATION_IDENTITY);
+        const second = terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED, OTHER_OPERATION_IDENTITY);
         const row = (transitionId: string) => ({
             task_id: TASK_ID, state: TASK_STATES.COMPLETED, timestamp: '2026-09-20T10:05:00.000Z',
             reason: 'Task completed successfully', metadata: '{}', transition_id: transitionId,
@@ -524,128 +605,142 @@ describe('an ambiguous commit is established, never assumed', () => {
             'different transitions of the same task are not blocked by each other');
     });
 
+    test('the identity is claimed durably before the terminal write, and re-claimed unchanged', async () => {
+        const claimed = await claimTerminalTransition(TASK_ID, TASK_STATES.COMPLETED, OPERATION_IDENTITY);
+        assert.equal(claimRows.length, 1, 'the claim is a durable row of its own, written before any history row');
+        assert.equal(claimRows[0].operation_id, OPERATION_IDENTITY, 'and records the operation it belongs to');
+        assert.equal(rowsOf(TASK_STATES.COMPLETED).length, 0, 'and precedes the terminal history entry');
+
+        const reclaimed = await claimTerminalTransition(TASK_ID, TASK_STATES.COMPLETED, OPERATION_IDENTITY);
+        assert.equal(reclaimed, claimed, 'the retry reads back the identity the first attempt claimed');
+        assert.equal(claimRows.length, 1, 'and does not mint a second one');
+    });
+
+    test('a caller with no durable operation identity is refused rather than given a per-attempt key', () => {
+        assert.equal(durableOperationIdentity('issue-job', 'job-42'), 'issue-job:job-42');
+        assert.throws(() => durableOperationIdentity('issue-job', undefined), new RegExp(TERMINAL_OPERATION_IDENTITY_MISSING));
+        assert.throws(() => durableOperationIdentity('issue-job', '  '), new RegExp(TERMINAL_OPERATION_IDENTITY_MISSING));
+    });
+
     test('the failed settlement carries its own key, distinct from the completion it replaces', async () => {
         const manager = stateManager();
         await startExecution(manager);
         failedInsertStates.add(TASK_STATES.COMPLETED);
 
         await markTaskTerminalState({
-            stateManager: manager as never, taskId: TASK_ID, claudeResult: successfulClaudeResult(),
+            stateManager: manager as never, taskId: TASK_ID, operationId: OPERATION_IDENTITY, claudeResult: successfulClaudeResult(),
             postProcessingResult: POST_PROCESSING_RESULT, commitResult: COMMIT_RESULT,
         });
 
         const failed = rowsOf(TASK_STATES.FAILED);
         assert.equal(failed.length, 1);
-        assert.match(String(failed[0].transition_id), new RegExp(`^${TASK_STATES.FAILED}:${TASK_ID}:`),
-            'the settlement is its own transition, keyed as such');
+        assert.equal(failed[0].transition_id,
+            terminalTransitionId(TASK_ID, TASK_STATES.FAILED, `${OPERATION_IDENTITY}#completion-persistence-failed`),
+            'the settlement is its own logical transition of the same operation, and claims its own key');
+        assert.notEqual(failed[0].transition_id, terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED, OPERATION_IDENTITY),
+            'never the key of the completion it replaces');
         await manager.close();
     });
 });
 
-/**
- * The publisher sweep.
- *
- * A hard-coded list of the paths known to publish `completed` can only ever check the paths
- * someone remembered; the task-import job published a model-executed completion for years while
- * such a list passed. These tests instead enumerate every source file, decide from the source
- * itself which ones publish a completion or run a model execution, and hold the whole set to the
- * invariant — so a new publisher fails this test the moment it is written, and can only pass by
- * using the barrier or by being entered, with a reason, in the ledger below (which is re-verified,
- * not trusted).
- */
-const SOURCE_ROOT = new URL('../src/', import.meta.url);
-const BARRIER_MODULE = 'jobs/completedExecutionDurability.ts';
 
-/** Publishing a completion: the terminal helper, or a completed transition of the task state. */
-const PUBLISHES_COMPLETED = /markTaskCompleted\(|state:\s*TaskStates\.COMPLETED|updateTaskState\w*\([^;]{0,240}?TaskStates\.COMPLETED/;
-const USES_BARRIER = /publishCompletedWithDurableExecutionEvidence\(/;
-const RUNS_MODEL_EXECUTION = /\.executeTask\(/;
-
-/**
- * Completion publishers that run no model execution, so they have no execution evidence to make
- * durable. Each reason is re-checked below against the file it claims to describe.
- */
-const NON_EXECUTING_COMPLETION_PATHS = new Map<string, string>([
-    ['jobs/prCommentNoAuthorizedFindings.ts',
-        'no authorized finding was selected, so no agent runs: the job posts a comment and completes'],
-    ['jobs/prCommentReviewJob.ts',
-        'the review workflow runs its own analysis, never the delivery placeholder path'],
-    ['jobs/prCommentTaskFinalizer.ts',
-        'reconciles a task from its BullMQ job outcome; it executes nothing itself'],
-]);
-
-async function sourceFiles(directory: URL = SOURCE_ROOT, prefix = ''): Promise<string[]> {
-    const entries = await readdir(directory, { withFileTypes: true });
-    const files: string[] = [];
-    for (const entry of entries) {
-        if (entry.isDirectory()) files.push(...await sourceFiles(new URL(`${entry.name}/`, directory), `${prefix}${entry.name}/`));
-        else if (entry.name.endsWith('.ts')) files.push(`${prefix}${entry.name}`);
+describe('a crashed attempt and the queue retry that replaces it address one transition', () => {
+    async function publishCompletion(manager: InstanceType<typeof WorkerStateManager>): Promise<void> {
+        await publishCompletedWithDurableExecutionEvidence({
+            stateManager: manager as never, taskId: TASK_ID, operationId: OPERATION_IDENTITY,
+            metadata: {
+                reason: 'Task completed successfully',
+                claudeResult: finalClaudeExecutionResult({ success: true, sessionId: SESSION_ID, executionTime: EXECUTION_TIME_MS }),
+                historyMetadata: { agentOutcome: buildAgentOutcome(successfulClaudeResult()) },
+            },
+        });
     }
-    return files;
-}
 
-async function classifiedSources(): Promise<Array<{ path: string; source: string }>> {
-    const paths = await sourceFiles();
-    return Promise.all(paths.map(async path => ({ path, source: await readFile(new URL(path, SOURCE_ROOT), 'utf8') })));
-}
+    test('the retry recognises the completion the crashed attempt committed, and writes nothing new', async () => {
+        const first = stateManager();
+        await startExecution(first);
+        // The insert commits; the process dies before it hears back. Nothing else runs.
+        ambiguousCommitStates.add(TASK_STATES.COMPLETED);
+        failHistoryReadBack = true;
+        await assert.rejects(() => publishCompletion(first), new RegExp(COMPLETION_DURABILITY_UNVERIFIABLE));
+        await first.close();
+        assert.equal(rowsOf(TASK_STATES.COMPLETED).length, 1, 'the row committed, unknown to the dead process');
 
-describe('every path that publishes completed after a model execution goes through the barrier', () => {
-    test('the sweep sees the sources it is meant to police', async () => {
-        const sources = await classifiedSources();
-        assert.ok(sources.length > 50, 'the enumeration must actually walk the source tree');
-        assert.ok(sources.some(({ path }) => path === BARRIER_MODULE), 'including the barrier itself');
-        const publishers = sources.filter(({ path, source }) => path !== BARRIER_MODULE && PUBLISHES_COMPLETED.test(source))
-            .map(({ path }) => path).sort();
-        assert.deepEqual(publishers, [...NON_EXECUTING_COMPLETION_PATHS.keys()].sort(),
-            'the publishers the sweep finds are exactly the documented non-executing ones');
-        assert.ok(sources.some(({ source }) => RUNS_MODEL_EXECUTION.test(source)), 'and the model-executing paths');
+        // BullMQ redelivers the job. A fresh process, a fresh state manager, the same operation.
+        ambiguousCommitStates.clear();
+        failHistoryReadBack = false;
+        failedInsertStates.add(TASK_STATES.COMPLETED);
+        const retry = stateManager();
+        await publishCompletion(retry);
+
+        assert.equal(rowsOf(TASK_STATES.COMPLETED).length, 1,
+            'the retry derives the same key, reads the committed row back, and adds no second completion');
+        assert.equal(durableRows(TASK_STATES.FAILED).length, 0,
+            'and never settles failed over a completion that is already durable');
+        assert.equal(claimRows.length, 1, 'one logical operation holds exactly one claimed identity');
+        assert.equal(redisState().state, TASK_STATES.COMPLETED);
+        assert.ok(durableCompletionCarriesEvidence());
+        await retry.close();
     });
 
-    test('no source publishes completed outside the barrier except a documented non-executing path', async () => {
-        const sources = await classifiedSources();
-        // A direct publication bypasses the barrier even in a file that also uses it, so using the
-        // barrier is not an excuse here: publishing directly is allowed only for a ledger entry.
-        const unguarded = sources
-            .filter(({ path, source }) => path !== BARRIER_MODULE
-                && PUBLISHES_COMPLETED.test(source)
-                && !NON_EXECUTING_COMPLETION_PATHS.has(path))
-            .map(({ path }) => path);
-        assert.deepEqual(unguarded, [],
-            'a path publishing completed must go through publishCompletedWithDurableExecutionEvidence, '
-            + 'or be entered in NON_EXECUTING_COMPLETION_PATHS with a reason');
+    test('a completion whose identity cannot be claimed settles nothing terminal', async () => {
+        const manager = stateManager();
+        await startExecution(manager);
+        failTransitionClaim = true;
+
+        const error = await publishCompletion(manager).then(() => undefined, (thrown: unknown) => thrown);
+        assert.ok(error instanceof CompletionDurabilityUnverifiableError, 'the dedicated unverifiable type is raised');
+        assert.ok(isCompletionDurabilityUnverifiable(error));
+        assert.equal(rowsOf(TASK_STATES.COMPLETED).length, 0);
+        assert.equal(durableRows(TASK_STATES.FAILED).length, 0,
+            'an attempt that could not establish an identity may not settle failed either');
+        await manager.close();
     });
 
-    test('no documented exception runs a model execution, and none of them has gone stale', async () => {
-        const sources = new Map((await classifiedSources()).map(({ path, source }) => [path, source]));
-        for (const [path, reason] of NON_EXECUTING_COMPLETION_PATHS) {
-            const source = sources.get(path);
-            assert.ok(source, `${path} is listed as an exception but no longer exists: ${reason}`);
-            assert.ok(PUBLISHES_COMPLETED.test(source), `${path} no longer publishes completed; remove its exception`);
-            assert.doesNotMatch(source, RUNS_MODEL_EXECUTION,
-                `${path} now runs a model execution, so it must publish through the barrier`);
-        }
+    test('an older completed row of another transition is not evidence that this one committed', async () => {
+        const manager = stateManager();
+        await startExecution(manager);
+        // A completion of an EARLIER operation is durable in the history, exactly as it would be
+        // after a retried task. This attempt is a different logical operation and its own write
+        // genuinely fails. The by-state inference used to read the older row as proof.
+        await taskHistoryQuery().insert({
+            task_id: TASK_ID, state: TASK_STATES.COMPLETED, timestamp: '2026-09-20T09:00:00.000Z',
+            reason: 'an earlier operation completed this task', metadata: JSON.stringify({ agentOutcome: { success: true } }),
+            transition_id: terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED, OTHER_OPERATION_IDENTITY),
+        });
+        failedInsertStates.add(TASK_STATES.COMPLETED);
+
+        await publishCompletion(manager);
+
+        assert.equal(rowsOf(TASK_STATES.COMPLETED).length, 1, 'no second completed row was inferred into existence');
+        const failed = durableRows(TASK_STATES.FAILED);
+        assert.equal(failed.length, 1,
+            'this transition is confirmed absent by ITS key, so it settles as a durable failure with its evidence');
+        assert.equal(failed[0].completionPersistenceFailed, true);
+        assert.equal(agentOutcomeOf(failed[0])?.success, true);
+        await manager.close();
     });
 
-    test('every model execution that completes its task completes through the barrier', async () => {
-        const sources = await classifiedSources();
-        const executing = sources.filter(({ source }) => RUNS_MODEL_EXECUTION.test(source));
-        assert.ok(executing.length > 0, 'the sweep must find the model-executing paths');
-        for (const { path, source } of executing) {
-            if (!PUBLISHES_COMPLETED.test(source)) continue;
-            assert.match(source, USES_BARRIER,
-                `${path} runs a model execution and publishes completed, so it must use the barrier`);
-        }
+    test('an unverifiable completion is recognisable after crossing a serialisation boundary', () => {
+        const original = new CompletionDurabilityUnverifiableError(TASK_ID, 'read-back refused');
+        assert.ok(isCompletionDurabilityUnverifiable(original));
+        assert.ok(isCompletionDurabilityUnverifiable(new Error(original.message)), 'a re-wrapped message still counts');
+        assert.ok(isCompletionDurabilityUnverifiable(new Error('job failed', { cause: original })), 'and so does a cause chain');
+        assert.equal(isCompletionDurabilityUnverifiable(new Error('agent execution failed')), false);
+        assert.equal(isCompletionDurabilityUnverifiable(undefined), false);
     });
+});
 
-    test('every barrier caller records the terminal agent outcome on the completion', async () => {
-        const callers = (await classifiedSources())
-            .filter(({ path, source }) => path !== BARRIER_MODULE && USES_BARRIER.test(source));
-        assert.ok(callers.length >= 4, 'the issue, PR-comment, merge-conflict and task-import paths all use it');
-        for (const { path, source } of callers) {
-            assert.match(source, /agentOutcome/, `${path} must carry the terminal outcome on its completion`);
-        }
-    });
-
+/**
+ * What the barrier requires of each path's completion metadata.
+ *
+ * The invariant that EVERY completion publisher goes through the barrier is no longer policed by
+ * a regex sweep over one directory — that sweep could only see the spellings it was taught, and
+ * duly mis-classified a review job that executes a model through an imported helper. It is now
+ * enforced twice: by the runtime capability boundary in `@propr/core`, and by the AST rule in
+ * `completionBoundaryRule.test.ts`, which derives the ledger instead of trusting one.
+ */
+describe('a completion carries what the barrier requires of it', () => {
     test("each path's completion metadata satisfies the barrier", () => {
         const claudeResult = successfulClaudeResult();
         const finalResult = finalClaudeExecutionResult({ success: true, sessionId: SESSION_ID, executionTime: EXECUTION_TIME_MS });

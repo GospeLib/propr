@@ -16,42 +16,58 @@
  * not Redis, not the database, not the realtime event — ever shows `completed` without evidence.
  *
  * A write that rejects is not proof that nothing landed: an INSERT can commit and lose its
- * acknowledgement. So every attempt carries one idempotency key (`transition_id`, unique in
- * `task_history`), and after any failure the history is read back by that key before anything is
- * decided — a lost acknowledgement is recognised as the completion it is, rather than rolled back
- * and overwritten by a `failed` fallback that would make a delivered success look re-dispatchable.
+ * acknowledgement. So the transition carries an idempotency key (`transition_id`, unique in
+ * `task_history`) and the history is read back by that key before anything is decided. The key is
+ * NOT invented per attempt: it is derived from the caller's durable logical-operation identity
+ * and claimed in `task_terminal_transitions` before the terminal write, so a process that dies
+ * after a committed insert and a queue that redelivers the job arrive at the SAME key and
+ * recognise the completion that is already durable, instead of writing a second one or settling
+ * `failed` over a delivered success.
  *
  * When the database genuinely will not take the write, the work is not discarded: the task is
  * settled as durably `failed` carrying the same terminal evidence (including an `agentOutcome`
  * that says the model succeeded, and the PR/commit the run produced) plus
  * `completionPersistenceFailed`. That record is terminal, durable and self-describing, so it can
- * be neither mistaken for a delivered success nor read as a fresh unrun task. If even that
- * cannot be persisted, the error propagates and the job fails loudly rather than lying.
+ * be neither mistaken for a delivered success nor read as a fresh unrun task.
+ *
+ * When durability cannot be ESTABLISHED at all — the read-back itself fails, or the identity
+ * cannot be claimed — nothing terminal is written on a guess. `CompletionDurabilityUnverifiableError`
+ * propagates, and every outer failure handler on every path re-throws it instead of settling, so
+ * an unverifiable completion can never be followed by `failed`.
  */
-import { randomUUID } from 'node:crypto';
-import { db, ErrorCategories, TaskStates } from '@propr/core';
+import { db, ErrorCategories, TaskStates, durableExecutionCompletionGuard, claimTerminalTransition } from '@propr/core';
 import type { ClaudeResultSummary, UpdateMetadata, WorkerStateManager } from '@propr/core';
 import type { Logger } from 'pino';
 import { ClaudeResultPhases } from './claudeExecutionResult.js';
+import { CompletionDurabilityUnverifiableError, COMPLETION_DURABILITY_UNVERIFIABLE, isCompletionDurabilityUnverifiable }
+    from './completionDurabilityOutcome.js';
+
+// Re-exported so a caller that already imports the barrier needs no second import; a failure
+// handler that only needs to RECOGNISE the outcome imports the dependency-free module directly.
+export { CompletionDurabilityUnverifiableError, COMPLETION_DURABILITY_UNVERIFIABLE, isCompletionDurabilityUnverifiable };
 
 /** Refused before anything is published: the caller gave no final execution evidence to record. */
 export const COMPLETION_WITHOUT_EXECUTION_EVIDENCE = 'COMPLETION_WITHOUT_DURABLE_EXECUTION_EVIDENCE';
 /** The completed entry could not be persisted; the task was settled as failed instead. */
 export const COMPLETION_HISTORY_NOT_DURABLE = 'COMPLETION_HISTORY_NOT_DURABLE';
-/**
- * The write failed and the history could not be read back, so whether `completed` is durable is
- * unknown. Nothing terminal is written on a guess; the job fails loudly instead.
- */
-export const COMPLETION_DURABILITY_UNVERIFIABLE = 'COMPLETION_DURABILITY_UNVERIFIABLE';
-
 const MAX_DURABLE_COMPLETION_ATTEMPTS = 3;
 const DURABLE_COMPLETION_RETRY_DELAY_MS = 50;
+/** The settlement is its own logical transition of the same operation, and claims its own key. */
+const COMPLETION_PERSISTENCE_FAILED_SUFFIX = '#completion-persistence-failed';
 
 type CompletionStateManager = Pick<WorkerStateManager, 'updateTaskState' | 'markTaskFailed'>;
 
 export interface DurableCompletionOptions {
     stateManager: CompletionStateManager;
     taskId: string;
+    /**
+     * The durable identity of the logical operation publishing this completion — the execution
+     * admission receipt, or the queue job that owns this attempt. It must be readable again,
+     * unchanged, after the process dies and the queue redelivers the job: it is what makes the
+     * idempotency key survive exactly the failure the key exists for. Build it with
+     * `durableOperationIdentity`, never from a clock, a random value or an attempt counter.
+     */
+    operationId: string;
     metadata: UpdateMetadata;
     correlatedLogger?: Logger;
 }
@@ -74,32 +90,19 @@ export function carriesTerminalExecutionEvidence(metadata: UpdateMetadata): bool
 
 /** Settles a success whose completed entry will not persist, without discarding its evidence. */
 async function settleUnrecordableCompletionAsFailed(options: DurableCompletionOptions, cause: Error): Promise<void> {
-    const { stateManager, taskId, metadata, correlatedLogger } = options;
+    const { stateManager, taskId, metadata, operationId, correlatedLogger } = options;
     correlatedLogger?.error({ taskId, error: cause.message },
         'Completed task history could not be persisted; settling the task as failed with its execution evidence');
+    const transitionId = await claimTerminalTransition(taskId, TaskStates.FAILED, `${operationId}${COMPLETION_PERSISTENCE_FAILED_SUFFIX}`);
     await stateManager.markTaskFailed(taskId, new Error(`${COMPLETION_HISTORY_NOT_DURABLE}: ${cause.message}`), {
         errorCategory: ErrorCategories.POST_PROCESSING,
-        transitionId: terminalTransitionId(taskId, TaskStates.FAILED),
+        transitionId,
         ...(metadata.claudeResult ? { claudeResult: metadata.claudeResult } : {}),
         ...(metadata.prResult ? { prResult: metadata.prResult } : {}),
         ...(metadata.commitHash ? { commitHash: metadata.commitHash } : {}),
         historyMetadata: { ...(metadata.historyMetadata ?? {}), completionPersistenceFailed: true },
         requireDurableHistory: true,
     });
-}
-
-/**
- * The idempotency key for one logical terminal transition.
- *
- * Deterministic for that transition: it is computed once, before the first write, and the same
- * value is reused by every retry and by the read-back, so all of them address exactly one row.
- * Non-colliding across genuinely different transitions: the key carries the transition's target
- * state and task id and ends in a fresh 122-bit random UUID, so a second terminal transition of
- * the same task — a later completion, or the `failed` settlement below — is a different key and
- * can never be mistaken for, or blocked by, this one.
- */
-export function terminalTransitionId(taskId: string, state: string): string {
-    return `${state}:${taskId}:${randomUUID()}`;
 }
 
 /** What the durable history says about a completion whose write did not acknowledge. */
@@ -109,17 +112,18 @@ type DurableCompletion = 'durable' | 'absent' | 'unverifiable';
  * Establishes what is actually durable after an ambiguous write, rather than assuming.
  *
  * A rejected INSERT promise is not proof that nothing landed: the row can commit and the
- * acknowledgement be lost. So the history is read back — first for this exact transition key, then
- * for any `completed` row of the task — and only `absent` (a read that succeeded and found
- * nothing) permits a retry or a `failed` settlement.
+ * acknowledgement be lost. So the history is read back by this transition's claimed key — and by
+ * nothing else. There is deliberately no "any completed row for this task" fallback: an older
+ * completed row of some other transition is not evidence that THIS one committed, and inferring
+ * from it is exactly how a reconciliation republished a completion whose evidence never landed.
+ * Only `absent` (a read that succeeded and found no row for this key) permits a retry or a
+ * `failed` settlement.
  */
 async function readBackDurableCompletion(options: DurableCompletionOptions, transitionId: string): Promise<DurableCompletion> {
     const { taskId, correlatedLogger } = options;
     try {
         const byTransition = await db('task_history').where({ task_id: taskId, transition_id: transitionId }).first();
-        if (byTransition) return 'durable';
-        const byState = await db('task_history').where({ task_id: taskId, state: TaskStates.COMPLETED }).first();
-        return byState ? 'durable' : 'absent';
+        return byTransition ? 'durable' : 'absent';
     } catch (error) {
         correlatedLogger?.error({ taskId, transitionId, error: (error as Error).message },
             'Could not read the task history back to establish whether the completed entry is durable');
@@ -138,7 +142,8 @@ async function reconcileDurablyCompletedTask(options: DurableCompletionOptions, 
     correlatedLogger?.warn({ taskId, transitionId },
         'The completed history entry committed despite the failed write; reconciling the projection instead of failing the task');
     try {
-        await stateManager.updateTaskState(taskId, TaskStates.COMPLETED, { ...metadata, transitionId });
+        await stateManager.updateTaskState(taskId, TaskStates.COMPLETED,
+            { ...metadata, transitionId, completionGuard: durableExecutionCompletionGuard(transitionId) });
     } catch (error) {
         // The durable history already says completed, which is what a consumer reads; a projection
         // that could not be caught up is logged, never converted into a terminal failure.
@@ -153,23 +158,32 @@ async function reconcileDurablyCompletedTask(options: DurableCompletionOptions, 
  * Throws `COMPLETION_WITHOUT_DURABLE_EXECUTION_EVIDENCE` when the caller has no final evidence to
  * record — the completion is refused outright rather than published unreadable.
  *
- * Every attempt carries one idempotency key, and no failed attempt is believed: the history is
- * read back before anything else is decided. A commit whose acknowledgement was lost is
- * recognised as the success it is; only a confirmed absence is retried, and only a confirmed
- * absence may settle as failed. When the read-back itself cannot be performed, nothing terminal
- * is written and `COMPLETION_DURABILITY_UNVERIFIABLE` propagates.
+ * The transition identity is claimed durably first, so every attempt — including one made by a
+ * different process after a crash — addresses the same row. No failed attempt is believed: the
+ * history is read back by that key before anything else is decided. A commit whose
+ * acknowledgement was lost is recognised as the success it is; only a confirmed absence is
+ * retried, and only a confirmed absence may settle as failed. When durability cannot be
+ * established, `CompletionDurabilityUnverifiableError` propagates and nothing terminal is written.
  */
 export async function publishCompletedWithDurableExecutionEvidence(options: DurableCompletionOptions): Promise<void> {
-    const { stateManager, taskId, metadata } = options;
+    const { stateManager, taskId, metadata, operationId } = options;
     if (!carriesTerminalExecutionEvidence(metadata)) throw new Error(COMPLETION_WITHOUT_EXECUTION_EVIDENCE);
 
-    const transitionId = terminalTransitionId(taskId, TaskStates.COMPLETED);
+    let transitionId: string;
+    try {
+        transitionId = await claimTerminalTransition(taskId, TaskStates.COMPLETED, operationId);
+    } catch (error) {
+        // Without a durable identity a retry cannot recognise a completion that already committed
+        // on an earlier delivery, so no terminal state may be written on this attempt either.
+        throw new CompletionDurabilityUnverifiableError(taskId, `the transition identity could not be claimed: ${(error as Error).message}`);
+    }
+
     let lastError: Error | undefined;
     let lastReadBack: DurableCompletion = 'absent';
     for (let attempt = 0; attempt < MAX_DURABLE_COMPLETION_ATTEMPTS; attempt++) {
         try {
             await stateManager.updateTaskState(taskId, TaskStates.COMPLETED,
-                { ...metadata, transitionId, requireDurableHistory: true });
+                { ...metadata, transitionId, requireDurableHistory: true, completionGuard: durableExecutionCompletionGuard(transitionId) });
             return;
         } catch (error) {
             lastError = error as Error;
@@ -187,7 +201,7 @@ export async function publishCompletedWithDurableExecutionEvidence(options: Dura
     }
     const cause = lastError ?? new Error('unknown');
     if (lastReadBack === 'unverifiable') {
-        throw new Error(`${COMPLETION_DURABILITY_UNVERIFIABLE}: ${cause.message}`);
+        throw new CompletionDurabilityUnverifiableError(taskId, cause.message);
     }
     await settleUnrecordableCompletionAsFailed(options, cause);
 }

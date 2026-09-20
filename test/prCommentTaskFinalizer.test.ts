@@ -1,4 +1,5 @@
 import { test, mock } from 'node:test';
+import { completionCoreExports } from './helpers/completionCoreDoubles.js';
 import assert from 'node:assert/strict';
 import {
     TaskStates,
@@ -10,6 +11,7 @@ import {
 
 await mock.module('@propr/core', {
     namedExports: {
+        ...completionCoreExports,
         TaskStates,
         taskStateExpectation: (task: TaskStateData): TaskStateExpectation => ({
             state: task.state,
@@ -229,4 +231,33 @@ test('finalization explicitly reports incomplete durable publication', async () 
     assert.equal(result.outcome, 'partial_publication');
     assert.equal(result.stateChanged, true);
     assert.equal(result.publication?.historyPersisted, false);
+});
+
+/**
+ * The worker-level failure handler is the last place an unverifiable completion can be turned
+ * into a `failed` record: the processor re-throws, BullMQ marks the job failed, and this
+ * finalizer settles the task from that outcome. It must decline, including when the error has
+ * been reduced to a BullMQ `failedReason` string and rebuilt as a plain Error.
+ */
+test('a job that failed with an unverifiable completion is never settled as failed', async () => {
+    const store = createStore(makeTask());
+
+    const result = await finalizeFailedPRCommentTask(
+        'task-123',
+        new Error('COMPLETION_DURABILITY_UNVERIFIABLE: database refused the history read-back'),
+        store,
+    );
+
+    assert.equal(result.outcome, 'unverifiable_completion');
+    assert.equal(result.stateChanged, false);
+    assert.equal(store.current().state, TaskStates.PROCESSING, 'the task keeps its non-terminal state');
+});
+
+test('a genuine job failure still settles the task', async () => {
+    const store = createStore(makeTask());
+
+    const result = await finalizeFailedPRCommentTask('task-123', new Error('agent execution failed'), store);
+
+    assert.equal(result.outcome, 'finalized');
+    assert.equal(store.current().state, TaskStates.FAILED);
 });

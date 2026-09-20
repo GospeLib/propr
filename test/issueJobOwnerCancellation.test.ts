@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { completionCoreExports } from './helpers/completionCoreDoubles.js';
 import { mock, test } from 'node:test';
 import { promisify } from 'node:util';
 import { generateClaudePrompt } from '../packages/core/src/claude/prompts/promptGenerator.js';
@@ -14,7 +15,8 @@ const createTaskState=mock.fn(async()=>undefined);
 const getTaskCancellation=mock.fn(async()=>({state:'cancelled',metadata:{controlAdmissionId:'actual-stop'}}));
 const stateManager={createTaskState,getTaskCancellation,getTaskState:async()=>({state:'cancelled'}),updateTaskState:mock.fn()};
 const context={taskId:'same-stopped-task',agentAlias:'default',modelName:'claude-test',stateManager,correlatedLogger:log,correlationId:'correlation',issueRef:{repoOwner:'owner',repoName:'repo',number:1},typedInvestigation:{provider:'claude',deadline:new Date(Date.now()+60_000).toISOString(),outputPath:'report.md'},ezerAdmissionVerified:true};
-await mock.module('@propr/core',{namedExports:{ ...publicationPolicy,
+await mock.module('@propr/core',{namedExports:{
+        ...completionCoreExports, ...publicationPolicy,
  loadRepositoryVisualPreviewSettings:async()=>({enabled:true,types:['image']}),
  logger:log,TaskStates:states,AgentRegistry:{getInstance:()=>({getAgentByAlias:()=>agent})},generateClaudePrompt,updateFileChangesFromWorktree:noOp,recordLLMMetrics:noOp,resolveAgentTerminationReason:noOp,createLogFiles:noOp,redactSecrets:(value:string)=>value,
  ensureRepoCloned:noOp,getRepoUrl:noOp,safeAddLabel:noOp,safeRemoveLabel:noOp,ensureGitRepository:noOp,UsageLimitError:class extends Error{},validateRepositoryInfo:noOp,addModelSpecificDelay:noOp,withRetry:noOp,retryConfigs:{},updatePlanIssueTaskId:noOp,

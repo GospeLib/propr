@@ -26,6 +26,7 @@ describe('issue job terminal state', () => {
 
     await markTaskTerminalState({
       stateManager: stateManager as unknown as StateManager,
+      operationId: 'issue-job:test-terminal-state',
       taskId: 'failed-agent-task',
       claudeResult: {
         success: false,
@@ -55,6 +56,7 @@ describe('issue job terminal state', () => {
 
     await markTaskTerminalState({
       stateManager: stateManager as unknown as StateManager,
+      operationId: 'issue-job:test-terminal-state',
       taskId: 'partial-agent-task',
       claudeResult: {
         success: false,
@@ -100,6 +102,7 @@ describe('issue job terminal state', () => {
 
     await markTaskTerminalState({
       stateManager: stateManager as unknown as StateManager,
+      operationId: 'issue-job:test-terminal-state',
       taskId: 'task-9',
       claudeResult: {
         success: false,
@@ -139,6 +142,7 @@ describe('issue job terminal state', () => {
     const warn = mock.fn();
     await markTaskComplete({
       stateManager: stateManager as unknown as StateManager,
+      operationId: 'issue-job:test-terminal-state',
       taskId: 'task-durable',
       issueRef: { repoOwner: 'owner', repoName: 'repo', number: 9 } as TaskCompletionParams['issueRef'],
       currentIssueLabels: [],

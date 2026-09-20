@@ -50,6 +50,9 @@ export function attachPRCommentTaskStateFinalizers(
                         'Finalized PR comment task in Redis with incomplete publication');
                 } else if (result.outcome === 'task_missing') {
                     logger.warn({ taskId }, 'Could not finalize PR comment task because its state is missing');
+                } else if (result.outcome === 'unverifiable_completion') {
+                    logger.error({ taskId },
+                        'PR comment job failed with an unverifiable completion; the task was deliberately left unsettled');
                 } else if (result.outcome === 'retry_pending') {
                     logger.debug({ taskId }, 'PR comment job failure is retryable; task was not finalized');
                 } else {

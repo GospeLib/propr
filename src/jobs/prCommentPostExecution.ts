@@ -31,6 +31,7 @@ import type { AIReviewComment } from './reviewCommentGatherer.js';
 import { resolveUltrafixHistoryMeta } from './ultrafixJobHelpers.js';
 import { finalClaudeExecutionResult } from './claudeExecutionResult.js';
 import { publishCompletedWithDurableExecutionEvidence } from './completedExecutionDurability.js';
+import { durableOperationIdentity } from '@propr/core';
 import { buildAgentOutcome } from './executionOutcome.js';
 import type { GitHubToken } from './githubTypes.js';
 import {
@@ -282,6 +283,8 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
         // evidence rides on the completed entry itself. See completedExecutionDurability.ts.
         await publishCompletedWithDurableExecutionEvidence({
             stateManager, taskId, correlatedLogger,
+            // The queue job owns this attempt; its id is unchanged across every redelivery.
+            operationId: durableOperationIdentity('pr-comment-job', job.id ?? taskId),
             metadata: {
                 reason: partial ? 'PR comment processing published partial work after interrupted execution' : 'PR comment processing completed successfully',
                 commitHash: commitResult?.commitHash,

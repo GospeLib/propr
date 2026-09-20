@@ -60,6 +60,8 @@ export interface LabelCheckResult {
 export interface TaskCompletionParams {
   stateManager: WorkerStateManager;
   taskId: string;
+  /** Durable logical-operation identity for this attempt's terminal transition. */
+  operationId: string;
   issueRef: IssueJobData;
   currentIssueLabels: string[];
   claudeResult: ClaudeCodeResponse | null;

@@ -65,6 +65,12 @@ function completionMetadata(
 export interface TerminalStateParams {
   stateManager: WorkerStateManager;
   taskId: string;
+  /**
+   * The durable identity of the logical operation that owns this terminal transition. It must
+   * survive a process crash and a queue redelivery unchanged — see
+   * `DurableCompletionOptions.operationId`.
+   */
+  operationId: string;
   claudeResult: ClaudeCodeResponse | null;
   postProcessingResult: PostProcessingResult | null;
   commitResult: CommitResult | null;
@@ -76,7 +82,7 @@ export interface TerminalStatePolicy {
 }
 
 export async function markTaskTerminalState(params: TerminalStateParams, policy: TerminalStatePolicy = {}): Promise<void> {
-  const { stateManager, taskId, claudeResult, postProcessingResult, commitResult } = params;
+  const { stateManager, taskId, operationId, claudeResult, postProcessingResult, commitResult } = params;
   const status = getTaskCompletionStatus(claudeResult, postProcessingResult);
   const commitResultData = commitResult
     ? { commitHash: commitResult.commitHash, commitMessage: commitResult.commitMessage }
@@ -119,6 +125,7 @@ export async function markTaskTerminalState(params: TerminalStateParams, policy:
   await publishCompletedWithDurableExecutionEvidence({
     stateManager,
     taskId,
+    operationId,
     metadata: completionMetadata(claudeResult, taskResult, commitResultData, evidence),
   });
 }

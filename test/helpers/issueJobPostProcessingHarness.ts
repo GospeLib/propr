@@ -4,6 +4,7 @@
  * first import of each test file that uses it.
  */
 import { mock } from 'node:test';
+import { completionCoreExports } from './completionCoreDoubles.js';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -44,7 +45,8 @@ await mock.module('timers/promises', {
 });
 
 await mock.module('@propr/core', {
-    namedExports: { ...publicationPolicy, requireAuthorizedPublicationMetadata,
+    namedExports: {
+        ...completionCoreExports, ...publicationPolicy, requireAuthorizedPublicationMetadata,
         cleanupWorktree: mock.fn(async () => undefined),
         cleanupPreparedVisualPreviewEvidence: mock.fn(async () => undefined),
         commitChanges,

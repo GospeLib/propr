@@ -117,6 +117,12 @@ export interface UpdateMetadata {
     /** Refuse execution/settlement when its authoritative database history was not persisted. */
     requireDurableHistory?: boolean;
     /**
+     * The capability that permits a `completed` transition. The transition builder refuses
+     * `completed` without one, so the only ways to publish a completion are the durability
+     * barrier and an explicit declaration that no model execution ran.
+     */
+    completionGuard?: import('./completionGuard.js').CompletionGuard;
+    /**
      * Idempotency key for one logical terminal transition, unique in `task_history`.
      *
      * The writer keeps it identical across that transition's retries, so an INSERT that committed

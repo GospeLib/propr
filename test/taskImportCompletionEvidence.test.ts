@@ -10,6 +10,7 @@
  * durable failure and is never published as completed.
  */
 import assert from 'node:assert/strict';
+import { completionCoreExports } from './helpers/completionCoreDoubles.js';
 import { beforeEach, describe, mock, test } from 'node:test';
 
 const TASK_STATES = {
@@ -44,10 +45,16 @@ const updates: RecordedUpdate[] = [];
 const failures: Array<{ taskId: string; error: Error; metadata: Record<string, unknown> }> = [];
 let markTaskCompletedCalls = 0;
 
+/** Reproduces a database that refuses the completed history row. */
+let refuseCompletedHistoryWrite = false;
+
 const stateManager = {
     createTaskState: async () => undefined,
     updateTaskState: async (taskId: string, state: string, metadata: Record<string, unknown> = {}) => {
         updates.push({ taskId, state, metadata });
+        if (refuseCompletedHistoryWrite && state === TASK_STATES.COMPLETED) {
+            throw new Error('database refused the completed history row');
+        }
         return {};
     },
     markTaskFailed: async (taskId: string, error: Error, metadata: Record<string, unknown> = {}) => {
@@ -66,10 +73,16 @@ const coreLogger = { debug: () => undefined, info: () => undefined, warn: () => 
 
 await mock.module('@propr/core', {
     namedExports: {
+        ...completionCoreExports,
         TaskStates: TASK_STATES,
         ErrorCategories: ERROR_CATEGORIES,
         logger: { ...coreLogger, withCorrelation: () => coreLogger },
-        db: () => ({ where: () => ({ first: async () => undefined }) }),
+        // The read-back the barrier performs after an ambiguous write. Refusing it is what makes
+        // a completion unverifiable: it may have committed, and nothing can establish whether.
+        db: () => ({ where: () => ({ first: async () => {
+            if (refuseCompletedHistoryWrite) throw new Error('database refused the history read-back');
+            return undefined;
+        } }) }),
         getStateManager: () => stateManager,
         getAuthenticatedOctokit: async () => ({ auth: async () => ({ token: 'github-token' }) }),
         withRetry: async (operation: () => Promise<unknown>) => operation(),
@@ -128,6 +141,7 @@ beforeEach(() => {
     updates.length = 0;
     failures.length = 0;
     markTaskCompletedCalls = 0;
+    refuseCompletedHistoryWrite = false;
     agentResult = {
         success: true,
         logs: 'logs',
@@ -175,5 +189,27 @@ describe('the task-import job records terminal execution evidence', () => {
         assert.equal(claudeResultOf(failure.metadata)?.success, false);
         assert.equal(agentOutcomeOf(failure.metadata)?.success, false,
             'and the terminal agent outcome a consumer reads');
+    });
+
+    /**
+     * End to end through the processor, not through the barrier.
+     *
+     * The barrier throws `COMPLETION_DURABILITY_UNVERIFIABLE` so that NOTHING terminal is written
+     * while a committed completion cannot be told from an absent one. This job's generic
+     * `catch (error) { markTaskFailed(...) }` used to swallow that distinction and settle the task
+     * as failed — recreating the production defect the barrier exists to prevent.
+     */
+    test('a completion whose durability cannot be established never becomes a failed record', async () => {
+        refuseCompletedHistoryWrite = true;
+
+        await assert.rejects(() => processTaskImportJob(taskImportJob()),
+            /COMPLETION_DURABILITY_UNVERIFIABLE/);
+
+        assert.equal(failures.length, 0,
+            'the job must not settle a task whose completion may already be durable');
+        assert.equal(updates.filter(update => update.state === TASK_STATES.FAILED).length, 0,
+            'and no failed history entry may be written');
+        assert.ok(updates.some(update => update.state === TASK_STATES.COMPLETED),
+            'the completion was attempted; only its durability is unknown');
     });
 });

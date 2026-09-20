@@ -7,8 +7,19 @@ import {
     type TaskStateExpectation,
     type UpdateMetadata,
     type WorkerStateManager,
+    nonExecutingCompletionGuard,
 } from '@propr/core';
 import { sanitizeErrorMessage } from './errorSanitizer.js';
+import { isCompletionDurabilityUnverifiable } from './completionDurabilityOutcome.js';
+
+/**
+ * The finalizer reconciles a task from its BullMQ job outcome; it runs no model execution of its
+ * own, so it has no execution evidence to make durable and completes under the explicit
+ * non-executing capability rather than the durability barrier. A processor that DID execute has
+ * already published its own terminal state through the barrier, which this finalizer sees as
+ * `already_terminal` and leaves alone.
+ */
+const FINALIZER_COMPLETION_REASON = 'reconciles a task from its BullMQ job outcome; it executes nothing itself';
 
 const MAX_FINALIZATION_RETRY_DELAY_MS = 1_000;
 const TERMINAL_STATES = new Set<TaskState>([
@@ -24,6 +35,7 @@ type TaskStateStore = Pick<
 
 export type PRCommentTaskFinalizationOutcome =
     | 'finalized'
+    | 'unverifiable_completion'
     | 'partial_publication'
     | 'already_terminal'
     | 'retry_pending'
@@ -83,6 +95,7 @@ function completedTransition(result: JobResult | undefined): FinalTransition {
                         ? sanitizeErrorMessage(`PR comment job skipped${reason ? `: ${reason}` : ''}`)
                         : 'PR comment job completed',
                     historyMetadata,
+                    completionGuard: nonExecutingCompletionGuard(FINALIZER_COMPLETION_REASON),
                 },
             };
         case 'cancelled':
@@ -169,6 +182,11 @@ export async function finalizeFailedPRCommentTask(
     stateManager: TaskStateStore,
     options?: PRCommentTaskFinalizationOptions,
 ): Promise<PRCommentTaskFinalizationResult> {
+    // A job that failed because its completion could not be verified may already have committed
+    // that completion. Settling `failed` over it is the exact re-dispatch defect this prevents.
+    if (isCompletionDurabilityUnverifiable(error)) {
+        return { outcome: 'unverifiable_completion', stateChanged: false };
+    }
     return applyFinalTransition(
         taskId,
         failedTransition(error.message, 'bullmq_failed'),

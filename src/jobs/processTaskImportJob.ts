@@ -22,6 +22,8 @@ import { agentResultToClaudeResponse } from './prFileUtils.js';
 import { buildAgentOutcome } from './executionOutcome.js';
 import { finalClaudeExecutionResult } from './claudeExecutionResult.js';
 import { publishCompletedWithDurableExecutionEvidence } from './completedExecutionDurability.js';
+import { isCompletionDurabilityUnverifiable } from './completionDurabilityOutcome.js';
+import { durableOperationIdentity } from '@propr/core';
 import type { GitHubToken } from './githubTypes.js';
 import { resolveDefaultAgentAndModel } from './prCommentAgentUtils.js';
 
@@ -180,6 +182,8 @@ export async function processTaskImportJob(job: Job<TaskImportJobData>): Promise
         // rides on the completed entry itself. See completedExecutionDurability.ts.
         await publishCompletedWithDurableExecutionEvidence({
             stateManager, taskId, correlatedLogger,
+            // The queue job owns this attempt and keeps its id across every redelivery.
+            operationId: durableOperationIdentity('task-import-job', jobId ?? correlationId),
             metadata: {
                 reason: 'Task completed successfully',
                 prResult: { status: 'complete', repository },
@@ -206,6 +210,13 @@ export async function processTaskImportJob(job: Job<TaskImportJobData>): Promise
             return handleSimpleUsageLimitError(error, job as unknown as Job<{ repoOwner: string; repoName: string; number: number; modelName?: string; correlationId?: string }>, correlatedLogger, repository);
         }
         correlatedLogger.error({ error: (error as Error).message, stack: (error as Error).stack }, 'Task import job failed');
+        // The barrier could not establish whether `completed` committed. Settling `failed` here is
+        // exactly the production failure this remediation exists to prevent, so the error leaves
+        // without any terminal record and the task stays unsettled until it can be established.
+        if (isCompletionDurabilityUnverifiable(error)) {
+            handleError(error, 'Task import job completion durability is unverifiable', { correlationId });
+            throw error;
+        }
         await stateManager.markTaskFailed(taskId, error as Error, {
             errorCategory: ErrorCategories.CLAUDE_EXECUTION,
             ...(terminalExecutionEvidence ?? {}),

@@ -4,7 +4,7 @@ import { db } from '../db/connection.js';
 import type { Logger } from 'pino';
 import {
     TaskStates, type TaskState, type IssueRef, type TaskStateData, type UpdateMetadata,
-    type TaskResult, type ResumableTaskInfo, type TaskStateExpectation,
+    type ResumableTaskInfo, type TaskStateExpectation,
     type NonTerminalTaskScanResult,
     type TaskStateUpdateResult,
     type WorkerStateManagerOptions
@@ -418,22 +418,15 @@ export class WorkerStateManager {
         return result?.state ?? null;
     }
 
-    /**
-     * Marks task as completed
-     * @param taskId - Task identifier
-     * @param result - Task result
-     * @returns Updated state
+    /*
+     * `markTaskCompleted` is deliberately absent.
+     *
+     * It was a keyless, evidence-free completion writer on the public state-manager API: anything
+     * holding a state manager could publish the signal a consumer re-dispatches on, with no
+     * execution evidence and no idempotency key. Completions are published through the durability
+     * barrier (`publishCompletedWithDurableExecutionEvidence`), and a path that genuinely ran no
+     * model execution publishes with `nonExecutingCompletionGuard`. Do not reintroduce it.
      */
-    async markTaskCompleted(taskId: string, result: TaskResult = {}): Promise<TaskStateData> {
-        const metadata: UpdateMetadata = {
-            prResult: result, reason: 'Task completed successfully',
-            historyMetadata: {
-                pr: (result.prUrl && result.prNumber) ? { number: result.prNumber, url: result.prUrl } : null,
-                commitResult: result.commitResult ?? null
-            }
-        };
-        return await this.updateTaskState(taskId, TaskStates.COMPLETED, metadata);
-    }
 
     /**
      * Gets all tasks in processing states (for recovery)

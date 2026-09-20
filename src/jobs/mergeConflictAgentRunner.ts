@@ -126,13 +126,15 @@ export async function handleMergeWithAgent(options: {
     startingCommentId: number;
     stateManager: WorkerStateManager;
     taskId: string;
+    /** Durable identity of the queue job owning this attempt; see the durability barrier. */
+    operationId: string;
     correlationId: string;
     correlatedLogger: Logger;
     redisClient: Redis;
 }): Promise<JobResult> {
     const { conflictedFiles, worktreeInfo, branchName, baseBranch, pullRequestNumber, repoUrl,
         repoOwner, repoName, githubToken, octokit, startingCommentId,
-        stateManager, taskId, correlationId, correlatedLogger, redisClient } = options;
+        stateManager, taskId, operationId, correlationId, correlatedLogger, redisClient } = options;
 
     const prompt = buildConflictResolutionPrompt({
         pullRequestNumber, baseBranch, headBranch: branchName, conflictedFiles, worktreeInfo, repoOwner, repoName,
@@ -202,7 +204,7 @@ export async function handleMergeWithAgent(options: {
     // `completed` is published only once the final execution evidence is durable; the evidence
     // rides on the completed entry itself. See completedExecutionDurability.ts.
     await publishCompletedWithDurableExecutionEvidence({
-        stateManager, taskId, correlatedLogger,
+        stateManager, taskId, correlatedLogger, operationId,
         metadata: {
             reason: 'Merge conflict resolution completed successfully', commitHash: finalCommitHash,
             claudeResult: executionSummary,

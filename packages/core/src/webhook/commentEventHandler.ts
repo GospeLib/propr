@@ -1,6 +1,7 @@
 import { admittedCommentJobId, enqueueAdmittedComment } from '../admission/admittedComment.js';
 import { EZER_REVIEW_REQUEST } from '../admission/reviewRequest.js';
 import { requiresEzerExecutionAdmission } from '../admission/ezerExecutionAdmission.js';
+import { claimEzerAddressedComment } from '../intake/routingOwnerEvent.js';
 /* eslint-disable max-lines */
 import logger, { generateCorrelationId } from '../utils/logger.js';
 import { handleError } from '../utils/errorHandler.js';
@@ -657,6 +658,30 @@ export async function processCommentEvent(payload: IssueCommentEvent | PullReque
     if (!eventDetails) return { status: 'ignored', reason: 'not_pull_request_comment' };
 
     const { prNumber, comment: rawComment } = eventDetails;
+
+    // THE `/ezer` AUTHORIZATION CHOKEPOINT — the first decision made about any comment, on every
+    // path, before any Ezer-specific handling, before the slash parser (whose production alias maps
+    // `/ezer` to `/fix`) and before any generic follow-up logic.
+    //
+    // This function is the ONLY consumer of `parseSlashCommand` in the codebase, so it is the single
+    // boundary every route to the dispatcher passes through: routing-WebSocket intake and
+    // `direct_webhook` (both via processWebhookEvent -> handleIssueCommentEvent /
+    // handlePullRequestReviewCommentEvent), the daemon and API comment-processor wrappers, the
+    // edited-comment reprocess hook, and the system-ultrafix synthetic re-entry. Gating here
+    // dominates all of them, which per-call-site gates demonstrably did not — the same bypass was
+    // found three times through three different reachable call sites.
+    //
+    // Identity is the configured owner's stable numeric GitHub user id (EZER_OWNER_GITHUB_USER_ID),
+    // never a login. Fail closed: unset owner id admits no `/ezer` comment at all. The refusal is a
+    // terminal `ignored` disposition, so the delivery is ACKed (an outsider cannot force endless
+    // redelivery) and consumes no seat.
+    const unauthorizedEzerComment = claimEzerAddressedComment(rawComment);
+    if (unauthorizedEzerComment) {
+        correlatedLogger.warn({ repository: repoFullName, pullRequestNumber: prNumber, commentId: rawComment.id,
+            commentAuthor: rawComment.user.login, eventType },
+            'Refused an /ezer comment from a user that is not the configured Ezer owner');
+        return unauthorizedEzerComment;
+    }
 
     const commentAuthor = rawComment.user.login;
     const ezerReview = EZER_REVIEW_REQUEST.exec(rawComment.body || '');

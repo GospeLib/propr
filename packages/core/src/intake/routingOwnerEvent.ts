@@ -48,6 +48,41 @@ const EZER_NOT_OWNER_DISPOSITION:DeliveryDisposition=Object.freeze({status:'igno
 const EZER_COMMAND_NOT_ADMITTED_DISPOSITION:DeliveryDisposition=Object.freeze({status:'ignored',reason:'ezer_command_not_admitted',billing:Object.freeze({seatConsumed:false})});
 export {EZER_NOT_OWNER_DISPOSITION,EZER_COMMAND_NOT_ADMITTED_DISPOSITION};
 /**
+ * THE `/ezer` AUTHORIZATION CHOKEPOINT.
+ *
+ * `/ezer` is a publicly reachable namespace: any GitHub user can post a comment containing it on
+ * any pull request or issue in a watched repository. Three consecutive reviews found the same
+ * authorization bypass through three different reachable paths, because each fix was installed at
+ * ONE call site rather than at the boundary every path shares:
+ *
+ *   1. the exact owner commands reached `relay()` unauthenticated  — fixed at `forwardRoutingOwnerEvent`;
+ *   2. `pull_request_review_comment` skipped that gate entirely     — fixed by keying it on "carries a comment body";
+ *   3. `direct_webhook` never invokes that gate at all             — fixed HERE.
+ *
+ * This function is that shared boundary's decision. It is invoked as the FIRST decision of
+ * `processCommentEvent` (packages/core/src/webhook/commentEventHandler.ts) — the single function
+ * in the codebase that runs `parseSlashCommand`, and therefore the ONLY place the production
+ * parser's `/ezer` → `/fix` alias can be reached. Every intake mode (routing WebSocket, direct
+ * webhook), every process (daemon, API), every synthetic/system re-entry and every future caller
+ * reaches the slash dispatcher through that one function, so gating it there dominates all of them
+ * instead of guarding them one at a time.
+ *
+ * Fail closed, on the STABLE NUMERIC GitHub user id only — a login or display name is spoofable and
+ * is never the identity gate. With no configured owner id, nothing addressed to Ezer is admitted.
+ *
+ * @returns `null` when the comment may continue down the ordinary path — either it is not addressed
+ * to Ezer at all, or it is and the configured owner wrote it (authorization passed; the Ezer-specific
+ * handling downstream, including the cryptographically bound signed-review admission, is unchanged).
+ * Otherwise the terminal {@link EZER_NOT_OWNER_DISPOSITION}: ACKed `ignored`, no seat consumed, no
+ * fall-through to the dispatcher, and no withheld ACK an outsider could use to force redelivery.
+ */
+export function claimEzerAddressedComment(comment:unknown,ownerUserId:string=process.env.EZER_OWNER_GITHUB_USER_ID??''):DeliveryDisposition|null{
+ const candidate=object(comment);
+ if(typeof candidate.body!=='string')return null;
+ if(!EZER_ADDRESS_PREFIX.test(candidate.body.trim()))return null;
+ return ownerAuthored(candidate,ownerUserId)?null:EZER_NOT_OWNER_DISPOSITION;
+}
+/**
  * The only comment event type an owner command is ever carried from. ProPR's intake supports
  * exactly two comment-bearing GitHub events — `issue_comment` and `pull_request_review_comment`
  * (see SUPPORTED_WEBHOOK_EVENTS in ../webhook/webhookHandler.ts) — and the ordinary dispatcher's

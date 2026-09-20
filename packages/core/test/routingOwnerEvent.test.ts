@@ -1,13 +1,13 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {createHmac} from 'node:crypto';
-import {forwardRoutingOwnerEvent,replyMalformedOwnerCommand} from '../src/intake/routingOwnerEvent.js';
+import {forwardRoutingOwnerEvent,replyMalformedOwnerCommand,EZER_NOT_OWNER_DISPOSITION,EZER_COMMAND_NOT_ADMITTED_DISPOSITION} from '../src/intake/routingOwnerEvent.js';
 import type {PaginatedOctokitInstance} from '../src/auth/githubAuth.js';
 const secret='owner-relay-test-secret-at-least-32-bytes',deliveryId='real-routing-delivery-1234',installationId='161226896';
 const ownerUserId='7',ownerAuthor={id:7,type:'User',login:'ezer-owner'};
 process.env.EZER_OWNER_GITHUB_USER_ID=ownerUserId;
 test('native read relay validates correlated settlement and never writes a GitHub reply',async()=>{
- const payload={...fixture(),repository:{id:10,full_name:'GospeLib/main'},issue:{id:20,number:90},comment:{id:66,body:'/ezer help'}};
+ const payload={...fixture(),repository:{id:10,full_name:'GospeLib/main'},issue:{id:20,number:90},comment:{id:66,body:'/ezer help',user:{...ownerAuthor}}};
  let writes=0,readbacks=0;
  const options={enabled:true,readEnabled:true,baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{writes++;},onReadback:async(value:Record<string,unknown>)=>{readbacks++;assert.equal(value.operationId,'read-operation');},fetchImpl:async()=>Response.json({accepted:true,operationId:'read-operation',correlation:{repository:'GospeLib/main',issueNumber:90,commentId:66,operationId:'read-operation',sessionId:'github-issue:10:20'},result:{operationId:'read-operation',state:'SUCCEEDED',links:{command:'help',text:'Commands you can invoke:',sessionId:'github-issue:10:20'}}})};
  assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),true);
@@ -23,7 +23,6 @@ test('native read relay validates correlated settlement and never writes a GitHu
 for(const [mode,payloadOf] of [
  ['a PR surface',()=>({...fixture(),repository:{id:10,full_name:'GospeLib/main'},issue:{id:20,number:2338,pull_request:{url:'pr'}},comment:{id:66,body:'/ezer help',user:{...ownerAuthor}}})],
  ['the wrong owner repository',()=>({...fixture(),repository:{id:10,full_name:'GospeLib/product-hub'},issue:{id:20,number:90},comment:{id:66,body:'/ezer status',user:{...ownerAuthor}}})],
- ['an edited delivery',()=>({...fixture(),action:'edited',repository:{id:10,full_name:'GospeLib/main'},issue:{id:20,number:90},comment:{id:66,body:'/ezer help',user:{...ownerAuthor}}})],
 ] as const)test(`a read command on ${mode} is answered once and ACKed, never redelivered forever`,async()=>{
  const payload=payloadOf();let replies=0;
  const options={enabled:true,readEnabled:true,baseUrl:'http://ezer:8791',secret,
@@ -32,12 +31,34 @@ for(const [mode,payloadOf] of [
  assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),true);
  assert.equal(replies,1);
 });
-test('a read command on a surface Ezer does not answer on falls through rather than looping',async()=>{
+test('a read command on a surface Ezer does not answer on is ACKed terminally, never dispatched or looped',async()=>{
  const payload={...fixture(),repository:{id:10,full_name:'someone-else/repo'},issue:{id:20,number:90},comment:{id:66,body:'/ezer help',user:{...ownerAuthor}}};
  let replies=0;
- assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{enabled:true,readEnabled:true,baseUrl:'http://ezer:8791',secret,
-  replyMalformed:async()=>{replies++;},fetchImpl:async()=>{throw new Error('must not forward');}}),false);
+ assert.deepEqual(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{enabled:true,readEnabled:true,baseUrl:'http://ezer:8791',secret,
+  replyMalformed:async()=>{replies++;},fetchImpl:async()=>{throw new Error('must not forward');}}),EZER_COMMAND_NOT_ADMITTED_DISPOSITION);
  assert.equal(replies,0);
+});
+test('an edited read delivery is ACKed terminally without ever calling the reply helper',async()=>{
+ // The PRODUCTION reply helper is deliberately left in place (no `replyMalformed` stub): it
+ // re-reads the comment and throws OWNER_COMMAND_REPLY_COMMENT_CHANGED for anything whose
+ // `updated_at` has moved, which withheld the ACK and looped this delivery forever. Reaching it
+ // at all would also need GitHub credentials this test does not provide, so a passing assertion
+ // here proves it is never reached.
+ const payload={...fixture(),action:'edited',repository:{id:10,full_name:'GospeLib/main'},issue:{id:20,number:90},
+  comment:{id:66,body:'/ezer help',created_at:'2026-09-20T02:30:50Z',updated_at:'2026-09-20T03:11:00Z',user:{...ownerAuthor}}};
+ const outcome=await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{enabled:true,readEnabled:true,baseUrl:'http://ezer:8791',secret,
+  fetchImpl:async()=>{throw new Error('a permanently unbindable read must never reach the owner relay');}});
+ assert.deepEqual(outcome,EZER_COMMAND_NOT_ADMITTED_DISPOSITION);
+ assert.equal(typeof outcome==='object'&&outcome.status,'ignored');
+});
+test('the production reply helper really does refuse an edited comment',async()=>{
+ // The invariant the branch above exists for, asserted against the real helper rather than a stub.
+ const comment={id:66,body:'/ezer help',created_at:'2026-09-20T02:30:50Z',updated_at:'2026-09-20T03:11:00Z',issue_url:'https://api.github.com/repos/GospeLib/main/issues/90',user:{...ownerAuthor}};
+ const event={comment,issue:{number:90},repository:{full_name:'GospeLib/main'}};
+ let posts=0;
+ const api={request:async(route:string)=>{if(route.startsWith('GET'))return{data:comment};posts++;return{data:{id:99}};},paginate:async()=>[]} as unknown as Pick<PaginatedOctokitInstance,'request'|'paginate'>;
+ await assert.rejects(()=>replyMalformedOwnerCommand(event,deliveryId,api),/OWNER_COMMAND_REPLY_COMMENT_CHANGED/);
+ assert.equal(posts,0);
 });
 test('a transient read failure still withholds the ACK so the same delivery is retried',async()=>{
  const payload={...fixture(),repository:{id:10,full_name:'GospeLib/main'},issue:{id:20,number:90},comment:{id:66,body:'/ezer help',user:{...ownerAuthor}}};
@@ -95,14 +116,15 @@ test('an owner comment addressed to Ezer that is not a command is answered inste
  assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),true);
  assert.equal(replies,1);
 });
-for(const mode of ['relay-disabled','wrong-installation','wrong-repository','edited'] as const)test(`an unrecognized /ezer comment on a ${mode} delivery falls through without reply or throw`,async()=>{
+for(const mode of ['relay-disabled','wrong-installation','wrong-repository','edited'] as const)test(`an unrecognized /ezer comment on a ${mode} delivery is ACKed terminally without reply, throw, or ordinary dispatch`,async()=>{
  const payload=fixture();payload.comment.body='/ezer please finish S02';
  if(mode==='wrong-repository')payload.repository.full_name='someone-else/repo';
  if(mode==='edited')payload.action='edited';
  let replies=0;
  const handled=await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,mode==='wrong-installation'?'999':installationId,
   {enabled:mode!=='relay-disabled',baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;},fetchImpl:async()=>{throw new Error('must not forward');}});
- assert.equal(handled,false);assert.equal(replies,0);
+ // Truthy, so RoutingWebSocketIntakeService ACKs it and never calls the ordinary comment dispatcher.
+ assert.deepEqual(handled,EZER_COMMAND_NOT_ADMITTED_DISPOSITION);assert.equal(replies,0);
 });
 test('unrecognized-command feedback answers on the comment\'s own surface and is idempotent',async()=>{
  const comment={id:5747057704,body:'/ezer S02 is not wired up.',created_at:'2026-09-20T02:30:50Z',updated_at:'2026-09-20T02:30:50Z',issue_url:'https://api.github.com/repos/GospeLib/main/issues/2387',user:{id:7,type:'User',login:'ezer-owner'}};
@@ -201,17 +223,17 @@ test('explicit route forwarding is independently disabled and never falls throug
  (payload as any).issue={number:90,pull_request:{url:'pr'}};await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{...options,routeEnabled:true});assert.equal(sent,1);assert.equal(replies,2);
 });
 
-test('a non-owner human addressing Ezer gets no reply and costs no GitHub call',async()=>{
+test('a non-owner human addressing Ezer gets no reply, costs no GitHub call, and is never dispatched',async()=>{
  const payload=fixture();payload.comment.body='/ezer please ship S02';payload.comment.user={id:8,type:'User',login:'stranger'};
  let replies=0,calls=0;
  const options={enabled:true,stopEnabled:true,planControlEnabled:true,pauseEnabled:true,routeEnabled:true,readEnabled:true,baseUrl:'http://ezer:8791',secret,
   replyMalformed:async()=>{replies++;},fetchImpl:async()=>{calls++;throw new Error('must not forward');}};
- assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),false);
+ assert.deepEqual(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),EZER_NOT_OWNER_DISPOSITION);
  assert.equal(replies,0);assert.equal(calls,0);
  // A bot, an app impersonating the owner's id, and an owner-shaped id that is not the owner.
  for(const user of [{id:7,type:'Bot',login:'ezer-owner[bot]'},{id:'7',type:'User',login:'ezer-owner'},{id:70,type:'User',login:'ezer-owner'}]){
   payload.comment.user=user as unknown as typeof payload.comment.user;
-  assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),false);
+  assert.deepEqual(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),EZER_NOT_OWNER_DISPOSITION);
  }
  assert.equal(replies,0);assert.equal(calls,0);
 });
@@ -220,11 +242,11 @@ test('the owner id alone is not enough: normal intake author policy still filter
  let replies=0;
  const options={enabled:true,baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;},fetchImpl:async()=>{throw new Error('must not forward');}};
  process.env.GITHUB_USER_WHITELIST='someone-else';
- try{assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),false);}
+ try{assert.deepEqual(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),EZER_NOT_OWNER_DISPOSITION);}
  finally{delete process.env.GITHUB_USER_WHITELIST;}
  assert.equal(replies,0);
  process.env.GITHUB_USER_BLACKLIST='ezer-owner';
- try{assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),false);}
+ try{assert.deepEqual(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),EZER_NOT_OWNER_DISPOSITION);}
  finally{delete process.env.GITHUB_USER_BLACKLIST;}
  assert.equal(replies,0);
  // Same delivery, unfiltered author: answered.
@@ -234,7 +256,7 @@ test('the owner id alone is not enough: normal intake author policy still filter
 test('no configured owner id means no reply at all, never a reply to anyone',async()=>{
  const payload=fixture();payload.comment.body='/ezer please ship S02';let replies=0;
  const options={enabled:true,ownerUserId:'',baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;},fetchImpl:async()=>{throw new Error('must not forward');}};
- assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),false);
+ assert.deepEqual(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),EZER_NOT_OWNER_DISPOSITION);
  assert.equal(replies,0);
 });
 for(const body of ['/ezer help please','/ezer status now','/ezer approve please','/ezer approve sha256:bad abc','/ezer retry EP-real-S01','/ezer retry EP-real-S01 zero','/ezer stop','/ezer stop one two','/ezer pause','/ezer resume typed-work:item bad-uuid','/ezer use local:model','/ezer accept-review-stop stop:abcd'])
@@ -264,4 +286,49 @@ test('the reply helper refuses an unauthorised author before any GitHub call',as
  const api={request:async()=>{calls++;return{data:comment};},paginate:async()=>{calls++;return[];}} as unknown as Pick<PaginatedOctokitInstance,'request'|'paginate'>;
  await assert.rejects(()=>replyMalformedOwnerCommand(event,deliveryId,api),/OWNER_COMMAND_REPLY_NOT_AUTHORIZED/);
  assert.equal(calls,0);
+});
+
+// Hostile intake: `/ezer` is publicly reachable, so EVERY exact command is exercised with an
+// author who is not the owner. Authorization must fail closed before any capability check and
+// before any relay call — and must neither reply, nor relay, nor throw (a throw withholds the
+// ACK and lets an outsider force indefinite redelivery), nor return unhandled (which hands the
+// comment to the ordinary comment dispatcher, which accepts ordinary human authors).
+const EXACT_COMMANDS=[
+ ['read help','/ezer help','GospeLib/main',{number:90}],
+ ['read status','/ezer status','GospeLib/main',{number:90}],
+ ['stop','/ezer stop typed-work:actual-item','GospeLib/main',{number:90}],
+ ['approve','/ezer approve sha256:'+'b'.repeat(64)+' '+'a'.repeat(40),'GospeLib/product-hub',{number:90,pull_request:{url:'pr'}}],
+ ['retry','/ezer retry EP-real-S01 2','GospeLib/main',{number:90}],
+ ['retry lane','/ezer retry EP-real-S02-T02 2','GospeLib/main',{number:90}],
+ ['pause','/ezer pause typed-work:item','GospeLib/main',{number:90}],
+ ['resume','/ezer resume typed-work:item 11111111-1111-4111-8111-111111111111','GospeLib/main',{number:90}],
+ ['route','/ezer use local:gpt-5.6-sol EP-test-S01','GospeLib/main',{number:90}],
+ ['checkpoint',`/ezer accept-review-stop stop:abcd ${'a'.repeat(40)} sha256:${'b'.repeat(64)} 55`,'GospeLib/product-hub',{number:90,pull_request:{url:'pr'}}],
+] as const;
+const NON_OWNER_AUTHORS=[
+ ['a stranger',{id:8,type:'User',login:'stranger'}],
+ ['a bot wearing the owner login',{id:7,type:'Bot',login:'ezer-owner[bot]'}],
+ ['a string-typed owner id',{id:'7',type:'User',login:'ezer-owner'}],
+ ['an owner-shaped id that is not the owner',{id:70,type:'User',login:'ezer-owner'}],
+] as const;
+for(const [name,body,repo,issue] of EXACT_COMMANDS)for(const [who,user] of NON_OWNER_AUTHORS)
+ for(const capabilities of ['enabled','disabled'] as const)
+  test(`an exact ${name} command from ${who} is refused before any capability check or relay (capabilities ${capabilities})`,async()=>{
+   const payload={...fixture(),repository:{id:10,full_name:repo},issue:{id:20,...issue},comment:{id:66,body,user:{...user}}};
+   let replies=0,calls=0,readbacks=0;
+   const on=capabilities==='enabled';
+   const outcome=await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{
+    enabled:on,stopEnabled:on,planControlEnabled:on,pauseEnabled:on,routeEnabled:on,readEnabled:on,
+    baseUrl:'http://ezer:8791',secret,
+    replyMalformed:async()=>{replies++;},onReadback:async()=>{readbacks++;},
+    fetchImpl:async()=>{calls++;throw new Error('a non-owner command must never reach the owner relay');}});
+   assert.deepEqual(outcome,EZER_NOT_OWNER_DISPOSITION);
+   assert.equal(replies,0);assert.equal(calls,0);assert.equal(readbacks,0);
+  });
+test('a non-owner exact command is refused even with no configured owner id at all',async()=>{
+ for(const [,body,repo,issue] of EXACT_COMMANDS){
+  const payload={...fixture(),repository:{id:10,full_name:repo},issue:{id:20,...issue},comment:{id:66,body,user:{id:8,type:'User',login:'stranger'}}};
+  assert.deepEqual(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{enabled:true,stopEnabled:true,planControlEnabled:true,pauseEnabled:true,routeEnabled:true,readEnabled:true,ownerUserId:'',baseUrl:'http://ezer:8791',secret,
+   fetchImpl:async()=>{throw new Error('must not forward');}}),EZER_NOT_OWNER_DISPOSITION);
+ }
 });

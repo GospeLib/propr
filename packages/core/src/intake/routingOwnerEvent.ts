@@ -4,6 +4,7 @@ import {makeIdempotent} from '../utils/errorHandler.js';
 import {filterCommentByAuthor} from '../utils/commentFilters.js';
 import log from '../utils/logger.js';
 import type {PaginatedOctokitInstance} from '../auth/githubAuth.js';
+import type {DeliveryDisposition} from './routingWebSocketProtocol.js';
 const OWNER_RELAY_PATH='/webhooks/propr-owner-event';
 const OWNER_RELAY_REPOSITORY='GospeLib/product-hub';
 const OWNER_RELAY_INSTALLATION='161226896';
@@ -33,6 +34,19 @@ const COMMENT_PAGE_SIZE=100;
 const READ_SESSION_NAMESPACE='github-issue';
 /** The owner's stable numeric GitHub user ID; a login can be renamed or reused, an ID cannot. */
 const OWNER_AUTHOR_ID_PATTERN=/^[0-9]+$/;
+/**
+ * `/ezer` is a PUBLICLY REACHABLE namespace: anyone with a GitHub account can post a comment
+ * containing it on a watched pull request or issue. Everything addressed to Ezer is therefore
+ * owned by THIS intake path and never handed to the ordinary comment dispatcher, which accepts
+ * ordinary human authors and can enqueue work. A delivery this path refuses terminally is ACKed
+ * with an explicit `ignored` status — not thrown (which withholds the ACK and lets an outsider
+ * force endless redelivery) and not returned as unhandled (which would fall through to that
+ * dispatcher). Neither consumes a seat.
+ */
+const EZER_NOT_OWNER_DISPOSITION:DeliveryDisposition=Object.freeze({status:'ignored',reason:'user_not_allowed',billing:Object.freeze({seatConsumed:false})});
+/** Owner-authored, but on a delivery this path can neither admit nor answer; see above. */
+const EZER_COMMAND_NOT_ADMITTED_DISPOSITION:DeliveryDisposition=Object.freeze({status:'ignored',reason:'ezer_command_not_admitted',billing:Object.freeze({seatConsumed:false})});
+export {EZER_NOT_OWNER_DISPOSITION,EZER_COMMAND_NOT_ADMITTED_DISPOSITION};
 interface Options{enabled:boolean;stopEnabled?:boolean;planControlEnabled?:boolean;pauseEnabled?:boolean;routeEnabled?:boolean;readEnabled?:boolean;baseUrl:string;secret:string;ownerUserId?:string;fetchImpl?:typeof fetch;now?:()=>Date;replyMalformed?:(event:Record<string,unknown>,deliveryId:string)=>Promise<void>;onReadback?:(result:Record<string,unknown>)=>Promise<void>;}
 function object(value:unknown):Record<string,unknown>{return value!==null&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};}
 /**
@@ -97,13 +111,18 @@ export async function replyMalformedOwnerCommand(event:Record<string,unknown>,de
  // Failed readback or ambiguous POST propagates to existing delivery retry; no blind POST loop.
  await reply();
 }
-export async function forwardRoutingOwnerEvent(payload:unknown,eventType:string,deliveryId:string,installationId:unknown,options:Options={enabled:process.env.EZER_OWNER_RELAY_ENABLED==='true',stopEnabled:process.env.EZER_OWNER_STOP_ENABLED==='true',planControlEnabled:process.env.EZER_OWNER_PLAN_CONTROL_ENABLED==='true',pauseEnabled:process.env.EZER_OWNER_PAUSE_ENABLED==='true',routeEnabled:process.env.EZER_OWNER_ROUTE_ENABLED==='true',readEnabled:process.env.EZER_OWNER_READ_ENABLED==='true',baseUrl:process.env.EZER_OWNER_RELAY_BASE_URL??'',secret:process.env.EZER_INTERNAL_API_SECRET??''}):Promise<boolean>{
+export async function forwardRoutingOwnerEvent(payload:unknown,eventType:string,deliveryId:string,installationId:unknown,options:Options={enabled:process.env.EZER_OWNER_RELAY_ENABLED==='true',stopEnabled:process.env.EZER_OWNER_STOP_ENABLED==='true',planControlEnabled:process.env.EZER_OWNER_PLAN_CONTROL_ENABLED==='true',pauseEnabled:process.env.EZER_OWNER_PAUSE_ENABLED==='true',routeEnabled:process.env.EZER_OWNER_ROUTE_ENABLED==='true',readEnabled:process.env.EZER_OWNER_READ_ENABLED==='true',baseUrl:process.env.EZER_OWNER_RELAY_BASE_URL??'',secret:process.env.EZER_INTERNAL_API_SECRET??''}):Promise<boolean|DeliveryDisposition>{
  const event=object(payload),comment=object(event.comment),repository=object(event.repository),installation=object(event.installation);
  if(eventType!=='issue_comment'||typeof comment.body!=='string')return false;
  const body=comment.body.trim(),isStop=STOP_COMMAND.test(body),isManifest=MANIFEST_COMMAND.test(body),isRetry=RETRY_COMMAND.test(body),isPlanControl=PLAN_COMMAND_PREFIX.test(body),isPauseControl=PAUSE_COMMAND_PREFIX.test(body),isRouteControl=ROUTE_COMMAND_PREFIX.test(body);
  // Not addressed to Ezer at all: an ordinary comment, handled by the normal path.
  if(!EZER_ADDRESS_PREFIX.test(body))return false;
- const ownerUserId=configuredOwnerUserId(options),authorized=ownerAuthored(comment,ownerUserId);
+ // FAIL CLOSED FIRST, before every capability check and before any relay call: only the
+ // configured owner's stable numeric GitHub user ID may be acted on. A login or display name is
+ // spoofable and is never the identity gate. Anyone else's `/ezer` comment stops dead here — no
+ // relay, no GitHub read, no bot reply, and no fall-through to the ordinary comment dispatcher —
+ // and is ACKed `ignored`, so a stranger can neither consume work nor loop the delivery.
+ if(!ownerAuthored(comment,configuredOwnerUserId(options)))return EZER_NOT_OWNER_DISPOSITION;
  const boundDelivery=event.action==='created'&&OWNER_SURFACE_REPOSITORIES.has(String(repository.full_name))&&String(installationId)===OWNER_RELAY_INSTALLATION&&String(installation.id)===OWNER_RELAY_INSTALLATION;
  // An exact command is the only thing ever admitted or relayed. Everything else addressed to
  // Ezer — a recognised verb with wrong arguments just as much as free prose — is answered once
@@ -111,17 +130,23 @@ export async function forwardRoutingOwnerEvent(payload:unknown,eventType:string,
  // can never drive endless relay redelivery.
  const isExactCommand=READ_COMMAND.test(body)||isStop||isManifest||isRetry||PAUSE_COMMAND.test(body)||RESUME_COMMAND.test(body)||ROUTE_COMMAND.test(body)||OWNER_COMMAND.test(body);
  if(!isExactCommand){
-  // An unbound, relay-disabled or unauthorised delivery falls through to ordinary handling
-  // rather than throwing, so stray `/ezer` chatter can never withhold an ACK, and a comment
-  // from anyone but the owner costs no GitHub read and no bot reply at all.
-  if(!options.enabled||!boundDelivery||!authorized)return false;
+  // An unbound or relay-disabled delivery is consumed terminally rather than thrown, so stray
+  // `/ezer` chatter can never withhold an ACK — and rather than fallen through, so it can never
+  // reach the ordinary comment dispatcher either. `boundDelivery` requires `action === 'created'`,
+  // which is also what the reply helper requires (it re-reads the comment and refuses one whose
+  // `updated_at` moved), so an edited comment is never answered and never loops.
+  if(!options.enabled||!boundDelivery)return EZER_COMMAND_NOT_ADMITTED_DISPOSITION;
   await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);
   return true;
  }
  // An exact command whose capability is off, or which names the wrong surface, is refused the
- // same bounded way — but only for the owner, and only on a surface Ezer answers on; anyone or
- // anywhere else falls through to ordinary handling, which ACKs rather than withholding.
- const refuse=async():Promise<boolean>=>{if(!authorized||!OWNER_SURFACE_REPOSITORIES.has(String(repository.full_name)))return false;await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);return true;};
+ // same bounded way — but only where a reply can actually be bound: on a surface Ezer answers
+ // on, and on a `created` delivery. An EDITED comment can never be answered, because the reply
+ // helper re-reads it and refuses any comment whose `updated_at` has moved from its `created_at`;
+ // calling it anyway threw, withheld the ACK, and had the relay redeliver the same permanently
+ // unbindable comment forever. Both conditions are properties of the delivered bytes, so
+ // redelivery cannot change them: ACK terminally, without a reply, instead.
+ const refuse=async():Promise<boolean|DeliveryDisposition>=>{if(event.action!=='created'||!OWNER_SURFACE_REPOSITORIES.has(String(repository.full_name)))return EZER_COMMAND_NOT_ADMITTED_DISPOSITION;await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);return true;};
  if(READ_COMMAND_PREFIX.test(body)){
   // TRANSIENT, so still thrown: a capability an operator turns on makes the SAME redelivery
   // succeed, which is exactly what withholding the ACK is for.

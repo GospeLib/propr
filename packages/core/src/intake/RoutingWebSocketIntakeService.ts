@@ -472,9 +472,14 @@ export class RoutingWebSocketIntakeService {
             // report accepted/blocked/ignored (with reason/billing); a void return
             // means a plain `accepted`. A thrown error is handled below and withholds
             // the ACK so the relay redelivers.
-            disposition = await forwardRoutingOwnerEvent(payload, rawEventType, deliveryId, delivery.installationId ?? this.ownerRelayInstallationId)
-                ? ACCEPTED_DISPOSITION
-                : normalizeDisposition(await this.dispatch(payload, rawEventType, correlationId));
+            // The owner-event path owns every `/ezer`-addressed comment outright: `true` means it
+            // handled the delivery, an explicit disposition means it refused the delivery
+            // terminally (unauthorized author, or a command it can neither admit nor answer) and
+            // that disposition is ACKed verbatim. Only a falsy result — a delivery that is not
+            // addressed to Ezer at all — reaches the ordinary webhook dispatcher.
+            const owned = await forwardRoutingOwnerEvent(payload, rawEventType, deliveryId, delivery.installationId ?? this.ownerRelayInstallationId);
+            disposition = owned === true ? ACCEPTED_DISPOSITION
+                : owned || normalizeDisposition(await this.dispatch(payload, rawEventType, correlationId));
         } catch (error) {
             this.deliveries.fail(deliveryId);
             log.error(

@@ -712,6 +712,24 @@ describe('every form the containment claim names is exercised, not believed', ()
         });
         assert.deepEqual(found, [], 'the module the binding came out of is what decides it');
     });
+
+    test('a NON-LITERAL computed binding is not guessed from the local alias', () => {
+        // `propertyName` IS present here — this is not shorthand — but it is a computed name that
+        // is not a string literal, so which property `spawn` was bound to is unknown. Falling back
+        // to the local alias would report `child_process.spawn`, a guess that contradicts the
+        // adjacent claim that non-literal computed names stay unresolved.
+        const found = fixtureProcessCreationSites({
+            'computedRename.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const key = 'exec';
+                const { [key]: spawn } = require('child_process');
+                export async function computed(prompt: string) {
+                    return executeWithUsageTracking('run', async () => spawn('docker ' + prompt));
+                }
+            `,
+        });
+        assert.deepEqual(found, [], 'an explicit but unresolvable computed property must not be guessed from the alias');
+    });
 });
 
 describe('a callback argument is unleased unless a verified wrapper runs it', () => {

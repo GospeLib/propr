@@ -697,8 +697,18 @@ export function analyzeProcessCreationSites(program: ts.Program, rootDirectory: 
             // process-creation surface answered "no" for a plain `spawn` written under another
             // name — a paid process path that could be added without the frozen list changing.
             // What a binding element names is the property it was taken from, so that is read.
-            const api = ts.isBindingElement(declaration) ? bindingPropertyName(declaration) ?? name : name;
-            if (!PROCESS_CREATION_APIS.includes(api)) { /* fall through to the alias chase */ }
+            // The local name is a stand-in for the property ONLY when the binding is SHORTHAND
+            // (no `propertyName` at all, e.g. `const { spawn } = …`). When a `propertyName` is
+            // present but does not resolve to a literal — `const { [key]: spawn } = …` — the
+            // property actually selected is dynamic and unknown, and the local alias says
+            // nothing about it: guessing `spawn` from the alias would turn an unresolvable
+            // computed binding into a false positive (or, if the alias happens not to match a
+            // process-creation name, silently miss one). So an explicit-but-unresolvable
+            // `propertyName` yields no primitive here, not a guess from the local name.
+            const api = ts.isBindingElement(declaration)
+                ? (declaration.propertyName ? bindingPropertyName(declaration) : name)
+                : name;
+            if (!api || !PROCESS_CREATION_APIS.includes(api)) { /* fall through to the alias chase */ }
             else if (file.endsWith(NODE_CHILD_PROCESS_DECLARATION)) return `child_process.${api}`;
             else if (ts.isBindingElement(declaration) && destructuredFromChildProcess(declaration)) {
                 return `child_process.${api}`;

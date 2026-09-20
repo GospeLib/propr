@@ -592,11 +592,15 @@ export function analyzeProcessCreationSites(program: ts.Program, rootDirectory: 
      * through one ordinary hop, and a rule that only read the load itself would call that nothing.
      */
     const destructuredFromChildProcess = (declaration: ts.BindingElement): boolean => {
-        let current: ts.Node = declaration;
-        while (current.parent && !ts.isVariableDeclaration(current.parent)) current = current.parent;
-        const variable = current.parent;
-        if (!variable || !ts.isVariableDeclaration(variable) || !variable.initializer) return false;
-        return namesChildProcessModule(variable.initializer);
+        // The pattern this element sits in must be the ROOT pattern — its own parent must be the
+        // `VariableDeclaration`, not another `BindingElement`. A nested pattern (`{ extra: {
+        // spawn } }`) puts an intervening property between the module and this element; climbing
+        // past that intervening step (as a bare walk-to-the-nearest-`VariableDeclaration` did)
+        // answers whether the OUTER destructuring came from `child_process`, which says nothing
+        // about what this INNER element actually selects.
+        const pattern = declaration.parent;
+        if (!ts.isVariableDeclaration(pattern.parent) || !pattern.parent.initializer) return false;
+        return namesChildProcessModule(pattern.parent.initializer);
     };
     /**
      * Whether this expression NAMES the `child_process` module itself, rather than one export of it.
@@ -697,16 +701,30 @@ export function analyzeProcessCreationSites(program: ts.Program, rootDirectory: 
             // process-creation surface answered "no" for a plain `spawn` written under another
             // name — a paid process path that could be added without the frozen list changing.
             // What a binding element names is the property it was taken from, so that is read.
-            // The local name is a stand-in for the property ONLY when the binding is SHORTHAND
-            // (no `propertyName` at all, e.g. `const { spawn } = …`). When a `propertyName` is
+            // The local name is a stand-in for the property ONLY when the binding is a SHORTHAND,
+            // DIRECT, non-rest element of the ROOT object binding pattern (e.g. `const { spawn }
+            // = …`). Every other no-`propertyName` shape answers "no property name" without
+            // meaning "the local name IS the property": a NESTED element (`{ extra: { spawn } }`)
+            // is shorthand for the INNER pattern only — the local name says nothing about the
+            // outer module's property; an ARRAY element (`const [spawn] = …`) selects by
+            // position, not name, so the identifier is an arbitrary label; and a REST element
+            // (`{ ...spawn }` or `[...spawn]`) collects whatever is left over, not one property.
+            // Guessing a primitive from any of these turns an unresolvable binding into a false
+            // positive, exactly like the computed-property case below. When a `propertyName` IS
             // present but does not resolve to a literal — `const { [key]: spawn } = …` — the
             // property actually selected is dynamic and unknown, and the local alias says
             // nothing about it: guessing `spawn` from the alias would turn an unresolvable
             // computed binding into a false positive (or, if the alias happens not to match a
             // process-creation name, silently miss one). So an explicit-but-unresolvable
             // `propertyName` yields no primitive here, not a guess from the local name.
+            const isDirectRootObjectBindingElement = ts.isBindingElement(declaration)
+                && !declaration.dotDotDotToken
+                && ts.isObjectBindingPattern(declaration.parent)
+                && ts.isVariableDeclaration(declaration.parent.parent);
             const api = ts.isBindingElement(declaration)
-                ? (declaration.propertyName ? bindingPropertyName(declaration) : name)
+                ? (declaration.propertyName
+                    ? bindingPropertyName(declaration)
+                    : (isDirectRootObjectBindingElement ? name : undefined))
                 : name;
             if (!api || !PROCESS_CREATION_APIS.includes(api)) { /* fall through to the alias chase */ }
             else if (file.endsWith(NODE_CHILD_PROCESS_DECLARATION)) return `child_process.${api}`;

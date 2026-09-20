@@ -730,6 +730,74 @@ describe('every form the containment claim names is exercised, not believed', ()
         });
         assert.deepEqual(found, [], 'an explicit but unresolvable computed property must not be guessed from the alias');
     });
+
+    test('a NESTED shorthand binding is not guessed from the local name', () => {
+        // `{ docker: { spawn } }` is shorthand for the INNER pattern only. The local name `spawn`
+        // is not a stand-in for `cp.spawn` — the actual property selected is `cp.docker.spawn`,
+        // which this source never establishes exists. Climbing past the intervening `docker` step
+        // to ask only "did the outermost initializer name child_process" would answer yes and
+        // guess `child_process.spawn`, which is not what this destructuring reads.
+        const found = fixtureProcessCreationSites({
+            'nestedShorthand.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const cp: any = require('node:child_process');
+                const { docker: { spawn } } = cp;
+                export async function nested(prompt: string) {
+                    return executeWithUsageTracking('run', async () => spawn('docker ' + prompt));
+                }
+            `,
+        });
+        assert.deepEqual(found, [], 'a nested element is not the same claim as a root element with the same name');
+    });
+
+    test('a NESTED, DEFAULTED shorthand binding is not guessed from the local name', () => {
+        // Same nesting as above, plus a default value on the inner element — the default must not
+        // reopen the guess either.
+        const found = fixtureProcessCreationSites({
+            'nestedDefaulted.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const cp: any = require('node:child_process');
+                const { docker: { spawn = null as any } = {} } = cp;
+                export async function nestedDefaulted(prompt: string) {
+                    return executeWithUsageTracking('run', async () => spawn('docker ' + prompt));
+                }
+            `,
+        });
+        assert.deepEqual(found, [], 'a defaulted nested element is still nested, not a root element');
+    });
+
+    test('an ARRAY binding is not guessed from the local name', () => {
+        // Array destructuring selects by POSITION, not by name. `const [spawn] = cp` binds
+        // whatever `cp`'s first enumerated value is to a local called `spawn`; the identifier is
+        // an arbitrary label the author chose, not a property name the analysis may read back.
+        const found = fixtureProcessCreationSites({
+            'arrayBinding.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const cp: any = require('node:child_process');
+                const [spawn] = cp;
+                export async function arrayBound(prompt: string) {
+                    return executeWithUsageTracking('run', async () => spawn('docker ' + prompt));
+                }
+            `,
+        });
+        assert.deepEqual(found, [], 'a positional array element is not a property named by the local identifier');
+    });
+
+    test('a REST binding is not guessed from the local name', () => {
+        // `{ ...spawn }` collects everything NOT already destructured into one object; it is never
+        // itself the value of a single property, however the rest local happens to be spelled.
+        const found = fixtureProcessCreationSites({
+            'restBinding.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const cp: any = require('node:child_process');
+                const { exec, ...spawn } = cp;
+                export async function restBound(prompt: string) {
+                    return executeWithUsageTracking('run', async () => spawn('docker ' + prompt));
+                }
+            `,
+        });
+        assert.deepEqual(found, [], 'a rest element collects the remainder, it does not name one property');
+    });
 });
 
 describe('a callback argument is unleased unless a verified wrapper runs it', () => {

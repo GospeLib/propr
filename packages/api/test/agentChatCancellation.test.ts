@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Request, Response } from 'express';
@@ -13,7 +13,8 @@ const DISCONNECT_DELAY_MS = 100;
 const CHILD_TIMEOUT_MS = 2_000;
 const NATIVE_TIMEOUT_MS = 50;
 const NATIVE_SLOW_COMPLETION_MS = 150;
-const executionBinding = (prompt: string) => ({ requestId: 'request', operationId: 'operation',
+// One admitted operation may be executed once, so every scenario admits its own.
+const executionBinding = (prompt: string) => ({ requestId: 'request', operationId: `operation-${randomUUID()}`,
     inputDigest: `sha256:${'a'.repeat(64)}`, repository: 'owner/repo',
     providerInputDigest: `sha256:${createHash('sha256').update(prompt).digest('hex')}` });
 
@@ -126,7 +127,7 @@ test('native binding rejects altered prompt bytes before admission or authoring'
         analyze: async () => { authored = true; return { success: true, response: 'fixture', modelUsed: 'fixture' }; } } as unknown as Agent;
     await assert.rejects(nativeAnalysis(agent, 'altered prompt', { options: { analysisProfile: 'planning-artifact' },
         signal: new AbortController().signal, binding: {
-            requestId: 'request', operationId: 'operation', inputDigest: `sha256:${'a'.repeat(64)}`,
+            requestId: 'request', operationId: `operation-${randomUUID()}`, inputDigest: `sha256:${'a'.repeat(64)}`,
             repository: 'owner/repo', providerInputDigest: `sha256:${'b'.repeat(64)}`,
         }, dependencies: { stateManager: {
             async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() { admitted = true; }, async updateTaskState() {}, async updateHistoryMetadata() {},

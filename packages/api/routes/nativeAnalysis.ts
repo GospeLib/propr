@@ -2,6 +2,8 @@ import { randomUUID, createHash } from 'node:crypto';
 import {
     getStateManager, runWithExecutionAbortSignal, runWithPlannerAbortContext, TaskStates, SyntheticAgent,
     durableOperationIdentity, publishCompletedWithDurableExecutionEvidence, isCompletionDurabilityUnverifiable,
+    terminalTransitionId, certifyDurableCompletion, isDurableCompletionAbsent,
+    acquireExecutionLease, releaseExecutionLease, settleExecutionLease, startExecutionLeaseRenewal,
     type Agent, type AnalyzeOptions, type WorkerStateManager,
 } from '@propr/core';
 import { setAbortSignal } from './plannerAbortHandlers.js';
@@ -28,6 +30,29 @@ export type NativeAnalysisStateManager = Pick<WorkerStateManager,
 
 /** The task already holds a terminal state for this admitted operation; it may not run again. */
 export const NATIVE_ANALYSIS_OPERATION_SETTLED = 'NATIVE_ANALYSIS_OPERATION_ALREADY_SETTLED';
+/** Another live attempt holds the execution lease for this operation; this one does not execute. */
+export const NATIVE_ANALYSIS_OPERATION_IN_PROGRESS = 'NATIVE_ANALYSIS_OPERATION_EXECUTION_IN_PROGRESS';
+
+/**
+ * Whether the AUTHORITATIVE history already holds the completion of this operation.
+ *
+ * Redis is a projection: it can be lost with the process, evicted, or flushed, and consulting it
+ * alone is how a durably settled operation got a second paid execution. The durable history is
+ * addressed by the deterministic transition identity of this operation, so the evidence is exactly
+ * the row the earlier attempt committed — never "some completed row for this task".
+ *
+ * A read that FAILS is not an absence. It propagates, because "the database would not answer" is
+ * not permission to spend money again.
+ */
+async function operationDurablyCompleted(taskId: string, transitionId: string): Promise<boolean> {
+    try {
+        await certifyDurableCompletion(taskId, transitionId);
+        return true;
+    } catch (error) {
+        if (isDurableCompletionAbsent(error)) return false;
+        throw error;
+    }
+}
 
 /**
  * The task identity of one admitted native-analysis operation.
@@ -81,9 +106,15 @@ export async function nativeAnalysis(
     // The attempt generation stays per-attempt on purpose: it fences executor ownership for THIS
     // attempt, which is the opposite of what the task and transition identities are for.
     const attemptGeneration = randomUUID();
+    // The lease generation is deliberately NOT the attempt generation. The attempt generation
+    // fences the executor (abort markers, planner context) and is read by other machinery on that
+    // contract; the lease fences the RIGHT TO RUN, is written to a different durable row, and has
+    // to stay meaningful even if the executor fence is ever reused or derived. Two fences, two
+    // values, so neither can be widened by a change made for the other.
+    const leaseGeneration = randomUUID();
     const [repoOwner, repoName] = binding.repository.split('/');
     const evidence = {
-        requestId, taskId, attemptGeneration, operationId: binding?.operationId,
+        requestId, taskId, attemptGeneration, leaseGeneration, operationId: binding?.operationId,
         inputDigest: binding?.inputDigest,
         providerInputDigest: `sha256:${createHash('sha256').update(prompt).digest('hex')}`,
         agentId: agent.config.id, agentAlias: agent.config.alias,
@@ -125,15 +156,63 @@ export async function nativeAnalysis(
     };
     signal.addEventListener('abort', requestCancellation, { once: true });
     if (signal.aborted) requestCancellation();
+    // A refusal must not leave the cancellation listener attached to a request that never ran.
+    const refusal = (message: string): Error => {
+        signal.removeEventListener('abort', requestCancellation);
+        return new Error(message);
+    };
     // A redelivery of the same admitted operation finds the task that operation already created.
     // One that already settled is refused outright rather than re-executed: repeating the paid run
     // is the loss this identity exists to prevent. It is checked before the settlement handler is
     // in scope, so a refusal can never write anything over the terminal state it just found.
     const existing = await state.getTaskState(taskId);
     if (existing && TERMINAL_NATIVE_STATES.has(existing.state)) {
-        signal.removeEventListener('abort', requestCancellation);
-        throw new Error(`${NATIVE_ANALYSIS_OPERATION_SETTLED}: ${taskId} is already ${existing.state}`);
+        throw refusal(`${NATIVE_ANALYSIS_OPERATION_SETTLED}: ${taskId} is already ${existing.state}`);
     }
+    // The projection above is NOT what decides whether paid work runs. It can be absent because
+    // the process died after the completed row committed, or because Redis lost the key — and
+    // then it reads exactly like a fresh operation. So the durable history is asked directly,
+    // under this operation's deterministic completed-transition identity.
+    const completedTransitionId = terminalTransitionId(taskId, TaskStates.COMPLETED, operationIdentity);
+    let durablyCompleted: boolean;
+    // An unreadable history is not an absence, so it propagates — but not with this request's
+    // cancellation listener still attached to a run that never started.
+    try { durablyCompleted = await operationDurablyCompleted(taskId, completedTransitionId); }
+    catch (error) { signal.removeEventListener('abort', requestCancellation); throw error; }
+    if (durablyCompleted) {
+        // The evidence is durable; only the projection was lost, so the projection is restored
+        // from it rather than the operation being run again. A projection that cannot be caught
+        // up changes nothing about the refusal: the history is what a consumer reads.
+        try { await state.projectDurableCompletion?.(taskId, { transitionId: completedTransitionId }); }
+        catch { /* the durable completion stands whether or not its projection could be restored */ }
+        throw refusal(`${NATIVE_ANALYSIS_OPERATION_SETTLED}: ${taskId} is already ${TaskStates.COMPLETED}`);
+    }
+    // Two redeliveries that both pass the checks above are both "not settled yet" and would both
+    // pay. The right to execute is therefore taken durably and exclusively, in one atomic
+    // statement, before the provider is reachable.
+    const acquired = await acquireExecutionLease({
+        leaseKey: operationIdentity, taskId, operationId: binding.operationId, generation: leaseGeneration,
+    });
+    if (acquired.outcome === 'settled') {
+        throw refusal(`${NATIVE_ANALYSIS_OPERATION_SETTLED}: ${taskId} settled as ${acquired.settledState}`);
+    }
+    if (acquired.outcome === 'held') {
+        throw refusal(`${NATIVE_ANALYSIS_OPERATION_IN_PROGRESS}: ${taskId} is executing under another attempt`);
+    }
+    const lease = acquired.lease;
+    let leaseSettled = false;
+    // A lease this attempt no longer holds is recorded rather than swallowed: the terminal
+    // transition identity still stops a second completed row, but losing the fence is the one
+    // condition under which another attempt could have started, and that must be visible.
+    const leaseFenceErrors: string[] = [];
+    const settleLease = async (terminal: string) => {
+        leaseSettled = await settleExecutionLease(lease, terminal);
+        if (!leaseSettled) leaseFenceErrors.push(`the execution lease was no longer held at ${terminal}`);
+    };
+    const stopLeaseRenewal = startExecutionLeaseRenewal(lease, {
+        onLost: () => leaseFenceErrors.push('the execution lease was taken over while this attempt was running'),
+        onError: error => leaseFenceErrors.push(`the execution lease could not be renewed: ${error.message}`),
+    });
     try {
         if (!existing) await state.createTaskState(taskId, {
             number: 0, repoOwner, repoName, type: 'analysis', ...evidence,
@@ -171,7 +250,8 @@ export async function nativeAnalysis(
         const terminalHistoryMetadata = { ...evidence, ...schemaEvidence(), result, childStopped, containerStopped,
             // The terminal outcome a value-only reader needs, beside the raw result.
             agentOutcome: { success: result.success, executionTimeMs: result.executionTimeMs },
-            cancellationAcknowledged: signal.aborted, cancellationCheckpointErrors: [...cancellationCheckpointErrors] };
+            cancellationAcknowledged: signal.aborted, cancellationCheckpointErrors: [...cancellationCheckpointErrors],
+            ...(leaseFenceErrors.length === 0 ? {} : { leaseFenceErrors: [...leaseFenceErrors] }) };
         try {
             // This route runs a model execution and publishes its own `completed`, so it goes
             // through the same durability barrier as the queued paths — the same claimed
@@ -188,9 +268,14 @@ export async function nativeAnalysis(
                 if (completion.outcome === 'settled_failed') {
                     settlementError = 'the completed history could not be persisted; the run was settled as failed with its evidence';
                 }
+                // Either outcome is a DURABLE settlement of this operation — a published
+                // completion or a failed record carrying the same evidence — so the lease is
+                // settled and no later attempt may ever pay for this operation again.
+                await settleLease(completion.outcome === 'published' ? TaskStates.COMPLETED : TaskStates.FAILED);
             } else {
                 await state.updateTaskState(taskId, terminalState,
                     { requireDurableHistory: true, historyMetadata: terminalHistoryMetadata });
+                await settleLease(terminalState);
             }
         } catch (error) {
             settlementError = (error as Error).message;
@@ -199,6 +284,7 @@ export async function nativeAnalysis(
         // outcome. Preserve its paid response, but explicitly refuse a settled receipt.
         return { ...result, execution: { ...evidence, ...schemaEvidence(), childStopped, containerStopped,
             terminalRecorded: settlementError === undefined,
+            ...(leaseFenceErrors.length === 0 ? {} : { leaseFenceErrors: [...leaseFenceErrors] }),
             ...(terminalTransitionId === undefined ? {} : { terminalTransitionId }),
             ...(settlementError === undefined ? {} : { settlementError }),
             // Durability could not be established either way: a caller must NOT treat this as
@@ -209,17 +295,27 @@ export async function nativeAnalysis(
     } catch (error) {
         await cancellationCheckpoint;
         let settlementError: string | undefined;
-        try { await state.updateTaskState(taskId, signal.aborted ? TaskStates.CANCELLED : TaskStates.FAILED, {
-            requireDurableHistory: true,
-            historyMetadata: { ...evidence, childStopped, containerStopped, cancellationAcknowledged: signal.aborted,
-                cancellationCheckpointErrors: [...cancellationCheckpointErrors] },
-            error: { message: (error as Error).message },
-        }); } catch (failure) { settlementError = (failure as Error).message; }
+        const terminalState = signal.aborted ? TaskStates.CANCELLED : TaskStates.FAILED;
+        try {
+            await state.updateTaskState(taskId, terminalState, {
+                requireDurableHistory: true,
+                historyMetadata: { ...evidence, childStopped, containerStopped, cancellationAcknowledged: signal.aborted,
+                    cancellationCheckpointErrors: [...cancellationCheckpointErrors] },
+                error: { message: (error as Error).message },
+            });
+            await settleLease(terminalState);
+        } catch (failure) { settlementError = (failure as Error).message; }
         throw Object.assign(new Error((error as Error).message, { cause: error }), {
             execution: { ...evidence, childStopped, containerStopped,
                 ...(settlementError === undefined ? {} : { settlementError }) },
         });
     } finally {
         signal.removeEventListener('abort', requestCancellation);
+        stopLeaseRenewal();
+        // A lease that was never settled belonged to an attempt that did not settle the
+        // operation, so it is handed back at once: a retry of an UNSETTLED operation is
+        // legitimate work, and making it wait out the term would be a false refusal. A settled
+        // lease is left exactly as it is — releasing that one would re-permit paid work.
+        if (!leaseSettled) { try { await releaseExecutionLease(lease); } catch { /* it lapses on its own */ } }
     }
 }

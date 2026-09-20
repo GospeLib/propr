@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
 import { closeConnection, SyntheticAgent, type Agent, type AnalyzeOptions } from '@propr/core';
 import { nativeAnalysis, type NativeAnalysisBinding } from '../routes/nativeAnalysis.js';
@@ -8,7 +8,10 @@ const PROMPT = 'exact original planning input';
 const SCHEMA = { type: 'object', additionalProperties: false, required: ['artifacts'],
   properties: { artifacts: { type: 'array', items: { type: 'string' } } } };
 const digest = (text: string) => `sha256:${createHash('sha256').update(text).digest('hex')}`;
-const binding = () => ({ requestId: 'request', operationId: 'operation', repository: 'fixture/planning',
+// Each test is a DIFFERENT admitted operation, so each gets its own durable operation identity:
+// one identity means one execution, which is the invariant under test elsewhere, not a fixture
+// detail to be shared between unrelated scenarios.
+const binding = () => ({ requestId: 'request', operationId: `operation-${randomUUID()}`, repository: 'fixture/planning',
   inputDigest: digest('logical input'), providerInputDigest: digest(PROMPT), responseSchemaDigest: digest(JSON.stringify(SCHEMA)) });
 after(closeConnection);
 

@@ -119,7 +119,57 @@ function historyQuery() {
     return query;
 }
 
+interface LeaseRow {
+    lease_key: string; task_id: string; operation_id: string; lease_generation: string;
+    acquired_at: string; expires_at: string; settled_at: string | null; settled_state: string | null;
+}
+const leaseRows: LeaseRow[] = [];
+
+/**
+ * The lease table, modelled on the statements the real one runs: an insert that admits one row
+ * per key and is otherwise ignored, and conditional updates/deletes that report how many rows
+ * they actually changed.
+ */
+function leaseQuery() {
+    let criteria: Record<string, unknown> = {};
+    const nullColumns: string[] = [];
+    const comparisons: [string, string, string][] = [];
+    const matches = (row: LeaseRow) =>
+        Object.entries(criteria).every(([key, value]) => row[key as keyof LeaseRow] === value)
+        && nullColumns.every(column => row[column as keyof LeaseRow] == null)
+        && comparisons.every(([column, operator, value]) => operator === '<='
+            ? String(row[column as keyof LeaseRow]) <= value : String(row[column as keyof LeaseRow]) > value);
+    const append = async (row: LeaseRow) => {
+        if (!leaseRows.some(existing => existing.lease_key === row.lease_key)) leaseRows.push({ ...row });
+        return [leaseRows.length];
+    };
+    const query = {
+        insert: (row: LeaseRow) => Object.assign(lazyResult(() => append(row)), {
+            onConflict: () => ({ ignore: () => lazyResult(() => append(row)) }),
+        }),
+        where: (column: string | Record<string, unknown>, operator?: string, value?: string) => {
+            if (typeof column === 'object') criteria = { ...criteria, ...column };
+            else comparisons.push([column, operator as string, value as string]);
+            return query;
+        },
+        whereNull: (column: string) => { nullColumns.push(column); return query; },
+        first: async () => { const row = leaseRows.find(matches); return row ? { ...row } : undefined; },
+        update: async (values: Partial<LeaseRow>) => {
+            const affected = leaseRows.filter(matches);
+            for (const row of affected) Object.assign(row, values);
+            return affected.length;
+        },
+        delete: async () => {
+            const affected = leaseRows.filter(matches);
+            for (const row of affected) leaseRows.splice(leaseRows.indexOf(row), 1);
+            return affected.length;
+        },
+    };
+    return query;
+}
+
 const databaseTable = (table: string) => table === 'task_terminal_transitions' ? claimQuery()
+    : table === 'task_execution_leases' ? leaseQuery()
     : table === 'tasks' ? tasksQuery() : historyQuery();
 
 await mock.module('../packages/core/src/db/connection.js', { namedExports: { db: databaseTable } });
@@ -139,8 +189,10 @@ const { durableExecutionCompletionGuard, nonExecutingCompletionGuard, isCompleti
 const { COMPLETION_DURABILITY_UNVERIFIABLE, CompletionDurabilityUnverifiableError, isCompletionDurabilityUnverifiable } =
     await import('../packages/core/src/utils/completionDurabilityOutcome.js');
 const { WorkerStateManager } = await import('../packages/core/src/utils/workerStateManager.js');
-const { publishCompletedWithDurableExecutionEvidence, certifyDurableCompletion } =
+const { publishCompletedWithDurableExecutionEvidence, certifyDurableCompletion, isDurableCompletionAbsent } =
     await import('../packages/core/src/utils/durableCompletionBarrier.js');
+const { acquireExecutionLease, releaseExecutionLease, renewExecutionLease, settleExecutionLease, startExecutionLeaseRenewal } =
+    await import('../packages/core/src/utils/executionLease.js');
 
 class SyntheticAgent {}
 
@@ -156,7 +208,8 @@ await mock.module('@propr/core', {
         runWithPlannerAbortContext: async <T>(_taskId: string, _generation: string, run: () => Promise<T>) => run(),
         durableOperationIdentity, claimTerminalTransition, terminalTransitionId,
         durableExecutionCompletionGuard, nonExecutingCompletionGuard, isCompletionGuard, assertCompletionGuarded,
-        publishCompletedWithDurableExecutionEvidence, certifyDurableCompletion,
+        publishCompletedWithDurableExecutionEvidence, certifyDurableCompletion, isDurableCompletionAbsent,
+        acquireExecutionLease, releaseExecutionLease, renewExecutionLease, settleExecutionLease, startExecutionLeaseRenewal,
         COMPLETION_DURABILITY_UNVERIFIABLE, CompletionDurabilityUnverifiableError, isCompletionDurabilityUnverifiable,
         buildPlannerAbortSignalKey: (draftId: string) => `planner:abort:${draftId}`,
         buildPlannerAbortRedisOptions: () => ({}),
@@ -182,17 +235,24 @@ const binding = (prompt: string) => ({
     providerInputDigest: `sha256:${createHash('sha256').update(prompt).digest('hex')}`,
 });
 
-function claudeAgent(onAnalyze: () => void) {
+function claudeAgent(onAnalyze: () => void | Promise<void>) {
     return {
         config: { type: 'claude', id: 'claude-native', alias: 'native' },
         async analyze() {
-            onAnalyze();
+            await onAnalyze();
             return { success: true, response: 'plan', modelUsed: 'fixture', executionTimeMs: EXECUTION_TIME_MS };
         },
     } as never;
 }
 
-async function runAnalysis(onAnalyze: () => void, stateManager: unknown) {
+function failingAgent(onAnalyze: () => void) {
+    return {
+        config: { type: 'claude', id: 'claude-native', alias: 'native' },
+        async analyze() { onAnalyze(); throw new Error('provider unavailable'); },
+    } as never;
+}
+
+async function runAnalysis(onAnalyze: () => void | Promise<void>, stateManager: unknown) {
     return nativeAnalysis(claudeAgent(onAnalyze), 'prompt', {
         options: {} as never,
         signal: new AbortController().signal,
@@ -209,36 +269,103 @@ beforeEach(() => {
     redisStore.clear();
     historyRows.length = 0;
     claimRows.length = 0;
+    leaseRows.length = 0;
     taskRows.length = 0;
     nextHistoryId = 1;
 });
 
 describe('a retried native analysis operation keeps one identity', () => {
-    test('a crash that loses the projection still leaves one task, one claim and one completed row', async () => {
+    test('a crash that loses the projection refuses the retry from the durable history, and pays once', async () => {
         let analyses = 0;
         const first = await runAnalysis(() => { analyses++; }, new WorkerStateManager());
         const firstTaskId = (first.execution as { taskId: string }).taskId;
         assert.equal(completedRows().length, 1);
         assert.equal((first.execution as { terminalRecorded: boolean }).terminalRecorded, true);
+        assert.equal((first.execution as { terminalTransitionId?: string }).terminalTransitionId,
+            terminalTransitionId(firstTaskId, TASK_STATES.COMPLETED, durableOperationIdentity('native-analysis', OPERATION_ID)),
+            'under the identity derived from the admitted operation, not from the attempt');
 
         // The process dies: the durable history survives, the Redis projection does not.
         redisStore.clear();
 
-        const second = await runAnalysis(() => { analyses++; }, new WorkerStateManager());
-        const secondTaskId = (second.execution as { taskId: string }).taskId;
-
-        assert.equal(secondTaskId, firstTaskId,
-            'the retry of one admitted operation must address the task that operation already created');
+        await assert.rejects(() => runAnalysis(() => { analyses++; }, new WorkerStateManager()),
+            /NATIVE_ANALYSIS_OPERATION_ALREADY_SETTLED/,
+            'the projection is not what decides whether paid work runs; the durable history is');
+        assert.equal(analyses, 1, 'a durably settled operation never receives a second paid execution');
         assert.equal(claimRows.filter(row => row.state === TASK_STATES.COMPLETED).length, 1,
-            'and claim the one terminal transition identity, not a second one');
+            'and there is still one terminal transition identity, not a second one');
         assert.equal(completedRows().length, 1,
             `one logical completion is one durable row (saw ${JSON.stringify(completedRows())})`);
-        assert.equal((second.execution as { terminalRecorded: boolean }).terminalRecorded, true,
-            'a completion that is demonstrably durable must never be reported as unrecorded');
-        assert.equal((second.execution as { terminalTransitionId?: string }).terminalTransitionId,
-            terminalTransitionId(firstTaskId, TASK_STATES.COMPLETED, durableOperationIdentity('native-analysis', OPERATION_ID)),
-            'under the identity derived from the admitted operation, not from the attempt');
-        assert.equal(analyses, 2, 'the retry did re-run: this test is about identity, not about caching a result');
+    });
+
+    test('a projection that missed the terminal transition is restored from the durable history', async () => {
+        let analyses = 0;
+        const first = await runAnalysis(() => { analyses++; }, new WorkerStateManager());
+        const taskId = (first.execution as { taskId: string }).taskId;
+        // The history committed but the process died before the projection caught up: Redis is
+        // present and nonterminal, which reads exactly like an operation that never settled.
+        const [key, projected] = [...redisStore.entries()][0];
+        redisStore.set(key, JSON.stringify({ ...JSON.parse(projected), state: TASK_STATES.CLAUDE_EXECUTION }));
+
+        await assert.rejects(() => runAnalysis(() => { analyses++; }, new WorkerStateManager()),
+            /NATIVE_ANALYSIS_OPERATION_ALREADY_SETTLED/);
+        assert.equal(analyses, 1, 'a stale projection cannot buy a second paid execution');
+        assert.equal(JSON.parse(redisStore.get(key) as string).state, TASK_STATES.COMPLETED,
+            'and the projection is restored from the durable evidence rather than re-earned');
+        assert.equal(completedRows().length, 1);
+        assert.ok(taskId);
+    });
+
+    test('two simultaneous requests for one operation produce exactly one paid execution', async () => {
+        let analyses = 0;
+        let admit!: () => void;
+        const inProvider = new Promise<void>(resolve => { admit = resolve; });
+        let released!: () => void;
+        const release = new Promise<void>(resolve => { released = resolve; });
+        const first = runAnalysis(async () => { analyses++; admit(); await release; }, new WorkerStateManager());
+        // The second request arrives while the first is INSIDE the provider, which is the window
+        // the old `getTaskState` check could not close: neither request has settled anything yet.
+        await inProvider;
+        await assert.rejects(() => runAnalysis(() => { analyses++; }, new WorkerStateManager()),
+            /NATIVE_ANALYSIS_OPERATION_EXECUTION_IN_PROGRESS/,
+            'the second request must be refused by the lease, not admitted to a second paid run');
+        assert.equal(analyses, 1, 'the non-atomic check let both requests pay; the lease admits one');
+        released();
+        const completed = await first;
+        assert.equal((completed.execution as { terminalRecorded: boolean }).terminalRecorded, true,
+            'and the request that held the lease still settles normally');
+        assert.equal(completedRows().length, 1);
+        assert.equal(claimRows.filter(row => row.state === TASK_STATES.COMPLETED).length, 1);
+    });
+
+    test('a retry of an operation that settled NOTHING is still allowed to run', async () => {
+        let analyses = 0;
+        const base = new WorkerStateManager();
+        const terminal = new Set<string>([TASK_STATES.COMPLETED, TASK_STATES.FAILED, TASK_STATES.CANCELLED]);
+        // An attempt that dies without settling anything: its provider fails AND its terminal
+        // write fails, so the operation is left genuinely unsettled.
+        const crashing = {
+            createTaskState: base.createTaskState.bind(base),
+            updateHistoryMetadata: base.updateHistoryMetadata.bind(base),
+            getTaskState: base.getTaskState.bind(base),
+            markTaskFailed: base.markTaskFailed.bind(base),
+            projectDurableCompletion: base.projectDurableCompletion.bind(base),
+            updateTaskState: async (taskId: string, state: string, metadata?: unknown) => {
+                if (terminal.has(state)) throw new Error('terminal history unavailable');
+                return base.updateTaskState(taskId, state, metadata as never);
+            },
+        };
+        await assert.rejects(() => nativeAnalysis(failingAgent(() => { analyses++; }), 'prompt', {
+            options: {} as never, signal: new AbortController().signal, binding: binding('prompt'),
+            dependencies: { stateManager: crashing as never, setAbortSignal: async () => undefined },
+        }), /provider unavailable/);
+        assert.equal(analyses, 1);
+        assert.equal(leaseRows.length, 0, 'an attempt that settled nothing hands its lease straight back');
+
+        const retry = await runAnalysis(() => { analyses++; }, new WorkerStateManager());
+        assert.equal(analyses, 2, 'an unsettled operation may legitimately be retried; the fence is not a blanket refusal');
+        assert.equal((retry.execution as { terminalRecorded: boolean }).terminalRecorded, true);
+        assert.equal(completedRows().length, 1);
     });
 
     test('a retry that still sees the settled projection refuses to run the paid work again', async () => {

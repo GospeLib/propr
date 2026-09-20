@@ -2,15 +2,19 @@
  * Slash command parser for PR comment intake.
  *
  * Recognizes `/review`, `/fix`, `/merge`, `/switch`, `/use`, and `/ultrafix` commands from PR comments.
- * `/ezer` is accepted as an alias for `/fix` (Ezer-originated follow-up instructions ride the same
- * manual fix/follow-up path, including its deterministic per-comment job id).
  * Splits the comment into command name, arguments, and trailing multiline instructions.
+ *
+ * THIS PARSER KNOWS NOTHING ABOUT `/ezer`, DELIBERATELY. `/ezer` is a publicly reachable
+ * namespace — any GitHub user can post it on any watched pull request or issue — so the address
+ * must never resolve to a command for anyone who has not passed authorization. It is resolved to
+ * `/fix` in exactly one place, `resolveOwnerEzerCommandBody` in ../intake/routingOwnerEvent.ts,
+ * which is reached only after `claimEzerAddressedComment` has established that the configured
+ * owner (by stable numeric GitHub user id) wrote the comment. Reintroducing an alias table here
+ * would hand the address back to every consumer of this generally-exported function, authorized
+ * or not — which is the bypass shape found three times. See test/ezerDispatcherChokepoint.test.ts.
  */
 
 export type SlashCommandName = 'review' | 'fix' | 'merge' | 'switch' | 'use' | 'ultrafix';
-
-/** Command text aliases, normalized to their canonical SlashCommandName before dispatch. */
-const COMMAND_ALIASES: Readonly<Record<string, SlashCommandName>> = { ezer: 'fix' };
 
 export interface ParsedSlashCommand {
     /** The recognized command */
@@ -99,8 +103,7 @@ export function parseSlashCommand(body: string | undefined | null): ParsedSlashC
 
     const separatorOffset = firstLineTrimmed.slice(1).search(/\s/);
     const separatorIndex = separatorOffset === -1 ? -1 : separatorOffset + 1;
-    const rawCommandText = firstLineTrimmed.slice(1, separatorIndex === -1 ? undefined : separatorIndex);
-    const commandText = COMMAND_ALIASES[rawCommandText] ?? rawCommandText;
+    const commandText = firstLineTrimmed.slice(1, separatorIndex === -1 ? undefined : separatorIndex);
     if (!SLASH_COMMANDS.has(commandText as SlashCommandName)) return null;
 
     const command = commandText as SlashCommandName;

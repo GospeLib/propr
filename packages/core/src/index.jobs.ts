@@ -47,7 +47,10 @@ export { handleCommentDeleted, handleCommentEdited, processCommentEvent, setUltr
 export { triggerNextPendingIssue } from './webhook/planIssueTrigger.js';
 export type { CommentPayload, CommentEventConfig, CommentEventType, UltrafixDeps } from './webhook/commentEventHandler.js';
 export { extractLlmFromKeywords, stripKeywordsFromBody, buildCodeContext, isReviewComment, extractLlmFromLabels } from './webhook/commentEventHelpers.js';
-export { parseSlashCommand, buildCommandMeta } from './webhook/slashCommandParser.js';
+// `parseSlashCommand` / `buildCommandMeta` are deliberately NOT re-exported. Nothing outside
+// `webhook/commentEventHandler.ts` consumes them, and a public re-export is an import shape that
+// a source-scanning structural test cannot reliably see. The types below are re-exported because
+// a type can carry no behaviour and therefore no command resolution.
 export type { ParsedSlashCommand, SlashCommandName, CommandMeta, ReviewCommandMeta, FixCommandMeta, MergeCommandMeta, UltrafixCommandMeta } from './webhook/slashCommandParser.js';
 export { handlePullRequestConflictDetection, handlePushConflictDetection, handleMergeCommand } from './webhook/mergeConflictDetector.js';
 export type { ConflictDetectionOutcome, ConflictDetectionResult, HandleMergeCommandOptions } from './webhook/mergeConflictDetector.js';

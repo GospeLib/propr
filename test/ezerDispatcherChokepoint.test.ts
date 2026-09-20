@@ -1,9 +1,11 @@
 /**
  * The `/ezer` authorization chokepoint, proved at the boundary itself rather than per intake mode.
  *
- * `processCommentEvent` (packages/core/src/webhook/commentEventHandler.ts) is the ONLY consumer of
- * `parseSlashCommand` in the codebase, and therefore the only place the production parser's
- * `/ezer` → `/fix` alias can be reached. Every route to that dispatcher goes through it:
+ * `processCommentEvent` (packages/core/src/webhook/commentEventHandler.ts) is the only place the
+ * `/ezer` address acquires a command meaning: the generally-exported slash parser has no `/ezer`
+ * alias at all, and the address is resolved to `/fix` by `resolveOwnerEzerCommandBody`, which
+ * yields nothing unless the configured owner wrote the comment. Every route to that dispatcher
+ * goes through this one function:
  *
  *   - routing-WebSocket intake  → processWebhookEvent → handleIssueCommentEvent / handlePullRequestReviewCommentEvent
  *   - direct_webhook endpoint   → processWebhookEvent → (the same two handlers)
@@ -16,11 +18,12 @@
  * function — so exercising the function directly exercises all of them. The two intake modes get
  * their own full end-to-end regressions (test/ezerReviewCommentIntakeBypass.test.ts and
  * test/ezerDirectWebhookIntakeBypass.test.ts); this file covers the rest and pins the structural
- * invariant that makes one gate sufficient.
+ * invariant that makes one gate sufficient — no longer "one import of the parser", which a
+ * namespace or dynamic import could evade, but "the parser resolves `/ezer` for nobody".
  */
 import { test, mock, before, after } from 'node:test';
 import assert from 'node:assert';
-import { readdir, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createWebhookIssueCommentCreatedEvent, createWebhookPRReviewCommentCreatedEvent } from './testHelpers.js';
 
@@ -202,38 +205,91 @@ test('the gate is authorization, not a blanket ban: the owner\'s own /ezer comme
     assert.ok(enqueuedJobs.length > 0, 'and the owner\'s command reaches the dispatcher and enqueues work');
 });
 
-test('processCommentEvent is the only consumer of the slash-command parser', async () => {
-    // The structural invariant that makes ONE gate sufficient. A second consumer of
-    // `parseSlashCommand` would be a second route to the `/ezer` → `/fix` alias that the chokepoint
-    // in processCommentEvent does not dominate — exactly the shape of the bug found three times.
-    // If this fails, do not add a second guard: move the gate to the new common boundary.
-    const repoRoot = path.resolve(import.meta.dirname, '..');
-    const roots = ['src', 'packages/core/src', 'packages/api', 'packages/cli', 'scripts'];
-    const skipDirectories = new Set(['node_modules', 'dist', 'test', '.git']);
-    const consumers: string[] = [];
+test('the shared slash parser resolves /ezer for nobody, through every import shape', async () => {
+    // THE load-bearing invariant. It used to be "processCommentEvent is the only consumer of
+    // parseSlashCommand", enforced by scanning a hand-picked set of roots for static named
+    // imports — which could not see a namespace import, a dynamic import(), a property read off
+    // a module namespace, or any file under a root that was not on the list. A second consumer
+    // acquiring the `/ezer` -> `/fix` alias through one of those shapes would have kept that test
+    // green, which is precisely the incomplete-path-coverage mistake behind three prior bypasses.
+    //
+    // The alias no longer exists in the shared parser, so reachability of `/ezer` is no longer a
+    // question of who imports the parser: NO importer of it can resolve `/ezer`, by any route.
+    // This asserts that directly, over the import shapes the old scan was blind to. It fails if
+    // anyone puts the alias back into the generally-exported parser.
+    const parserSpecifier = '../packages/core/src/webhook/slashCommandParser.js';
+    const namespace = await import(parserSpecifier);                       // namespace import
+    const dynamic = (await import(parserSpecifier)).parseSlashCommand;     // dynamic import
+    const propertyAccess = namespace['parseSlashCommand'];                 // computed property read
+    const { parseSlashCommand: staticNamed } = namespace;                  // static named binding
 
-    async function walk(directory: string): Promise<void> {
-        let entries;
-        try { entries = await readdir(directory, { withFileTypes: true }); } catch { return; }
-        for (const entry of entries) {
-            const full = path.join(directory, entry.name);
-            if (entry.isDirectory()) {
-                if (!skipDirectories.has(entry.name)) await walk(full);
-                continue;
-            }
-            if (!entry.name.endsWith('.ts') && !entry.name.endsWith('.mts')) continue;
-            const source = await readFile(full, 'utf8');
-            // An import of the parser from anywhere other than its own module or the re-export barrel.
-            if (/\bimport\s[^;]*\bparseSlashCommand\b/.test(source)) {
-                consumers.push(path.relative(repoRoot, full));
-            }
+    const hostileBodies = [
+        '/ezer take over this pull request',
+        '/ezer',
+        '/ezer\nPlease fix the failing test',
+        '  /ezer do it  ',
+    ];
+    for (const [shape, parse] of Object.entries({
+        'namespace import': namespace.parseSlashCommand,
+        'dynamic import': dynamic,
+        'computed property access': propertyAccess,
+        'static named import': staticNamed,
+    })) {
+        for (const body of hostileBodies) {
+            assert.strictEqual(parse(body), null,
+                `${shape} must not resolve ${JSON.stringify(body)} — the shared parser has no /ezer alias`);
         }
+        // Non-vacuous: the same function still resolves an ordinary command through that shape.
+        assert.strictEqual(parse('/fix do the thing')?.command, 'fix', `${shape}: /fix still parses`);
     }
-    for (const root of roots) await walk(path.join(repoRoot, root));
+});
 
-    assert.deepEqual(
-        consumers.filter(file => !file.endsWith('index.jobs.ts')).sort(),
-        ['packages/core/src/webhook/commentEventHandler.ts'],
-        'a new consumer of parseSlashCommand is a new route to the /ezer alias — move the chokepoint, do not duplicate it',
+test('the parser module itself carries no /ezer handling, only prose about not having any', async () => {
+    // Source-level guard on the ONE module the invariant above depends on. Comments are stripped
+    // first, so the explanatory block comment does not satisfy it and a reintroduced
+    // `COMMAND_ALIASES = { ezer: 'fix' }` cannot hide as documentation.
+    const source = await readFile(
+        path.resolve(import.meta.dirname, '../packages/core/src/webhook/slashCommandParser.ts'), 'utf8');
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    assert.strictEqual(/ezer/i.test(code), false,
+        'the generally-exported slash parser must contain no /ezer handling — resolve it inside the authorized boundary instead');
+});
+
+test('the public barrel re-exports no value that can resolve a slash command', async () => {
+    // A barrel re-export is an import shape a source scan of call sites cannot follow, so the
+    // parser is simply not on the public surface. Types are fine: a type carries no behaviour.
+    const barrel = await readFile(
+        path.resolve(import.meta.dirname, '../packages/core/src/index.jobs.ts'), 'utf8');
+    const valueExports = barrel.split('\n').filter(line => /^export\s*\{/.test(line) && !/^export\s+type/.test(line));
+    assert.strictEqual(
+        valueExports.some(line => /\bparseSlashCommand\b|\bbuildCommandMeta\b/.test(line)), false,
+        'do not re-export the slash parser publicly — it widens the set of places a /ezer alias could be reached from',
     );
+});
+
+test('/ezer acquires a command meaning only for the configured owner', async () => {
+    // The other half: the resolution that replaced the alias is itself authorization-gated, and
+    // it reproduces the old alias byte for byte for the owner.
+    const { resolveOwnerEzerCommandBody } = await import('../packages/core/src/intake/routingOwnerEvent.js');
+    const body = '/ezer address the linting errors';
+
+    assert.strictEqual(resolveOwnerEzerCommandBody({ body, user: HOSTILE_USER }), null,
+        'a non-owner /ezer comment resolves to no command at all');
+    assert.strictEqual(resolveOwnerEzerCommandBody({ body, user: { ...OWNER_USER, id: OWNER_USER.id + 1 } }), null,
+        'a different numeric user id is not the owner');
+    assert.strictEqual(resolveOwnerEzerCommandBody({ body, user: { ...HOSTILE_USER, login: OWNER_USER.login } }), null,
+        'the owner\'s login on a stranger\'s id is not the owner — identity is the numeric id');
+
+    const resolved = resolveOwnerEzerCommandBody({ body, user: OWNER_USER });
+    assert.strictEqual(resolved, '/fix address the linting errors');
+    const { parseSlashCommand } = await import('../packages/core/src/webhook/slashCommandParser.js');
+    assert.deepEqual(parseSlashCommand(resolved), parseSlashCommand('/fix address the linting errors'),
+        'the owner\'s /ezer parses exactly as the old alias made it parse');
+
+    // Multiline and case are preserved exactly as the alias table handled them.
+    assert.strictEqual(resolveOwnerEzerCommandBody({ body: '/ezer\nfix the test', user: OWNER_USER }), '/fix\nfix the test');
+    assert.strictEqual(resolveOwnerEzerCommandBody({ body: '/ezersomething do a thing', user: OWNER_USER }), null,
+        '/ezersomething was never the address and is still not');
+    assert.strictEqual(resolveOwnerEzerCommandBody({ body: '/EZER do a thing', user: OWNER_USER }), null,
+        'the alias table was case-sensitive; so is this');
 });

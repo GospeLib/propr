@@ -62,30 +62,21 @@ describe('parseSlashCommand', () => {
         assert.deepStrictEqual(result, { command: 'merge', args: [], instructions: '' });
     });
 
-    test('parses bare /ezer as an alias for /fix', () => {
-        const result = parseSlashCommand('/ezer');
-        assert.deepStrictEqual(result, { command: 'fix', args: [], instructions: '' });
-    });
-
-    test('parses /ezer with inline instructions identically to /fix', () => {
-        const ezerResult = parseSlashCommand('/ezer address the linting errors');
-        const fixResult = parseSlashCommand('/fix address the linting errors');
-        assert.deepStrictEqual(ezerResult, fixResult);
-        assert.deepStrictEqual(ezerResult, { command: 'fix', args: ['address', 'the', 'linting', 'errors'], instructions: '' });
-    });
-
-    test('parses /ezer with multiline instructions', () => {
-        const body = '/ezer\nPlease fix the failing test in utils.test.ts';
-        const result = parseSlashCommand(body);
-        assert.ok(result);
-        assert.strictEqual(result.command, 'fix');
-        assert.deepStrictEqual(result.args, []);
-        assert.strictEqual(result.instructions, 'Please fix the failing test in utils.test.ts');
-    });
-
-    test('does not treat "/ezersomething" as the /ezer alias', () => {
-        const result = parseSlashCommand('/ezersomething do a thing');
-        assert.strictEqual(result, null);
+    // `/ezer` is a PUBLICLY REACHABLE address: anyone can post it on a watched PR or issue. This
+    // generally-exported parser must therefore give it NO command meaning at all, for anybody.
+    // The address is resolved to `/fix` only by resolveOwnerEzerCommandBody, behind the owner
+    // authorization chokepoint — see test/ezerDispatcherChokepoint.test.ts.
+    test('the shared parser gives /ezer no command, in any shape', () => {
+        for (const body of [
+            '/ezer',
+            '/ezer address the linting errors',
+            '/ezer\nPlease fix the failing test in utils.test.ts',
+            '/ezer take over this pull request',
+            '/ezersomething do a thing',
+            '/EZER address the linting errors',
+        ]) {
+            assert.strictEqual(parseSlashCommand(body), null, `parser must not resolve ${JSON.stringify(body)}`);
+        }
     });
 
     test('trims whitespace around body', () => {

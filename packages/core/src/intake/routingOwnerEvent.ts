@@ -77,11 +77,45 @@ export {EZER_NOT_OWNER_DISPOSITION,EZER_COMMAND_NOT_ADMITTED_DISPOSITION};
  * fall-through to the dispatcher, and no withheld ACK an outsider could use to force redelivery.
  */
 export function claimEzerAddressedComment(comment:unknown,ownerUserId:string=process.env.EZER_OWNER_GITHUB_USER_ID??''):DeliveryDisposition|null{
- const candidate=object(comment);
- if(typeof candidate.body!=='string')return null;
- if(!EZER_ADDRESS_PREFIX.test(candidate.body.trim()))return null;
- return ownerAuthored(candidate,ownerUserId)?null:EZER_NOT_OWNER_DISPOSITION;
+ const claim=classifyEzerAddressedComment(comment,ownerUserId);
+ if(!claim.addressed)return null;
+ return claim.ownerAuthored?null:EZER_NOT_OWNER_DISPOSITION;
 }
+/** Shared classification behind BOTH the refusal and the resolution, so the two can never drift. */
+function classifyEzerAddressedComment(comment:unknown,ownerUserId:string):{addressed:false}|{addressed:true;ownerAuthored:boolean;body:string}{
+ const candidate=object(comment);
+ if(typeof candidate.body!=='string')return{addressed:false};
+ if(!EZER_ADDRESS_PREFIX.test(candidate.body.trim()))return{addressed:false};
+ return{addressed:true,ownerAuthored:ownerAuthored(candidate,ownerUserId),body:candidate.body};
+}
+/**
+ * The command line exactly as the slash parser must see it, with the leading `/ezer` token
+ * rewritten to `/fix` — the one and only place the `/ezer` address acquires a command meaning.
+ *
+ * This resolution used to live in the generally-exported slash parser as a `COMMAND_ALIASES`
+ * entry, which meant ANY consumer of that parser — a namespace import, a dynamic `import()`, a
+ * CommonJS property read, a new file under an unscanned root — acquired the `/ezer` -> `/fix`
+ * mapping for free, authorized or not. Reachability of the alias then depended on a structural
+ * test noticing every new import shape, which is exactly the coverage assumption that produced
+ * three consecutive authorization bypasses. Here it instead depends on passing authorization:
+ * a comment that is not owner-authored gets `null` and therefore no command at all, however it
+ * reached this code.
+ *
+ * Case-sensitive on the `/ezer` token and applied only to the first line, reproducing byte for
+ * byte what the old alias table matched, so the owner's command parses exactly as before.
+ *
+ * @returns the rewritten body when the configured owner addressed Ezer, otherwise `null`.
+ */
+export function resolveOwnerEzerCommandBody(comment:unknown,ownerUserId:string=process.env.EZER_OWNER_GITHUB_USER_ID??''):string|null{
+ const claim=classifyEzerAddressedComment(comment,ownerUserId);
+ if(!claim.addressed||!claim.ownerAuthored)return null;
+ const firstNewline=claim.body.indexOf('\n');
+ const firstLine=firstNewline===-1?claim.body:claim.body.slice(0,firstNewline);
+ if(!EZER_COMMAND_TOKEN.test(firstLine))return null;
+ return firstLine.replace(EZER_COMMAND_TOKEN,'$1/fix')+(firstNewline===-1?'':claim.body.slice(firstNewline));
+}
+/** The leading `/ezer` token on the command line, case-sensitive exactly as the old alias key was. */
+const EZER_COMMAND_TOKEN=/^(\s*)\/ezer(?=\s|$)/;
 /**
  * The only comment event type an owner command is ever carried from. ProPR's intake supports
  * exactly two comment-bearing GitHub events — `issue_comment` and `pull_request_review_comment`

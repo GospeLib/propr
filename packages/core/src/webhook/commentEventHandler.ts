@@ -1,7 +1,7 @@
 import { admittedCommentJobId, enqueueAdmittedComment } from '../admission/admittedComment.js';
 import { EZER_REVIEW_REQUEST } from '../admission/reviewRequest.js';
 import { requiresEzerExecutionAdmission } from '../admission/ezerExecutionAdmission.js';
-import { claimEzerAddressedComment } from '../intake/routingOwnerEvent.js';
+import { claimEzerAddressedComment, resolveOwnerEzerCommandBody } from '../intake/routingOwnerEvent.js';
 /* eslint-disable max-lines */
 import logger, { generateCorrelationId } from '../utils/logger.js';
 import { handleError } from '../utils/errorHandler.js';
@@ -660,11 +660,13 @@ export async function processCommentEvent(payload: IssueCommentEvent | PullReque
     const { prNumber, comment: rawComment } = eventDetails;
 
     // THE `/ezer` AUTHORIZATION CHOKEPOINT — the first decision made about any comment, on every
-    // path, before any Ezer-specific handling, before the slash parser (whose production alias maps
-    // `/ezer` to `/fix`) and before any generic follow-up logic.
+    // path, before any Ezer-specific handling, before the slash parser, before `/ezer` is resolved
+    // to a command at all, and before any generic follow-up logic.
     //
-    // This function is the ONLY consumer of `parseSlashCommand` in the codebase, so it is the single
-    // boundary every route to the dispatcher passes through: routing-WebSocket intake and
+    // This function is also the ONLY place `/ezer` acquires a command meaning at all: the shared
+    // slash parser has no `/ezer` alias, and the address is resolved to `/fix` below by
+    // `resolveOwnerEzerCommandBody`, which returns nothing for a comment the owner did not write.
+    // It is the single boundary every route to the dispatcher passes through: routing-WebSocket intake and
     // `direct_webhook` (both via processWebhookEvent -> handleIssueCommentEvent /
     // handlePullRequestReviewCommentEvent), the daemon and API comment-processor wrappers, the
     // edited-comment reprocess hook, and the system-ultrafix synthetic re-entry. Gating here
@@ -695,7 +697,12 @@ export async function processCommentEvent(payload: IssueCommentEvent | PullReque
         protectedRepositories: process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES })) {
         return { status: 'ignored', reason: 'awaiting_ezer_comment_admission' };
     }
-    const parsedCommand = parseSlashCommand(rawComment.body);
+    // `/ezer` -> `/fix` resolution, INSIDE the authorized boundary. Reaching this line at all
+    // means the chokepoint above admitted the comment, and this helper independently re-checks
+    // owner authorship, so an `/ezer` address can only become a command for the configured owner.
+    // The rewritten body is fed to the parser only — `comment` below still carries the owner's
+    // original `/ezer` text, so everything downstream sees exactly what it saw under the alias.
+    const parsedCommand = parseSlashCommand(resolveOwnerEzerCommandBody(rawComment) ?? rawComment.body);
     const configuredBotUsernames = new Set(
         [getBotUsername(), process.env.GITHUB_BOT_USERNAME, 'propr-dev[bot]']
             .filter((value): value is string => typeof value === 'string' && value.length > 0)

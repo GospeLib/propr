@@ -1,6 +1,7 @@
 /** Narrow owner-approved relay carriage; no fabricated GitHub signature or direct dispatch. */
 import {createHmac} from 'node:crypto';
 import {makeIdempotent} from '../utils/errorHandler.js';
+import {filterCommentByAuthor} from '../utils/commentFilters.js';
 import log from '../utils/logger.js';
 import type {PaginatedOctokitInstance} from '../auth/githubAuth.js';
 const OWNER_RELAY_PATH='/webhooks/propr-owner-event';
@@ -30,8 +31,23 @@ const EZER_ADDRESS_PREFIX=/^\/ezer(?:\s|$)/i;
 const OWNER_SURFACE_REPOSITORIES=new Set([STOP_REPOSITORY,OWNER_RELAY_REPOSITORY]);
 const COMMENT_PAGE_SIZE=100;
 const READ_SESSION_NAMESPACE='github-issue';
-interface Options{enabled:boolean;stopEnabled?:boolean;planControlEnabled?:boolean;pauseEnabled?:boolean;routeEnabled?:boolean;readEnabled?:boolean;baseUrl:string;secret:string;fetchImpl?:typeof fetch;now?:()=>Date;replyMalformed?:(event:Record<string,unknown>,deliveryId:string)=>Promise<void>;onReadback?:(result:Record<string,unknown>)=>Promise<void>;}
+/** The owner's stable numeric GitHub user ID; a login can be renamed or reused, an ID cannot. */
+const OWNER_AUTHOR_ID_PATTERN=/^[0-9]+$/;
+interface Options{enabled:boolean;stopEnabled?:boolean;planControlEnabled?:boolean;pauseEnabled?:boolean;routeEnabled?:boolean;readEnabled?:boolean;baseUrl:string;secret:string;ownerUserId?:string;fetchImpl?:typeof fetch;now?:()=>Date;replyMalformed?:(event:Record<string,unknown>,deliveryId:string)=>Promise<void>;onReadback?:(result:Record<string,unknown>)=>Promise<void>;}
 function object(value:unknown):Record<string,unknown>{return value!==null&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};}
+/**
+ * Authorship policy for anything ProPR itself writes back on an `/ezer` comment. Two gates, both
+ * required: the configured owner's stable GitHub user ID, and `filterCommentByAuthor` — the same
+ * whitelist/blacklist/bot policy every normal intake surface (webhook comment handler, PR and issue
+ * pollers) applies before acting on a comment. Fail-closed: no configured owner ID, no reply.
+ */
+function ownerAuthored(comment:Record<string,unknown>,ownerUserId:string):boolean{
+ const actor=object(comment.user);
+ if(!OWNER_AUTHOR_ID_PATTERN.test(ownerUserId))return false;
+ if(actor.type!=='User'||!Number.isSafeInteger(actor.id)||String(actor.id)!==ownerUserId)return false;
+ return typeof actor.login==='string'&&actor.login.length>0&&!filterCommentByAuthor(actor.login,actor.type,null).shouldFilter;
+}
+function configuredOwnerUserId(options:Options):string{return options.ownerUserId??process.env.EZER_OWNER_GITHUB_USER_ID??'';}
 async function relay(event:Record<string,unknown>,eventType:string,deliveryId:string,installationId:unknown,options:Options):Promise<Record<string,unknown>>{
  if(options.secret.length<OWNER_RELAY_SECRET_MIN_LENGTH||!options.baseUrl)throw new Error('OWNER_RELAY_CONFIGURATION_MISSING');
  const raw=JSON.stringify({kind:'propr-relay-owner-event',version:1,deliveryId,eventType,installationId:String(installationId),issuedAt:(options.now?.()??new Date()).toISOString(),payload:event});
@@ -45,17 +61,24 @@ async function relay(event:Record<string,unknown>,eventType:string,deliveryId:st
 export async function replyMalformedOwnerCommand(event:Record<string,unknown>,deliveryId:string,providedApi?:Pick<PaginatedOctokitInstance,'request'|'paginate'>):Promise<void>{
  const comment=object(event.comment),issue=object(event.issue),actor=object(comment.user);
  if(!Number.isSafeInteger(comment.id)||!Number.isSafeInteger(issue.number)||typeof comment.body!=='string'||actor.type!=='User')throw new Error('OWNER_COMMAND_REPLY_UNBOUND');
- const api=providedApi??await(await import('../auth/githubAuth.js')).getAuthenticatedOctokit();
- const routeControl=ROUTE_COMMAND_PREFIX.test(comment.body.trim());
- const pauseControl=PAUSE_COMMAND_PREFIX.test(comment.body.trim());
- const wrongStopSurface=STOP_COMMAND.test(comment.body.trim())&&Boolean(issue.pull_request);
- // A comment addressed to Ezer that matches no command shape at all. It is answered on
- // its own surface (the owner wrote it there), never on a repository inferred from a
- // command it does not contain — the binding check below still proves that surface.
- const unrecognized=!routeControl&&!pauseControl&&!STOP_COMMAND.test(comment.body.trim())&&!PLAN_COMMAND_PREFIX.test(comment.body.trim())&&!OWNER_COMMAND_PREFIX.test(comment.body.trim());
+ // Author policy before any GitHub read or write: an unauthorised commenter must cost no API
+ // call at all. Callers gate first, so reaching this is a caller bug, not attacker-reachable.
+ if(!ownerAuthored(comment,process.env.EZER_OWNER_GITHUB_USER_ID??''))throw new Error('OWNER_COMMAND_REPLY_NOT_AUTHORIZED');
+ // Each refusal class is keyed on an EXACT command shape, so a recognised verb carrying wrong
+ // arguments is not mistaken for that command and answered with its message on its repository.
+ const trimmed=comment.body.trim();
+ const routeControl=ROUTE_COMMAND.test(trimmed);
+ const pauseControl=PAUSE_COMMAND.test(trimmed)||RESUME_COMMAND.test(trimmed);
+ const wrongStopSurface=STOP_COMMAND.test(trimmed)&&Boolean(issue.pull_request);
+ const checkpointControl=OWNER_COMMAND_PREFIX.test(trimmed)&&!OWNER_COMMAND.test(trimmed);
+ // Anything else addressed to Ezer — free prose, or a recognised verb with wrong arguments.
+ const unrecognized=!routeControl&&!pauseControl&&!wrongStopSurface&&!checkpointControl;
+ // Answered on the comment's own surface whenever the event carries one (the owner wrote it
+ // there), never on a repository inferred from a command it does not contain.
  const eventRepository=String(object(event.repository).full_name??'');
- if(unrecognized&&!OWNER_SURFACE_REPOSITORIES.has(eventRepository))throw new Error('OWNER_COMMAND_REPLY_UNBOUND');
- const repository=unrecognized?eventRepository:(wrongStopSurface||pauseControl||routeControl)?STOP_REPOSITORY:OWNER_RELAY_REPOSITORY;
+ if(eventRepository?!OWNER_SURFACE_REPOSITORIES.has(eventRepository):unrecognized)throw new Error('OWNER_COMMAND_REPLY_UNBOUND');
+ const repository=eventRepository||((wrongStopSurface||pauseControl||routeControl)?STOP_REPOSITORY:OWNER_RELAY_REPOSITORY);
+ const api=providedApi??await(await import('../auth/githubAuth.js')).getAuthenticatedOctokit();
  const [owner,repo]=repository.split('/');
  const {data:actual}=await api.request('GET /repos/{owner}/{repo}/issues/comments/{comment_id}',{owner,repo,comment_id:Number(comment.id)});
  if(actual.body!==comment.body||actual.user?.id!==actor.id||actual.created_at!==comment.created_at||actual.updated_at!==comment.updated_at||actual.created_at!==actual.updated_at||actual.issue_url!==`https://api.github.com/repos/${repository}/issues/${issue.number}`)throw new Error('OWNER_COMMAND_REPLY_COMMENT_CHANGED');
@@ -74,6 +97,23 @@ export async function forwardRoutingOwnerEvent(payload:unknown,eventType:string,
  const event=object(payload),comment=object(event.comment),repository=object(event.repository),installation=object(event.installation);
  if(eventType!=='issue_comment'||typeof comment.body!=='string')return false;
  const body=comment.body.trim(),isStop=STOP_COMMAND.test(body),isManifest=MANIFEST_COMMAND.test(body),isRetry=RETRY_COMMAND.test(body),isPlanControl=PLAN_COMMAND_PREFIX.test(body),isPauseControl=PAUSE_COMMAND_PREFIX.test(body),isRouteControl=ROUTE_COMMAND_PREFIX.test(body);
+ // Not addressed to Ezer at all: an ordinary comment, handled by the normal path.
+ if(!EZER_ADDRESS_PREFIX.test(body))return false;
+ const ownerUserId=configuredOwnerUserId(options),authorized=ownerAuthored(comment,ownerUserId);
+ const boundDelivery=event.action==='created'&&OWNER_SURFACE_REPOSITORIES.has(String(repository.full_name))&&String(installationId)===OWNER_RELAY_INSTALLATION&&String(installation.id)===OWNER_RELAY_INSTALLATION;
+ // An exact command is the only thing ever admitted or relayed. Everything else addressed to
+ // Ezer — a recognised verb with wrong arguments just as much as free prose — is answered once
+ // with bounded idempotent feedback and ACKed, never thrown, so a permanently invalid comment
+ // can never drive endless relay redelivery.
+ const isExactCommand=READ_COMMAND.test(body)||isStop||isManifest||isRetry||PAUSE_COMMAND.test(body)||RESUME_COMMAND.test(body)||ROUTE_COMMAND.test(body)||OWNER_COMMAND.test(body);
+ if(!isExactCommand){
+  // An unbound, relay-disabled or unauthorised delivery falls through to ordinary handling
+  // rather than throwing, so stray `/ezer` chatter can never withhold an ACK, and a comment
+  // from anyone but the owner costs no GitHub read and no bot reply at all.
+  if(!options.enabled||!boundDelivery||!authorized)return false;
+  await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);
+  return true;
+ }
  if(READ_COMMAND_PREFIX.test(body)){
   if(!options.enabled||!options.readEnabled)throw Error('OWNER_READ_RELAY_NOT_ENABLED');
   const command=READ_COMMAND.exec(body);
@@ -84,36 +124,24 @@ export async function forwardRoutingOwnerEvent(payload:unknown,eventType:string,
   if(options.onReadback)await options.onReadback(receipt);else log.info({deliveryId,readback:receipt},'Ezer authenticated native read settled');
   return true;
  }
- if(!isStop&&!isPlanControl&&!isPauseControl&&!isRouteControl&&!OWNER_COMMAND_PREFIX.test(body)){
-  // Not addressed to Ezer at all: an ordinary comment, handled by the normal path.
-  if(!EZER_ADDRESS_PREFIX.test(body))return false;
-  // Addressed to Ezer but matching no command shape. Silence here is what leaves the
-  // owner waiting on a comment that can never be acted on, so answer it — but only on a
-  // delivery bound exactly as an owner command would have to be. An unbound or
-  // relay-disabled delivery falls through to ordinary handling rather than throwing, so
-  // stray `/ezer` chatter can never withhold an ACK and drive relay redelivery.
-  if(!options.enabled)return false;
-  if(event.action!=='created'||!OWNER_SURFACE_REPOSITORIES.has(String(repository.full_name))||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)return false;
-  await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);
-  return true;
- }
+ // An exact command whose capability is off, or which names the wrong surface, is refused the
+ // same bounded way — but only for the owner; anyone else falls through to ordinary handling.
+ const refuse=async():Promise<boolean>=>{if(!authorized)return false;await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);return true;};
  if(isRouteControl){
   if(event.action!=='created'||repository.full_name!==STOP_REPOSITORY||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)throw new Error('OWNER_RELAY_DELIVERY_NOT_BOUND');
-  if(!options.enabled||!options.routeEnabled||!ROUTE_COMMAND.test(body)||object(event.issue).pull_request){await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);return true;}
+  if(!options.enabled||!options.routeEnabled||object(event.issue).pull_request)return refuse();
  }
  if(isPauseControl){
   if(event.action!=='created'||repository.full_name!==STOP_REPOSITORY||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)throw new Error('OWNER_RELAY_DELIVERY_NOT_BOUND');
-  if(!options.enabled||!options.pauseEnabled||(!PAUSE_COMMAND.test(body)&&!RESUME_COMMAND.test(body))||object(event.issue).pull_request){await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);return true;}
+  if(!options.enabled||!options.pauseEnabled||object(event.issue).pull_request)return refuse();
  }
  if(isPlanControl&&!options.planControlEnabled)throw new Error('OWNER_PLAN_CONTROL_RELAY_NOT_ENABLED');
- if(isPlanControl&&!isManifest&&!isRetry)throw new Error('OWNER_PLAN_CONTROL_COMMAND_INVALID');
  if(isStop&&!options.stopEnabled)throw new Error('OWNER_STOP_RELAY_NOT_ENABLED');
  if(!options.enabled)throw new Error('OWNER_RELAY_NOT_ENABLED');
  if(event.action!=='created'||repository.full_name!==((isStop||isRetry||isPauseControl||isRouteControl)?STOP_REPOSITORY:OWNER_RELAY_REPOSITORY)||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)throw new Error('OWNER_RELAY_DELIVERY_NOT_BOUND');
  if(isRetry&&object(event.issue).pull_request)throw new Error('OWNER_RETRY_ISSUE_REQUIRED');
  if(isManifest&&!object(event.issue).pull_request)throw new Error('OWNER_MANIFEST_CONTRACT_PR_REQUIRED');
- if(isStop&&object(event.issue).pull_request){await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);return true;}
- if(!isStop&&!isPlanControl&&!isPauseControl&&!isRouteControl&&!OWNER_COMMAND.test(body)){await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);return true;}
+ if(isStop&&object(event.issue).pull_request)return refuse();
  await relay(event,eventType,deliveryId,installationId,options);
  return true;
 }

@@ -4,6 +4,8 @@ import {createHmac} from 'node:crypto';
 import {forwardRoutingOwnerEvent,replyMalformedOwnerCommand} from '../src/intake/routingOwnerEvent.js';
 import type {PaginatedOctokitInstance} from '../src/auth/githubAuth.js';
 const secret='owner-relay-test-secret-at-least-32-bytes',deliveryId='real-routing-delivery-1234',installationId='161226896';
+const ownerUserId='7',ownerAuthor={id:7,type:'User',login:'ezer-owner'};
+process.env.EZER_OWNER_GITHUB_USER_ID=ownerUserId;
 test('native read relay validates correlated settlement and never writes a GitHub reply',async()=>{
  const payload={...fixture(),repository:{id:10,full_name:'GospeLib/main'},issue:{id:20,number:90},comment:{id:66,body:'/ezer help'}};
  let writes=0,readbacks=0;
@@ -18,7 +20,7 @@ test('native read relay validates correlated settlement and never writes a GitHu
  }
  assert.equal(writes,0);
 });
-function fixture(){return{action:'created',installation:{id:161226896},repository:{full_name:'GospeLib/product-hub'},comment:{body:`/ezer accept-review-stop stop:abcd ${'a'.repeat(40)} sha256:${'b'.repeat(64)} 55`}};}
+function fixture(){return{action:'created',installation:{id:161226896},repository:{full_name:'GospeLib/product-hub'},comment:{body:`/ezer accept-review-stop stop:abcd ${'a'.repeat(40)} sha256:${'b'.repeat(64)} 55`,user:{...ownerAuthor}}};}
 test('forwards original authenticated delivery metadata and exact payload with explicit attestation only',async()=>{
  const payload=fixture();let calls=0;
  const result=await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{enabled:true,baseUrl:'http://ezer:8791',secret,now:()=>new Date('2026-09-13T18:00:00Z'),fetchImpl:async(url,init)=>{
@@ -63,7 +65,7 @@ for(const mode of ['relay-disabled','wrong-installation','wrong-repository','edi
  assert.equal(handled,false);assert.equal(replies,0);
 });
 test('unrecognized-command feedback answers on the comment\'s own surface and is idempotent',async()=>{
- const comment={id:5747057704,body:'/ezer S02 is not wired up.',created_at:'2026-09-20T02:30:50Z',updated_at:'2026-09-20T02:30:50Z',issue_url:'https://api.github.com/repos/GospeLib/main/issues/2387',user:{id:7,type:'User'}};
+ const comment={id:5747057704,body:'/ezer S02 is not wired up.',created_at:'2026-09-20T02:30:50Z',updated_at:'2026-09-20T02:30:50Z',issue_url:'https://api.github.com/repos/GospeLib/main/issues/2387',user:{id:7,type:'User',login:'ezer-owner'}};
  const event={comment,issue:{number:2387,pull_request:{url:'pr'}},repository:{full_name:'GospeLib/main'}};
  const comments:Array<{body:string;user:{type:string}}>=[];let posts=0;
  const api={request:async(route:string,input:Record<string,unknown>)=>{assert.equal(input.repo,'main');if(route.startsWith('GET'))return{data:comment};posts++;comments.push({body:String(input.body),user:{type:'Bot'}});return{data:{id:99}};},paginate:async()=>comments} as unknown as Pick<PaginatedOctokitInstance,'request'|'paginate'>;
@@ -75,7 +77,7 @@ test('unrecognized-command feedback answers on the comment\'s own surface and is
  assert.match(comments[0].body,/ezer-invalid-unknown-command-5747057704/);
 });
 test('unrecognized-command feedback refuses a surface that is not an owner command surface',async()=>{
- const comment={id:1,body:'/ezer do the thing',created_at:'t',updated_at:'t',issue_url:'https://api.github.com/repos/someone-else/repo/issues/1',user:{id:7,type:'User'}};
+ const comment={id:1,body:'/ezer do the thing',created_at:'t',updated_at:'t',issue_url:'https://api.github.com/repos/someone-else/repo/issues/1',user:{id:7,type:'User',login:'ezer-owner'}};
  const event={comment,issue:{number:1},repository:{full_name:'someone-else/repo'}};
  let posts=0;
  const api={request:async()=>{posts++;return{data:comment};},paginate:async()=>[]} as unknown as Pick<PaginatedOctokitInstance,'request'|'paginate'>;
@@ -90,7 +92,7 @@ test('malformed checkpoint command receives an ordinary rejection, never owner a
  assert.equal(handled,true);assert.equal(replies,1);
 });
 function malformedReplyFixture(){
- const comment={id:42,body:'/ezer accept-review-stop truncated',created_at:'2026-09-13T18:00:00Z',updated_at:'2026-09-13T18:00:00Z',issue_url:'https://api.github.com/repos/GospeLib/product-hub/issues/90',user:{id:7,type:'User'}};
+ const comment={id:42,body:'/ezer accept-review-stop truncated',created_at:'2026-09-13T18:00:00Z',updated_at:'2026-09-13T18:00:00Z',issue_url:'https://api.github.com/repos/GospeLib/product-hub/issues/90',user:{id:7,type:'User',login:'ezer-owner'}};
  const event={comment,issue:{number:90}};const comments:Array<{body:string;user:{type:string}}>=[];let posts=0,unreadable=false,changed=false,ambiguous=false;
  const api={request:async(route:string,input?:Record<string,unknown>)=>{if(route.startsWith('GET'))return{data:{...comment,...(changed?{body:'changed'}:{})}};posts++;comments.push({body:String(input?.body),user:{type:'Bot'}});if(ambiguous)throw new Error('lost response');return{data:{id:99}};},paginate:async()=>{if(unreadable)throw new Error('read unavailable');return comments;}} as unknown as Pick<PaginatedOctokitInstance,'request'|'paginate'>;
  return{event,api,comments,get posts(){return posts;},setUnreadable(){unreadable=true;},setChanged(){changed=true;},setAmbiguous(){ambiguous=true;}};
@@ -120,7 +122,7 @@ test('a valid stop command on a result PR receives ordinary refusal and never re
  const handled=await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{enabled:true,stopEnabled:true,baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;},fetchImpl:async()=>{throw Error('must not admit');}});assert.equal(handled,true);assert.equal(replies,1);
 });
 test('wrong-surface stop feedback verifies the actual PR and is idempotent',async()=>{
- const comment={id:42,body:'/ezer stop typed-work:item',created_at:'2026-09-13T18:00:00Z',updated_at:'2026-09-13T18:00:00Z',issue_url:'https://api.github.com/repos/GospeLib/main/issues/2338',user:{id:7,type:'User'}};
+ const comment={id:42,body:'/ezer stop typed-work:item',created_at:'2026-09-13T18:00:00Z',updated_at:'2026-09-13T18:00:00Z',issue_url:'https://api.github.com/repos/GospeLib/main/issues/2338',user:{id:7,type:'User',login:'ezer-owner'}};
  const event={comment,issue:{number:2338,pull_request:{url:'pr'}}};const comments:any[]=[];let posts=0;
  const api={request:async(route:string,input:any)=>{assert.equal(input.repo,'main');if(route.startsWith('GET'))return{data:route.includes('comments/')?comment:{pull_request:{url:'pr'}}};posts++;comments.push({body:input.body,user:{type:'Bot'}});return{data:{id:99}};},paginate:async()=>comments} as any;
  await replyMalformedOwnerCommand(event,deliveryId,api);await replyMalformedOwnerCommand(event,deliveryId,api);assert.equal(posts,1);assert.match(comments[0].body,/STOP_COMMAND_REQUIRES_EXECUTION_ISSUE/);assert.match(comments[0].body,/Completed work cannot be cancelled/);
@@ -142,12 +144,12 @@ test('pause/resume require their disabled-by-default flag and never fall through
  const pauseId='11111111-1111-4111-8111-111111111111';let sends=0,replies=0;
  const options={enabled:true,pauseEnabled:true,baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;},fetchImpl:async()=>{sends++;return new Response(JSON.stringify({accepted:true}));}};
  for(const body of ['/ezer pause typed-work:item',`/ezer resume typed-work:item ${pauseId}`]){
-  const payload={...fixture(),repository:{full_name:'GospeLib/main'},issue:{number:90},comment:{body}};
+  const payload={...fixture(),repository:{full_name:'GospeLib/main'},issue:{number:90},comment:{body,user:{...ownerAuthor}}};
   assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),true);
   assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{...options,pauseEnabled:false}),true);
   (payload.issue as any).pull_request={url:'pr'};assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),true);
  }
- const malformed={...fixture(),repository:{full_name:'GospeLib/main'},comment:{body:'/ezer resume typed-work:item missing-pause'}};
+ const malformed={...fixture(),repository:{full_name:'GospeLib/main'},comment:{body:'/ezer resume typed-work:item missing-pause',user:{...ownerAuthor}}};
  assert.equal(await forwardRoutingOwnerEvent(malformed,'issue_comment',deliveryId,installationId,options),true);assert.equal(sends,2);assert.equal(replies,5);
 });
 
@@ -157,4 +159,69 @@ test('explicit route forwarding is independently disabled and never falls throug
  assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),true);assert.equal(replies,1);assert.equal(sent,0);
  assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{...options,routeEnabled:true}),true);assert.equal(sent,1);
  (payload as any).issue={number:90,pull_request:{url:'pr'}};await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{...options,routeEnabled:true});assert.equal(sent,1);assert.equal(replies,2);
+});
+
+test('a non-owner human addressing Ezer gets no reply and costs no GitHub call',async()=>{
+ const payload=fixture();payload.comment.body='/ezer please ship S02';payload.comment.user={id:8,type:'User',login:'stranger'};
+ let replies=0,calls=0;
+ const options={enabled:true,stopEnabled:true,planControlEnabled:true,pauseEnabled:true,routeEnabled:true,readEnabled:true,baseUrl:'http://ezer:8791',secret,
+  replyMalformed:async()=>{replies++;},fetchImpl:async()=>{calls++;throw new Error('must not forward');}};
+ assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),false);
+ assert.equal(replies,0);assert.equal(calls,0);
+ // A bot, an app impersonating the owner's id, and an owner-shaped id that is not the owner.
+ for(const user of [{id:7,type:'Bot',login:'ezer-owner[bot]'},{id:'7',type:'User',login:'ezer-owner'},{id:70,type:'User',login:'ezer-owner'}]){
+  payload.comment.user=user as unknown as typeof payload.comment.user;
+  assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),false);
+ }
+ assert.equal(replies,0);assert.equal(calls,0);
+});
+test('the owner id alone is not enough: normal intake author policy still filters the reply',async()=>{
+ const payload=fixture();payload.comment.body='/ezer please ship S02';
+ let replies=0;
+ const options={enabled:true,baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;},fetchImpl:async()=>{throw new Error('must not forward');}};
+ process.env.GITHUB_USER_WHITELIST='someone-else';
+ try{assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),false);}
+ finally{delete process.env.GITHUB_USER_WHITELIST;}
+ assert.equal(replies,0);
+ process.env.GITHUB_USER_BLACKLIST='ezer-owner';
+ try{assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),false);}
+ finally{delete process.env.GITHUB_USER_BLACKLIST;}
+ assert.equal(replies,0);
+ // Same delivery, unfiltered author: answered.
+ assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),true);
+ assert.equal(replies,1);
+});
+test('no configured owner id means no reply at all, never a reply to anyone',async()=>{
+ const payload=fixture();payload.comment.body='/ezer please ship S02';let replies=0;
+ const options={enabled:true,ownerUserId:'',baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;},fetchImpl:async()=>{throw new Error('must not forward');}};
+ assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),false);
+ assert.equal(replies,0);
+});
+for(const body of ['/ezer help please','/ezer status now','/ezer approve please','/ezer approve sha256:bad abc','/ezer retry EP-real-S01','/ezer retry EP-real-S01 zero','/ezer stop','/ezer stop one two','/ezer pause','/ezer resume typed-work:item bad-uuid','/ezer use local:model','/ezer accept-review-stop stop:abcd'])
+ test(`an addressed-but-invalid command is answered and ACKed, never thrown: ${body}`,async()=>{
+  const payload={...fixture(),repository:{full_name:'GospeLib/main'},issue:{number:90}};payload.comment.body=body;
+  let replies=0;
+  const options={enabled:true,stopEnabled:true,planControlEnabled:true,pauseEnabled:true,routeEnabled:true,readEnabled:true,baseUrl:'http://ezer:8791',secret,
+   replyMalformed:async(event:Record<string,unknown>)=>{assert.deepEqual(event,payload);replies++;},
+   fetchImpl:async()=>{throw new Error('an invalid command must never reach the owner relay');}};
+  assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),true);
+  assert.equal(replies,1);
+ });
+test('an invalid plan-control comment is answered on its own surface, not on the manifest repository',async()=>{
+ const comment={id:77,body:'/ezer approve please',created_at:'2026-09-20T02:30:50Z',updated_at:'2026-09-20T02:30:50Z',issue_url:'https://api.github.com/repos/GospeLib/main/issues/2387',user:{...ownerAuthor}};
+ const event={comment,issue:{number:2387},repository:{full_name:'GospeLib/main'}};
+ const comments:Array<{body:string;user:{type:string}}>=[];let posts=0;
+ const api={request:async(route:string,input:Record<string,unknown>)=>{assert.equal(input.repo,'main');if(route.startsWith('GET'))return{data:comment};posts++;comments.push({body:String(input.body),user:{type:'Bot'}});return{data:{id:99}};},paginate:async()=>comments} as unknown as Pick<PaginatedOctokitInstance,'request'|'paginate'>;
+ await replyMalformedOwnerCommand(event,deliveryId,api);
+ assert.equal(posts,1);
+ assert.match(comments[0].body,/EZER_COMMAND_NOT_RECOGNIZED/);
+ assert.match(comments[0].body,/ezer-invalid-unknown-command-77/);
+});
+test('the reply helper refuses an unauthorised author before any GitHub call',async()=>{
+ const comment={id:78,body:'/ezer do the thing',created_at:'t',updated_at:'t',issue_url:'https://api.github.com/repos/GospeLib/main/issues/1',user:{id:8,type:'User',login:'stranger'}};
+ const event={comment,issue:{number:1},repository:{full_name:'GospeLib/main'}};
+ let calls=0;
+ const api={request:async()=>{calls++;return{data:comment};},paginate:async()=>{calls++;return[];}} as unknown as Pick<PaginatedOctokitInstance,'request'|'paginate'>;
+ await assert.rejects(()=>replyMalformedOwnerCommand(event,deliveryId,api),/OWNER_COMMAND_REPLY_NOT_AUTHORIZED/);
+ assert.equal(calls,0);
 });

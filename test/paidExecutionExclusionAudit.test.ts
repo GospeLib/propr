@@ -532,6 +532,188 @@ describe('the containment gate catches a process creation that avoids the wrappe
     });
 });
 
+/**
+ * THE CLAIM READ CLAUSE BY CLAUSE, WITH A FIXTURE AGAINST EACH ONE.
+ *
+ * The containment claim above says, in so many words, that a site is recorded when an identifier
+ * resolves THROUGH IMPORT ALIASES AND THROUGH LOCAL `const` ALIASES to `executeDockerCommand` or
+ * to one of Node's process-creation APIs, that a destructuring out of a `require` or a dynamic
+ * `import` counts, that a namespace naming the module counts through any number of hops, and that
+ * a VALUE REFERENCE is inventoried where it is written rather than where it is later called.
+ *
+ * That wording has now been wrong twice — first about namespace CommonJS, then about a RENAMED
+ * destructuring, where the analysis tested the LOCAL symbol name (`launch`) instead of the
+ * property the binding was taken from (`spawn`) and returned an empty inventory. A claim that is
+ * believed rather than exercised is how both got through, so every clause of it is written out
+ * here as a fixture that would have to change the frozen list.
+ */
+describe('every form the containment claim names is exercised, not believed', () => {
+    const strays = (sites: ReturnType<typeof fixtureProcessCreationSites>) => sites
+        .filter(site => site.modelRun)
+        .filter(site => !site.path.endsWith(providerProcessBoundaryModule)
+            && !standaloneProviderPrimitiveModules.some(module => site.path.endsWith(module)));
+    const shape = (sites: ReturnType<typeof fixtureProcessCreationSites>, file: string) => sites
+        .filter(site => site.path === file)
+        .map(site => `${site.primitive} ${site.enclosing} modelRun=${site.modelRun}`);
+
+    test('CLAUSE "through import aliases": a renamed import of the executor is inventoried', () => {
+        const found = fixtureProcessCreationSites({
+            'renamedExecutorImport.ts': `
+                import { executeDockerCommand as run } from './claude/docker/dockerExecutor.js';
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                export async function renamed(prompt: string) {
+                    return executeWithUsageTracking('run', async () => run(['run', prompt]));
+                }
+            `,
+        });
+        assert.ok(shape(found, 'renamedExecutorImport.ts').includes('executeDockerCommand renamed modelRun=true'),
+            'the callee is spelled `run`; what it names is decided by the symbol it resolves to');
+        assert.deepEqual(strays(found).map(site => site.path), ['renamedExecutorImport.ts']);
+    });
+
+    test('CLAUSE "through import aliases": a renamed import of a child_process API is inventoried', () => {
+        const found = fixtureProcessCreationSites({
+            'renamedApiImport.ts': `
+                import { spawn as launch } from 'node:child_process';
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                export async function renamed(prompt: string) {
+                    return executeWithUsageTracking('run', async () => launch('docker', ['run', prompt]));
+                }
+            `,
+        });
+        assert.ok(shape(found, 'renamedApiImport.ts').includes('child_process.spawn renamed modelRun=true'),
+            'a renamed typed import is the same process creation under another local name');
+        assert.deepEqual(strays(found).map(site => site.path), ['renamedApiImport.ts']);
+    });
+
+    test('CLAUSE "destructured out of a require": a RENAMED destructuring is inventoried', () => {
+        // The form the claim covered as worded and the analysis did not read: the local name is
+        // `launch`, and the name test ran on the local name rather than on the property.
+        const found = fixtureProcessCreationSites({
+            'renamedRequire.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const { spawn: launch } = require('node:child_process');
+                export async function renamed(prompt: string) {
+                    return executeWithUsageTracking('run', async () => launch('docker', ['run', prompt]));
+                }
+            `,
+        });
+        assert.ok(shape(found, 'renamedRequire.ts').includes('child_process.spawn renamed modelRun=true'),
+            'the property the binding was taken from is what it names, not the name it was given');
+        assert.deepEqual(strays(found).map(site => site.path), ['renamedRequire.ts']);
+    });
+
+    test('CLAUSE "destructured out of a dynamic import": a RENAMED destructuring is inventoried', () => {
+        const found = fixtureProcessCreationSites({
+            'renamedDynamic.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                export async function renamed(prompt: string) {
+                    const { execFile: go } = await import('child_process');
+                    return executeWithUsageTracking('run', async () => go('docker', ['run', prompt]));
+                }
+            `,
+        });
+        assert.ok(shape(found, 'renamedDynamic.ts').includes('child_process.execFile renamed modelRun=true'),
+            'a late import renamed on the way out is still an import of the process-creation surface');
+        assert.deepEqual(strays(found).map(site => site.path), ['renamedDynamic.ts']);
+    });
+
+    test('CLAUSE "destructured out of a require": renamed by a string-literal property name', () => {
+        const found = fixtureProcessCreationSites({
+            'literalProperty.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const { 'execSync': go } = require('child_process');
+                export async function literal(prompt: string) {
+                    return executeWithUsageTracking('run', async () => go('docker ' + prompt));
+                }
+            `,
+        });
+        assert.ok(shape(found, 'literalProperty.ts').includes('child_process.execSync literal modelRun=true'),
+            'the brackets-and-a-literal reading of a property name applies to a binding element too');
+        assert.deepEqual(strays(found).map(site => site.path), ['literalProperty.ts']);
+    });
+
+    test('CLAUSE "a namespace, through any number of hops": destructuring off the namespace', () => {
+        const found = fixtureProcessCreationSites({
+            'offNamespace.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const cp = require('node:child_process');
+                const { spawn: launch } = cp;
+                export async function offNamespace(prompt: string) {
+                    return executeWithUsageTracking('run', async () => launch('docker', ['run', prompt]));
+                }
+            `,
+        });
+        assert.ok(shape(found, 'offNamespace.ts').includes('child_process.spawn offNamespace modelRun=true'),
+            'a destructuring is decided by the module the thing it came out of names');
+        assert.deepEqual(strays(found).map(site => site.path), ['offNamespace.ts']);
+    });
+
+    test('CLAUSE "a namespace, through any number of hops": a property off a re-aliased namespace', () => {
+        const found = fixtureProcessCreationSites({
+            'hoppedNamespace.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const cp = require('node:child_process');
+                const later = cp;
+                export async function hopped(prompt: string) {
+                    return executeWithUsageTracking('run', async () => later.execFileSync('docker', ['run', prompt]));
+                }
+            `,
+        });
+        assert.deepEqual(shape(found, 'hoppedNamespace.ts'), ['child_process.execFileSync hopped modelRun=true'],
+            'the const hop is the companion of the negative fixture that hops to another module');
+        assert.deepEqual(strays(found).map(site => site.path), ['hoppedNamespace.ts']);
+    });
+
+    test('CLAUSE "through local const aliases": a chain of them still names the primitive', () => {
+        const found = fixtureProcessCreationSites({
+            'chained.ts': `
+                import { spawn } from 'node:child_process';
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const launch = spawn;
+                const again = launch;
+                export async function chained(prompt: string) {
+                    return executeWithUsageTracking('run', async () => again('docker', ['run', prompt]));
+                }
+            `,
+        });
+        assert.ok(shape(found, 'chained.ts').includes('child_process.spawn chained modelRun=true'),
+            'one hop or three, the alias chase ends at the same process creation');
+        assert.deepEqual(strays(found).map(site => site.path), ['chained.ts']);
+    });
+
+    test('CLAUSE "a VALUE REFERENCE, not only a direct call": `promisify(execFile)` is on file', () => {
+        const found = fixtureProcessCreationSites({
+            'promisified.ts': `
+                import { promisify } from 'node:util';
+                import { execFile } from 'node:child_process';
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const run = promisify(execFile);
+                export async function promisified(prompt: string) {
+                    return executeWithUsageTracking('run', async () => run('docker', ['run', prompt]));
+                }
+            `,
+        });
+        assert.deepEqual(shape(found, 'promisified.ts'), ['child_process.execFile <module> modelRun=false'],
+            'handing the primitive to something is where it is inventoried; the later call is not reachable syntax');
+    });
+
+    test('a renamed destructuring of SOME OTHER module is not mistaken for one', () => {
+        // The companion to the five above: a rule that read any `{ x: y }` as a process creation
+        // would pass every one of them and prove nothing at all.
+        const found = fixtureProcessCreationSites({
+            'innocentRename.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const { spawn: launch } = require('./workerPool.js');
+                export async function innocent(prompt: string) {
+                    return executeWithUsageTracking('run', async () => launch(prompt));
+                }
+            `,
+        });
+        assert.deepEqual(found, [], 'the module the binding came out of is what decides it');
+    });
+});
+
 describe('a callback argument is unleased unless a verified wrapper runs it', () => {
     // Each of these passes the provider call to something that receives a function. None of them
     // can be shown to invoke it within the call, and all of them can run it after the lease is

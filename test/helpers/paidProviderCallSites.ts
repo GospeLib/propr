@@ -474,6 +474,16 @@ export function analyzeProviderCallSites(program: ts.Program, rootDirectory: str
  * inventoried where they are written rather than wherever the resulting function is later invoked.
  * No module is skipped, including the executor's own.
  *
+ * RENAMING IS NOT CONCEALMENT, and saying so was not enough. Every point at which a name can be
+ * changed on the way is resolved to the thing the name was taken FROM: a renamed import
+ * specifier, a chain of local `const` hops, a namespace the module was reached through, and a
+ * renamed BINDING ELEMENT — `const { spawn: launch } = require('node:child_process')`, whether the
+ * property is written as an identifier, a string literal, or a literal computed name. That last
+ * one was inside this claim as worded and outside what the analysis did: it tested the LOCAL
+ * symbol name, `launch`, against the process-creation surface, and returned an empty inventory for
+ * an ordinary `spawn`. It was found by writing the clause out as a fixture instead of believing
+ * it, which is now done for each clause above, one test each.
+ *
  * A model run is told apart from a management command by `executeWithUsageTracking`, the billing
  * wrapper the token accounting is collected through. Every spawn that runs a model is inside one;
  * `docker images`, `image inspect`, `pull`, `rmi`, a Dockerfile build, a `chown`, a `git` call and
@@ -573,13 +583,20 @@ export function analyzeProcessCreationSites(program: ts.Program, rootDirectory: 
         return isImport && specifier !== undefined && ts.isStringLiteralLike(specifier)
             && CHILD_PROCESS_SPECIFIERS.includes(specifier.text);
     };
-    /** Whether this destructuring came out of `child_process`, however it was imported. */
+    /**
+     * Whether this destructuring came out of `child_process`, however it was named.
+     *
+     * The test is `namesChildProcessModule`, not "is literally a `require` call", because the
+     * thing a binding is taken OUT of is decided the same way as the thing a property is read off:
+     * `const cp = require('node:child_process'); const { spawn } = cp;` destructures the module
+     * through one ordinary hop, and a rule that only read the load itself would call that nothing.
+     */
     const destructuredFromChildProcess = (declaration: ts.BindingElement): boolean => {
         let current: ts.Node = declaration;
         while (current.parent && !ts.isVariableDeclaration(current.parent)) current = current.parent;
         const variable = current.parent;
         if (!variable || !ts.isVariableDeclaration(variable) || !variable.initializer) return false;
-        return isChildProcessModuleLoad(variable.initializer);
+        return namesChildProcessModule(variable.initializer);
     };
     /**
      * Whether this expression NAMES the `child_process` module itself, rather than one export of it.
@@ -642,6 +659,23 @@ export function analyzeProcessCreationSites(program: ts.Program, rootDirectory: 
         return namesChildProcessModule(node.expression) ? `child_process.${name}` : undefined;
     };
     /**
+     * The property a binding element was taken out of, when it was renamed on the way.
+     *
+     * `{ spawn: launch }` and `{ 'spawn': launch }` and `{ ['spawn']: launch }` are one form
+     * written three ways. A computed name that is NOT a literal (`{ [whichever]: launch }`) is
+     * left unresolved, on the same ground as `cp[whichever]`: it stays outside what these sources
+     * can be said to prove, rather than being guessed at.
+     */
+    const bindingPropertyName = (declaration: ts.BindingElement): string | undefined => {
+        const property = declaration.propertyName;
+        if (!property) return undefined;
+        if (ts.isIdentifier(property) || ts.isStringLiteralLike(property)) return property.text;
+        if (ts.isComputedPropertyName(property) && ts.isStringLiteralLike(property.expression)) {
+            return property.expression.text;
+        }
+        return undefined;
+    };
+    /**
      * What this identifier ultimately names, following import aliases AND local `const` aliases.
      *
      * The alias chase is the whole point: `const run = executeDockerCommand` produces a symbol
@@ -658,10 +692,16 @@ export function analyzeProcessCreationSites(program: ts.Program, rootDirectory: 
         for (const declaration of symbol.getDeclarations() ?? []) {
             const file = declaration.getSourceFile().fileName;
             if (file.endsWith(RAW_SPAWN_MODULE) && unitName(declaration) === RAW_SPAWN) return RAW_SPAWN;
-            if (!PROCESS_CREATION_APIS.includes(name)) { /* fall through to the alias chase */ }
-            else if (file.endsWith(NODE_CHILD_PROCESS_DECLARATION)) return `child_process.${name}`;
+            // THE PROPERTY, NOT THE LOCAL NAME. `const { spawn: launch } = require('node:
+            // child_process')` binds a symbol called `launch`, and testing that name against the
+            // process-creation surface answered "no" for a plain `spawn` written under another
+            // name — a paid process path that could be added without the frozen list changing.
+            // What a binding element names is the property it was taken from, so that is read.
+            const api = ts.isBindingElement(declaration) ? bindingPropertyName(declaration) ?? name : name;
+            if (!PROCESS_CREATION_APIS.includes(api)) { /* fall through to the alias chase */ }
+            else if (file.endsWith(NODE_CHILD_PROCESS_DECLARATION)) return `child_process.${api}`;
             else if (ts.isBindingElement(declaration) && destructuredFromChildProcess(declaration)) {
-                return `child_process.${name}`;
+                return `child_process.${api}`;
             }
             if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
                 const target = ts.isIdentifier(declaration.initializer) ? declaration.initializer

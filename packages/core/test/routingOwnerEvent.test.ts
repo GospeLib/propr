@@ -20,6 +20,46 @@ test('native read relay validates correlated settlement and never writes a GitHu
  }
  assert.equal(writes,0);
 });
+for(const [mode,payloadOf] of [
+ ['a PR surface',()=>({...fixture(),repository:{id:10,full_name:'GospeLib/main'},issue:{id:20,number:2338,pull_request:{url:'pr'}},comment:{id:66,body:'/ezer help',user:{...ownerAuthor}}})],
+ ['the wrong owner repository',()=>({...fixture(),repository:{id:10,full_name:'GospeLib/product-hub'},issue:{id:20,number:90},comment:{id:66,body:'/ezer status',user:{...ownerAuthor}}})],
+ ['an edited delivery',()=>({...fixture(),action:'edited',repository:{id:10,full_name:'GospeLib/main'},issue:{id:20,number:90},comment:{id:66,body:'/ezer help',user:{...ownerAuthor}}})],
+] as const)test(`a read command on ${mode} is answered once and ACKed, never redelivered forever`,async()=>{
+ const payload=payloadOf();let replies=0;
+ const options={enabled:true,readEnabled:true,baseUrl:'http://ezer:8791',secret,
+  replyMalformed:async(event:Record<string,unknown>)=>{assert.deepEqual(event,payload);replies++;},
+  fetchImpl:async()=>{throw new Error('a permanently unbindable read must never reach the owner relay');}};
+ assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),true);
+ assert.equal(replies,1);
+});
+test('a read command on a surface Ezer does not answer on falls through rather than looping',async()=>{
+ const payload={...fixture(),repository:{id:10,full_name:'someone-else/repo'},issue:{id:20,number:90},comment:{id:66,body:'/ezer help',user:{...ownerAuthor}}};
+ let replies=0;
+ assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{enabled:true,readEnabled:true,baseUrl:'http://ezer:8791',secret,
+  replyMalformed:async()=>{replies++;},fetchImpl:async()=>{throw new Error('must not forward');}}),false);
+ assert.equal(replies,0);
+});
+test('a transient read failure still withholds the ACK so the same delivery is retried',async()=>{
+ const payload={...fixture(),repository:{id:10,full_name:'GospeLib/main'},issue:{id:20,number:90},comment:{id:66,body:'/ezer help',user:{...ownerAuthor}}};
+ let replies=0,sends=0;
+ const options={enabled:true,readEnabled:true,baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;}};
+ // The relay itself failing is transient: the identical delivery can succeed on redelivery.
+ await assert.rejects(()=>forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{...options,fetchImpl:async()=>{sends++;return new Response('{}',{status:503});}}),/OWNER_RELAY_HTTP_503/);
+ // So is a capability an operator can turn on.
+ await assert.rejects(()=>forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{...options,readEnabled:false,fetchImpl:async()=>{sends++;return Response.json({accepted:true});}}),/OWNER_READ_RELAY_NOT_ENABLED/);
+ assert.equal(sends,1);assert.equal(replies,0);
+});
+test('unbound-read feedback names the read refusal on its own surface and is idempotent',async()=>{
+ const comment={id:4242,body:'/ezer help',created_at:'2026-09-20T02:30:50Z',updated_at:'2026-09-20T02:30:50Z',issue_url:'https://api.github.com/repos/GospeLib/main/issues/2338',user:{...ownerAuthor}};
+ const event={comment,issue:{number:2338,pull_request:{url:'pr'}},repository:{full_name:'GospeLib/main'}};
+ const comments:Array<{body:string;user:{type:string}}>=[];let posts=0;
+ const api={request:async(route:string,input:Record<string,unknown>)=>{assert.equal(input.repo,'main');if(route.startsWith('GET'))return{data:route.includes('comments/')?comment:{pull_request:{url:'pr'}}};posts++;comments.push({body:String(input.body),user:{type:'Bot'}});return{data:{id:99}};},paginate:async()=>comments} as unknown as Pick<PaginatedOctokitInstance,'request'|'paginate'>;
+ await replyMalformedOwnerCommand(event,deliveryId,api);await replyMalformedOwnerCommand(event,deliveryId,api);
+ assert.equal(posts,1);
+ assert.match(comments[0].body,/READ_COMMAND_NOT_ADMITTED/);
+ assert.match(comments[0].body,/not on a pull request/);
+ assert.match(comments[0].body,/ezer-invalid-unit-read-4242/);
+});
 function fixture(){return{action:'created',installation:{id:161226896},repository:{full_name:'GospeLib/product-hub'},comment:{body:`/ezer accept-review-stop stop:abcd ${'a'.repeat(40)} sha256:${'b'.repeat(64)} 55`,user:{...ownerAuthor}}};}
 test('forwards original authenticated delivery metadata and exact payload with explicit attestation only',async()=>{
  const payload=fixture();let calls=0;

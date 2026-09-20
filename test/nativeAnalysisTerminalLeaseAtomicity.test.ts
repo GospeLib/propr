@@ -189,6 +189,29 @@ beforeEach(() => {
 afterEach(() => { historyReadFailure = undefined; });
 after(async () => { await database.destroy(); await rm(databaseDirectory, { recursive: true, force: true }); });
 
+/**
+ * A state manager that fails BEFORE the provider is ever reached, and cannot record anything.
+ *
+ * The other half of the release rule: this attempt spent nothing, so refusing to let it retry
+ * would turn every early crash into a permanent refusal for no gain at all.
+ */
+function dyingBeforeAnyWrite() {
+    const fail = async () => { throw new Error('the task state could not be created'); };
+    return {
+        createTaskState: fail, updateTaskState: fail, updateHistoryMetadata: fail,
+        getTaskState: async () => undefined, markTaskFailed: fail, projectDurableCompletion: fail,
+    };
+}
+
+/** An attempt that reaches the provider and then cannot record anything terminal at all. */
+function reachesProviderAndRecordsNothing(base: InstanceType<typeof WorkerStateManager>) {
+    return { ...dyingAfterTerminalWrite(base),
+        updateTaskState: async (taskId: string, state: string, metadata?: unknown) => {
+            if (state === TASK_STATES.CLAUDE_EXECUTION) return base.updateTaskState(taskId, state, metadata as never);
+            throw new Error('the terminal write never reached the database');
+        } };
+}
+
 describe('a terminal native-analysis outcome and its execution lease settle together', () => {
     test('a crash straight after a durable failed write leaves an operation no retry can pay for again', async () => {
         let analyses = 0;
@@ -276,21 +299,52 @@ describe('a terminal native-analysis outcome and its execution lease settle toge
         assert.equal((await leaseRow()).settled_state, TASK_STATES.COMPLETED);
     });
 
+    test('an attempt that never reached the provider hands its lease straight back', async () => {
+        let analyses = 0;
+        // It fails before `analyze` is called, so nothing was invoked and nothing can have been
+        // billed. Refusing this retry would cost a real operation and save nothing.
+        await assert.rejects(() => runAnalysis(agentThat(() => { analyses++; }), dyingBeforeAnyWrite()),
+            /the task state could not be created/);
+        assert.equal(analyses, 0, 'the premise: the provider was never reached');
+        assert.equal(await leaseRow(), undefined, 'so the right to run goes back immediately');
+
+        const retried = await runAnalysis(agentThat(() => { analyses++; }), new WorkerStateManager());
+        assert.equal((retried.execution as { terminalRecorded: boolean }).terminalRecorded, true);
+        assert.equal(analyses, 1, 'and the retry is the FIRST paid execution, not a second one');
+    });
+
+    test('an attempt that reached the provider and recorded nothing keeps its lease and says why', async () => {
+        let analyses = 0;
+        // The window the previous round released into. `agent.analyze` ran — it may already have
+        // been billed — and then every terminal write failed, so the history holds nothing. The
+        // old rule read that absence as "this operation never happened" and made it immediately
+        // payable again. Proving the executor stopped would prevent two runs overlapping; it
+        // would not prove no money changed hands.
+        await assert.rejects(() => runAnalysis(agentThat(() => { analyses++; }, false),
+            reachesProviderAndRecordsNothing(new WorkerStateManager())), /provider unavailable/);
+        const retained = await leaseRow();
+        assert.ok(retained, 'the lease is NOT handed back after a possibly billed invocation');
+        assert.equal(retained.settled_at, null, 'and it is not settled either: nothing terminal is durable');
+        assert.equal(Boolean(retained.provider_invocation_started), true,
+            'the fact that decides this is on the row, written before the provider was called');
+        assert.match(retained.reconciliation_reason, /may already have been billed/);
+        assert.match(retained.reconciliation_reason, /reconcile-execution-lease/,
+            'and it names the command that can release it, so a lapsed lease is not a dead end');
+
+        await assert.rejects(() => runAnalysis(agentThat(() => { analyses++; }), new WorkerStateManager()),
+            /NATIVE_ANALYSIS_OPERATION_EXECUTION_IN_PROGRESS/);
+        await database('task_execution_leases').where({ lease_key: leaseKey() })
+            .update({ expires_at: new Date(Date.now() - 120_000).toISOString() });
+        await assert.rejects(() => runAnalysis(agentThat(() => { analyses++; }), new WorkerStateManager()),
+            /NATIVE_ANALYSIS_OPERATION_EXECUTION_UNRECONCILED/,
+            'the lapsed term routes it to explicit reconciliation, never to an automatic retry');
+        assert.equal(analyses, 1, 'exactly one paid execution, and no second one on any path');
+    });
+
     test('durable proof that the executor stopped is what admits a successor, and only once', async () => {
         let analyses = 0;
-        const base = new WorkerStateManager();
-        // An attempt that dies without settling anything and without handing the lease back.
-        const stalled = { ...dyingAfterTerminalWrite(base),
-            updateTaskState: async (taskId: string, state: string, metadata?: unknown) => {
-                if (state === TASK_STATES.CLAUDE_EXECUTION) return base.updateTaskState(taskId, state, metadata as never);
-                throw new Error('the terminal write never reached the database');
-            } };
         historyReadFailure = undefined;
-        await assert.rejects(() => runAnalysis(agentThat(() => { analyses++; }, false), stalled), /provider unavailable/);
-        // Nothing terminal is durable, so this attempt released its own lease on the way out.
-        assert.equal(await leaseRow(), undefined);
-
-        // Take the lease again and strand it, to exercise the reconciliation path itself.
+        // Strand a lease deliberately, to exercise the reconciliation path itself.
         const stranded = randomUUID();
         assert.equal((await executionLease.acquireExecutionLease({
             leaseKey: leaseKey(), taskId: 'native-analysis-stranded', operationId, generation: stranded,
@@ -300,10 +354,16 @@ describe('a terminal native-analysis outcome and its execution lease settle toge
         await assert.rejects(() => runAnalysis(agentThat(() => { analyses++; }), new WorkerStateManager()),
             /NATIVE_ANALYSIS_OPERATION_EXECUTION_UNRECONCILED/);
 
-        await executionLease.recordExecutorStopProof({ leaseKey: leaseKey(), generation: stranded,
-            proof: 'operator confirmed the provider container exited', recordedBy: 'operator:test' });
+        // Recorded through the checked operator path, which is the one a runbook can hand someone:
+        // it refuses a live holder, a stale generation, an unconfirmed one and a settled lease, and
+        // it records a fact rather than taking or settling the lease itself.
+        assert.deepEqual(await executionLease.recordVerifiedExecutorStop({
+            leaseKey: leaseKey(), generation: stranded, confirmGeneration: stranded,
+            proof: 'docker ps shows no container for this task and the host was drained',
+            recordedBy: 'operator:test',
+        }), { recorded: true });
         const reconciled = await runAnalysis(agentThat(() => { analyses++; }), new WorkerStateManager());
         assert.equal((reconciled.execution as { terminalRecorded: boolean }).terminalRecorded, true);
-        assert.equal(analyses, 2, 'one refused attempt, and one admitted by the proof');
+        assert.equal(analyses, 1, 'the refused attempt paid nothing; only the admitted one ran');
     });
 });

@@ -122,6 +122,9 @@ function historyQuery() {
 interface LeaseRow {
     lease_key: string; task_id: string; operation_id: string; lease_generation: string;
     acquired_at: string; expires_at: string; settled_at: string | null; settled_state: string | null;
+    /** Whether the holder reached the provider — the one fact a voluntary release turns on. */
+    provider_invocation_started: boolean; reconciliation_reason: string | null;
+    reconciliation_requested_at: string | null;
 }
 const leaseRows: LeaseRow[] = [];
 
@@ -147,9 +150,14 @@ function leaseQuery() {
         insert: (row: LeaseRow) => Object.assign(lazyResult(() => append(row)), {
             onConflict: () => ({ ignore: () => lazyResult(() => append(row)) }),
         }),
-        where: (column: string | Record<string, unknown>, operator?: string, value?: string) => {
+        // knex's `where` has three shapes the lease statements use: an object of equalities, a
+        // two-argument column/value equality, and a three-argument comparison. Collapsing the
+        // second into the third silently turns an equality into a nonsense comparison, which is
+        // how a conditional DELETE matches nothing and a release quietly stops happening.
+        where: (column: string | Record<string, unknown>, operator?: string | boolean, value?: string) => {
             if (typeof column === 'object') criteria = { ...criteria, ...column };
-            else comparisons.push([column, operator as string, value as string]);
+            else if (value === undefined) criteria = { ...criteria, [column]: operator };
+            else comparisons.push([column, operator as string, value]);
             return query;
         },
         whereNull: (column: string) => { nullColumns.push(column); return query; },
@@ -238,7 +246,8 @@ const { WorkerStateManager } = await import('../packages/core/src/utils/workerSt
 const { publishCompletedWithDurableExecutionEvidence, certifyDurableCompletion, isDurableCompletionAbsent,
     COMPLETION_PERSISTENCE_FAILED_SUFFIX } =
     await import('../packages/core/src/utils/durableCompletionBarrier.js');
-const { acquireExecutionLease, recordExecutorStopProof, releaseExecutionLease, renewExecutionLease,
+const { acquireExecutionLease, markProviderInvocationStarted, recordExecutorStopProof,
+    releaseExecutionLease, renewExecutionLease, retainLeaseForReconciliation,
     settleExecutionLease, startExecutionLeaseRenewal } =
     await import('../packages/core/src/utils/executionLease.js');
 
@@ -259,6 +268,7 @@ await mock.module('@propr/core', {
         durableExecutionCompletionGuard, nonExecutingCompletionGuard, isCompletionGuard, assertCompletionGuarded,
         publishCompletedWithDurableExecutionEvidence, certifyDurableCompletion, isDurableCompletionAbsent,
         acquireExecutionLease, releaseExecutionLease, renewExecutionLease, settleExecutionLease, startExecutionLeaseRenewal,
+        markProviderInvocationStarted, retainLeaseForReconciliation,
         COMPLETION_DURABILITY_UNVERIFIABLE, CompletionDurabilityUnverifiableError, isCompletionDurabilityUnverifiable,
         buildPlannerAbortSignalKey: (draftId: string) => `planner:abort:${draftId}`,
         buildPlannerAbortRedisOptions: () => ({}),
@@ -388,12 +398,38 @@ describe('a retried native analysis operation keeps one identity', () => {
         assert.equal(claimRows.filter(row => row.state === TASK_STATES.COMPLETED).length, 1);
     });
 
-    test('a retry of an operation that settled NOTHING is still allowed to run', async () => {
+    test('a retry of an operation that never reached the provider is still allowed to run', async () => {
+        let analyses = 0;
+        // An attempt that dies BEFORE `analyze` is called. Nothing was invoked, so nothing can
+        // have been billed, and refusing the retry would cost a real operation for no gain.
+        const neverStarts = {
+            createTaskState: async () => { throw new Error('the task state could not be created'); },
+            updateTaskState: async () => { throw new Error('the task state could not be created'); },
+            updateHistoryMetadata: async () => { throw new Error('the task state could not be created'); },
+            getTaskState: async () => undefined,
+            markTaskFailed: async () => { throw new Error('the task state could not be created'); },
+            projectDurableCompletion: async () => { throw new Error('the task state could not be created'); },
+        };
+        await assert.rejects(() => nativeAnalysis(failingAgent(() => { analyses++; }), 'prompt', {
+            options: {} as never, signal: new AbortController().signal, binding: binding('prompt'),
+            dependencies: { stateManager: neverStarts as never, setAbortSignal: async () => undefined },
+        }), /the task state could not be created/);
+        assert.equal(analyses, 0, 'the premise: the provider was never reached');
+        assert.equal(leaseRows.length, 0, 'an attempt that spent nothing hands its lease straight back');
+
+        const retry = await runAnalysis(() => { analyses++; }, new WorkerStateManager());
+        assert.equal(analyses, 1, 'an unspent operation may legitimately be retried; the fence is not a blanket refusal');
+        assert.equal((retry.execution as { terminalRecorded: boolean }).terminalRecorded, true);
+        assert.equal(completedRows().length, 1);
+    });
+
+    test('an operation that REACHED the provider and settled nothing is not made payable again', async () => {
         let analyses = 0;
         const base = new WorkerStateManager();
         const terminal = new Set<string>([TASK_STATES.COMPLETED, TASK_STATES.FAILED, TASK_STATES.CANCELLED]);
-        // An attempt that dies without settling anything: its provider fails AND its terminal
-        // write fails, so the operation is left genuinely unsettled.
+        // The window the previous rule released into: the provider ran — it may already have been
+        // billed — and then every terminal write failed, so the history holds nothing about it.
+        // "Nothing was recorded" is not "nothing was charged".
         const crashing = {
             createTaskState: base.createTaskState.bind(base),
             updateHistoryMetadata: base.updateHistoryMetadata.bind(base),
@@ -410,12 +446,15 @@ describe('a retried native analysis operation keeps one identity', () => {
             dependencies: { stateManager: crashing as never, setAbortSignal: async () => undefined },
         }), /provider unavailable/);
         assert.equal(analyses, 1);
-        assert.equal(leaseRows.length, 0, 'an attempt that settled nothing hands its lease straight back');
+        assert.equal(leaseRows.length, 1, 'the right to run is NOT handed back after a possibly billed attempt');
+        assert.equal(leaseRows[0].settled_at, null);
+        assert.equal(leaseRows[0].provider_invocation_started, true);
+        assert.match(leaseRows[0].reconciliation_reason as string, /may already have been billed/);
 
-        const retry = await runAnalysis(() => { analyses++; }, new WorkerStateManager());
-        assert.equal(analyses, 2, 'an unsettled operation may legitimately be retried; the fence is not a blanket refusal');
-        assert.equal((retry.execution as { terminalRecorded: boolean }).terminalRecorded, true);
-        assert.equal(completedRows().length, 1);
+        await assert.rejects(() => runAnalysis(() => { analyses++; }, new WorkerStateManager()),
+            /NATIVE_ANALYSIS_OPERATION_EXECUTION/,
+            'the next delivery is refused and routed to reconciliation rather than to a second charge');
+        assert.equal(analyses, 1, 'exactly one paid execution');
     });
 
     test('a retry that still sees the settled projection refuses to run the paid work again', async () => {

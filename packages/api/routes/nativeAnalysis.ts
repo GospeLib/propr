@@ -5,6 +5,7 @@ import {
     terminalTransitionId, certifyDurableCompletion, isDurableCompletionAbsent,
     claimTerminalTransition, durableTerminalTransitionRecorded, COMPLETION_PERSISTENCE_FAILED_SUFFIX,
     acquireExecutionLease, releaseExecutionLease, settleExecutionLease, startExecutionLeaseRenewal,
+    markProviderInvocationStarted, retainLeaseForReconciliation,
     type Agent, type AnalyzeOptions, type DurableCommit, type WorkerStateManager,
 } from '@propr/core';
 import { setAbortSignal } from './plannerAbortHandlers.js';
@@ -43,6 +44,17 @@ export const NATIVE_ANALYSIS_OPERATION_IN_PROGRESS = 'NATIVE_ANALYSIS_OPERATION_
  * be resumed is a smaller loss than paying twice for work that is still running.
  */
 export const NATIVE_ANALYSIS_OPERATION_UNRECONCILED = 'NATIVE_ANALYSIS_OPERATION_EXECUTION_UNRECONCILED';
+/**
+ * Why a lease was kept although this attempt settled nothing.
+ *
+ * Written onto the lease row so the operation is distinguishable, weeks later, from one that
+ * lapsed without ever reaching the provider: the first may already have been billed and must be
+ * reconciled by someone who checks, the second is simply free to retry.
+ */
+export const PROVIDER_REACHED_WITHOUT_OUTCOME =
+    'the provider was invoked and no terminal record of the outcome is durable, so this operation '
+    + 'may already have been billed; run `npx tsx scripts/reconcile-execution-lease.ts` and record '
+    + 'a verified executor stop before it is allowed to run again';
 
 /**
  * Whether the AUTHORITATIVE history already holds the completion of this operation.
@@ -239,6 +251,12 @@ export async function nativeAnalysis(
     }
     const lease = acquired.lease;
     let leaseSettled = false;
+    // Whether this attempt REACHED the provider. It is the one fact that decides, on the way out,
+    // whether an unsettled lease may be handed back: an attempt that never got there spent
+    // nothing and a retry is free, while an attempt that got there may already have been billed
+    // for work whose outcome it then lost, and releasing that lease buys the same work twice.
+    // "I settled nothing" cannot stand in for it — that is true in both cases.
+    let providerInvocationStarted = false;
     // A lease this attempt no longer holds is recorded rather than swallowed: the terminal
     // transition identity still stops a second completed row, but losing the fence is the one
     // condition under which another attempt could have started, and that must be visible.
@@ -281,29 +299,40 @@ export async function nativeAnalysis(
                 ...(options.context === undefined ? {} : { context: options.context }) },
         }, binding?.operationId, { requireDurableHistory: true });
         await state.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, { historyMetadata: evidence, requireDurableHistory: true });
-        const result = await runWithPlannerAbortContext(taskId, attemptGeneration, () => runWithExecutionAbortSignal(signal, () => agent.analyze(prompt, {
-            ...options, taskId, executionType: 'plan-generation', correlationId: binding?.operationId,
-            repository: binding?.repository,
-            executionCallbacks: {
-                onInputPrepared: async input => {
-                    const observed = schemaDigest(input.responseSchema);
-                    if (observed !== binding.responseSchemaDigest) throw new Error('Native CLI response schema binding changed');
-                    await checkpoint({ providerCliInput: input,
-                        providerCliInputDigest: `sha256:${createHash('sha256').update(JSON.stringify(input)).digest('hex')}` });
-                    observedResponseSchemaDigest = observed;
+        const result = await runWithPlannerAbortContext(taskId, attemptGeneration, () => runWithExecutionAbortSignal(signal, async () => {
+            // Set BEFORE the call, and durably too, so a crash inside the provider still leaves
+            // the fact behind. A marker written afterwards would be absent for exactly the
+            // failures it exists to describe. The durable write failing does not stop the run and
+            // does not loosen the rule: the in-process flag already holds this attempt to it, and
+            // turning a transient database fault into a permanently unrunnable operation would be
+            // a worse answer than recording the fault and carrying on.
+            providerInvocationStarted = true;
+            try { await markProviderInvocationStarted(lease); }
+            catch (error) { leaseFenceErrors.push(`the provider-invocation marker could not be written: ${(error as Error).message}`); }
+            return agent.analyze(prompt, {
+                ...options, taskId, executionType: 'plan-generation', correlationId: binding?.operationId,
+                repository: binding?.repository,
+                executionCallbacks: {
+                    onInputPrepared: async input => {
+                        const observed = schemaDigest(input.responseSchema);
+                        if (observed !== binding.responseSchemaDigest) throw new Error('Native CLI response schema binding changed');
+                        await checkpoint({ providerCliInput: input,
+                            providerCliInputDigest: `sha256:${createHash('sha256').update(JSON.stringify(input)).digest('hex')}` });
+                        observedResponseSchemaDigest = observed;
+                    },
+                    onTimeout: requestCancellation,
+                    onAbortRequested: requestCancellation,
+                    onChildStarted: async child => checkpoint({ child }),
+                    onContainerId: async (containerId, containerName) => checkpoint({ containerId, containerName }),
+                    onSessionId: async sessionId => checkpoint({ providerSessionId: sessionId }),
+                    onTerminal: async terminal => {
+                        await checkpoint({ terminal: { ...terminal, messageTimestamps: Object.fromEntries(terminal.messageTimestamps) } });
+                        childStopped = terminal.childStopped;
+                        containerStopped = terminal.containerCessation === 'stopped';
+                    },
                 },
-                onTimeout: requestCancellation,
-                onAbortRequested: requestCancellation,
-                onChildStarted: async child => checkpoint({ child }),
-                onContainerId: async (containerId, containerName) => checkpoint({ containerId, containerName }),
-                onSessionId: async sessionId => checkpoint({ providerSessionId: sessionId }),
-                onTerminal: async terminal => {
-                    await checkpoint({ terminal: { ...terminal, messageTimestamps: Object.fromEntries(terminal.messageTimestamps) } });
-                    childStopped = terminal.childStopped;
-                    containerStopped = terminal.containerCessation === 'stopped';
-                },
-            },
-        }), attemptGeneration));
+            });
+        }, attemptGeneration));
         await cancellationCheckpoint;
         let settlementError: string | undefined;
         const terminalState = signal.aborted ? TaskStates.CANCELLED : result.success ? TaskStates.COMPLETED : TaskStates.FAILED;
@@ -389,22 +418,36 @@ export async function nativeAnalysis(
         stopLeaseRenewal();
         // Handing the lease back is the ONE route from "this operation was not settled" to "this
         // operation may run again", and it is now the only one: an expired term grants nothing.
-        // So it is given only on evidence, never on the absence of a flag. The history is asked
-        // whether ANY terminal identity of this operation became durable — including the one the
-        // barrier claims when it settles an unrecordable completion as failed — and only a
-        // confirmed absence releases. A write that failed is not an absence: it can have
-        // committed and lost its acknowledgement, and an unreadable history says nothing at all.
-        // Either way the lease stays, and the operation waits for reconciliation instead of
-        // paying twice.
+        // So it is given only on evidence, never on the absence of a flag — and the evidence has
+        // to answer the money question, not merely the bookkeeping one.
         if (!leaseSettled) {
-            let nothingTerminalIsDurable = false;
-            try {
-                const recorded = await Promise.all(terminalIdentities
-                    .map(([terminal, transitionId]) => durableTerminalTransitionRecorded(taskId, transitionId, terminal)));
-                nothingTerminalIsDurable = recorded.every(found => !found);
-            } catch { nothingTerminalIsDurable = false; }
-            if (nothingTerminalIsDurable) {
-                try { await releaseExecutionLease(lease); } catch { /* it stays until it is reconciled */ }
+            // The first question is not "did anything land" but "was anything SPENT". An attempt
+            // that reached the provider may already have been billed for work whose outcome it
+            // then lost, and no amount of absent history distinguishes that from an attempt that
+            // was never charged. Proving the executor stopped prevents two executions overlapping;
+            // it does not prove no money changed hands. So this attempt keeps its lease and says
+            // why, and the operation goes to deliberate reconciliation instead of being made
+            // immediately payable again.
+            // A `return` here would swallow this function's own outcome, so the two cases are
+            // written as branches rather than an early exit.
+            if (providerInvocationStarted) {
+                try { await retainLeaseForReconciliation(lease, PROVIDER_REACHED_WITHOUT_OUTCOME); }
+                catch { /* the lease is retained by NOT releasing it; the note is the extra */ }
+            } else {
+                // Nothing reached the provider, so a retry is free. The history is still asked
+                // whether ANY terminal identity of this operation became durable — including the
+                // one the barrier claims when it settles an unrecordable completion as failed —
+                // and only a confirmed absence releases. A write that failed is not an absence,
+                // and an unreadable history says nothing at all.
+                let nothingTerminalIsDurable = false;
+                try {
+                    const recorded = await Promise.all(terminalIdentities
+                        .map(([terminal, transitionId]) => durableTerminalTransitionRecorded(taskId, transitionId, terminal)));
+                    nothingTerminalIsDurable = recorded.every(found => !found);
+                } catch { nothingTerminalIsDurable = false; }
+                if (nothingTerminalIsDurable) {
+                    try { await releaseExecutionLease(lease); } catch { /* it stays until it is reconciled */ }
+                }
             }
         }
     }

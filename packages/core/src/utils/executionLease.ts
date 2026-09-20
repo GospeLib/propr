@@ -21,7 +21,10 @@
  *   skewed clock all produce it while the provider keeps running and keeps charging. Expiry
  *   therefore grants NOTHING on its own. Taking a lapsed lease requires a durable, separately
  *   recorded proof that the named prior generation stopped (`recordExecutorStopProof`), and that
- *   proof is consumed when it is used, so it can admit exactly one successor.
+ *   proof is consumed when it is used, so it can admit exactly one successor. CONSUMING IT AND
+ *   TAKING THE LEASE ARE ONE TRANSACTION: a proof that is spent without the takeover landing is a
+ *   proof that can never be spent again, and the operation it was about would then be refused for
+ *   ever with no way back. Either both statements commit or neither does.
  * - A SETTLED OPERATION IS NEVER TAKEN OVER. `settled_at` is terminal for the lease: expiry does
  *   not release it, so a settlement that is durable cannot be followed by another paid run.
  * - TIME COMES FROM THE DATABASE. Every term, every expiry comparison and every settlement stamp
@@ -44,12 +47,15 @@
  * its own became durable, and hands the lease back itself. That is proof the executor stopped,
  * because the executor is the one saying so. Nothing infers the same thing from silence.
  *
- * WHAT THIS STILL DOES NOT GUARANTEE. A voluntary release after a provider invocation that
- * produced NO durable terminal record lets the next delivery invoke the provider again. That is a
- * retry of an operation nothing settled, which is the behaviour this route wants — but if the
- * first invocation was billed before it failed, the retry is a second charge. At-most-once
- * execution is therefore guaranteed for a SETTLED operation, not for every operation that ever
- * reached the provider.
+ * WHERE A VOLUNTARY RELEASE STOPS. "I settled nothing" is not "I spent nothing". An attempt that
+ * reached the provider and then lost its outcome may already have been BILLED, and handing its
+ * lease straight back makes the next delivery pay for that same work again. So a release is
+ * permitted only to an attempt that never reached the provider at all. One that did marks
+ * `provider_invocation_started` and KEEPS its lease; the term then lapses into `unreconciled` and
+ * the operation waits until someone establishes what that executor actually did. At-most-once
+ * execution is therefore guaranteed for every operation that reached the provider, at the price of
+ * an operation that must be reconciled deliberately — `recordVerifiedExecutorStop` is how that is
+ * done without turning the reconciliation itself into the second charge.
  */
 import type { Knex } from 'knex';
 import { db } from '../db/connection.js';
@@ -61,6 +67,8 @@ const EXECUTOR_STOP_PROOFS = 'task_execution_lease_stop_proofs';
 export const EXECUTION_LEASE_TTL_MS = 60_000;
 /** Renewal cadence: three renewals per term, so one lost renewal cannot expire a live holder. */
 export const EXECUTION_LEASE_RENEWAL_INTERVAL_MS = Math.floor(EXECUTION_LEASE_TTL_MS / 3);
+/** Long enough that a stop proof cannot be a keystroke; short enough to be a real sentence. */
+export const MINIMUM_STOP_PROOF_LENGTH = 20;
 
 /** Another live attempt holds the right to execute this operation. */
 export const EXECUTION_LEASE_HELD = 'EXECUTION_LEASE_HELD';
@@ -100,6 +108,9 @@ interface ExecutionLeaseRow {
     expires_at: string;
     settled_at: string | null;
     settled_state: string | null;
+    provider_invocation_started?: number | boolean | null;
+    reconciliation_reason?: string | null;
+    reconciliation_requested_at?: string | null;
 }
 
 type Queryable = Knex | Knex.Transaction;
@@ -133,28 +144,34 @@ function expiry(now: string, ttlMs: number): string {
  */
 export async function recordExecutorStopProof(options: {
     leaseKey: string; generation: string; proof: string; recordedBy: string;
-}): Promise<void> {
+}): Promise<StopProofRecording> {
     if (!options.proof.trim()) throw new Error('an executor stop proof must state what was verified');
+    // `ignore()` is silent by design — two operators recording the same verified fact must not
+    // fight over the row — but silence is the wrong answer to "why is this operation still
+    // refused?". What is already on file is read first and reported, so a caller can tell an
+    // idempotent re-record from a proof that has already been SPENT, which is the difference
+    // between "nothing to do" and "this generation can never be admitted again".
+    //
+    // The read is not the arbitration and does not need to be: the insert below still admits
+    // exactly one row whatever two callers read at the same moment.
+    const existing = await db(EXECUTOR_STOP_PROOFS)
+        .where({ lease_key: options.leaseKey, lease_generation: options.generation })
+        .first() as { consumed_at: string | null } | undefined;
+    if (existing) return existing.consumed_at ? 'already_consumed' : 'already_recorded';
     await db(EXECUTOR_STOP_PROOFS).insert({
         lease_key: options.leaseKey, lease_generation: options.generation,
         proof: options.proof, recorded_by: options.recordedBy,
         recorded_at: await databaseNow(), consumed_at: null, consumed_by_generation: null,
     }).onConflict(['lease_key', 'lease_generation']).ignore();
+    return 'recorded';
 }
 
-/**
- * Consumes the stop proof for the observed generation, if one exists.
- *
- * Consumption is a conditional UPDATE, so of two contenders that both read the same unconsumed
- * proof exactly one claims it; the other is told the lease is still unreconciled rather than
- * being allowed to race for the row.
- */
-async function claimStopProof(leaseKey: string, generation: string, taker: string, now: string): Promise<boolean> {
-    const claimed = await db(EXECUTOR_STOP_PROOFS)
-        .where({ lease_key: leaseKey, lease_generation: generation })
-        .whereNull('consumed_at')
-        .update({ consumed_at: now, consumed_by_generation: taker });
-    return claimed === 1;
+/** What `recordExecutorStopProof` found on file for this exact generation. */
+export type StopProofRecording = 'recorded' | 'already_recorded' | 'already_consumed';
+
+/** Rolls the takeover transaction back without reporting a failure the caller must handle. */
+class TakeoverDidNotLand extends Error {
+    constructor() { super('the expired lease did not move, so its stop proof is not spent'); }
 }
 
 /**
@@ -173,6 +190,9 @@ export async function acquireExecutionLease(request: ExecutionLeaseRequest): Pro
         lease_key: leaseKey, task_id: taskId, operation_id: operationId,
         lease_generation: generation, acquired_at: now, expires_at: expiresAt,
         settled_at: null, settled_state: null,
+        // Written explicitly rather than left to the column default: whether this attempt reached
+        // the provider is the fact the release rule turns on, and it starts as a stated `false`.
+        provider_invocation_started: false, reconciliation_reason: null, reconciliation_requested_at: null,
     }).onConflict('lease_key').ignore();
 
     const held = await db(EXECUTION_LEASES).where({ lease_key: leaseKey }).first() as ExecutionLeaseRow | undefined;
@@ -189,19 +209,50 @@ export async function acquireExecutionLease(request: ExecutionLeaseRequest): Pro
     // The term lapsed. That is not evidence the holder stopped — only that nothing renewed it —
     // so it buys nothing by itself. A takeover needs a stop proof naming this exact generation,
     // and consuming that proof is what makes it usable once.
-    if (!await claimStopProof(leaseKey, held.lease_generation, generation, now)) {
-        return { outcome: 'unreconciled', holderGeneration: held.lease_generation, expiresAt: held.expires_at };
+    //
+    // CONSUMPTION AND TAKEOVER ARE ONE TRANSACTION. Spending the proof in its own committed
+    // statement and taking the lease in the next left a gap with no way out of it: a crash, a
+    // SQLite failure or a renewal landing in between leaves the prior generation installed over a
+    // proof that is already spent, and `recordExecutorStopProof` cannot write that generation's
+    // proof a second time — so every later attempt reads `unreconciled` for ever and the operation
+    // is stuck. Inside one transaction the proof is spent only if the takeover moved exactly one
+    // row; anything else rolls the consumption back and leaves the proof on file, unspent, for the
+    // next attempt.
+    let takenOver: 'acquired' | 'unreconciled' | 'did-not-land';
+    try {
+        takenOver = await db.transaction(async transaction => {
+            const claimed = await transaction(EXECUTOR_STOP_PROOFS)
+                .where({ lease_key: leaseKey, lease_generation: held.lease_generation })
+                .whereNull('consumed_at')
+                .update({ consumed_at: now, consumed_by_generation: generation });
+            // No proof, or another contender spent it first. Nothing was written, so committing an
+            // empty transaction is the honest outcome.
+            if (claimed !== 1) return 'unreconciled';
+            const moved = await transaction(EXECUTION_LEASES)
+                .where({ lease_key: leaseKey, lease_generation: held.lease_generation })
+                .whereNull('settled_at')
+                .where('expires_at', '<=', now)
+                .update({ lease_generation: generation, task_id: taskId, operation_id: operationId,
+                    acquired_at: now, expires_at: expiresAt, provider_invocation_started: false,
+                    reconciliation_reason: null, reconciliation_requested_at: null });
+            // A late renewal, a settlement, or a takeover by someone else moved the row out from
+            // under this one. The proof must go back on file with it.
+            if (moved !== 1) throw new TakeoverDidNotLand();
+            return 'acquired';
+        });
+    } catch (error) {
+        // Whatever failed — the conditional takeover matching nothing, or SQLite refusing the
+        // write — the transaction is gone and with it the consumption. A genuine database fault is
+        // not swallowed into a refusal: it propagates, because "the database would not answer" is
+        // never permission to start a second paid run.
+        if (!(error instanceof TakeoverDidNotLand)) throw error;
+        takenOver = 'did-not-land';
     }
-    // The proof is spent; the takeover is still one conditional statement naming the generation it
-    // was written about, so a row that moved underneath us affects nothing.
-    const takenOver = await db(EXECUTION_LEASES)
-        .where({ lease_key: leaseKey, lease_generation: held.lease_generation })
-        .whereNull('settled_at')
-        .where('expires_at', '<=', now)
-        .update({ lease_generation: generation, task_id: taskId, operation_id: operationId,
-            acquired_at: now, expires_at: expiresAt });
-    if (takenOver === 1) {
+    if (takenOver === 'acquired') {
         return { outcome: 'acquired', lease: { leaseKey, generation, expiresAt }, takenOverFrom: held.lease_generation };
+    }
+    if (takenOver === 'unreconciled') {
+        return { outcome: 'unreconciled', holderGeneration: held.lease_generation, expiresAt: held.expires_at };
     }
     const current = await db(EXECUTION_LEASES).where({ lease_key: leaseKey }).first() as ExecutionLeaseRow | undefined;
     if (current?.settled_at) return { outcome: 'settled', settledAt: current.settled_at, settledState: current.settled_state ?? 'unknown' };
@@ -237,17 +288,163 @@ export async function settleExecutionLease(lease: HeldExecutionLease, state: str
 }
 
 /**
+ * Records, durably and before the fact, that this attempt is about to reach the provider.
+ *
+ * From this moment the attempt can no longer hand its lease back on the grounds that it settled
+ * nothing: a provider invocation can be billed and then be lost — the process dies, the stream
+ * breaks, the terminal write fails — and "nothing was recorded" says nothing about whether
+ * anything was charged. The flag is written BEFORE the call so a crash during the call still
+ * finds it set; writing it afterwards would leave exactly the window it exists to close.
+ *
+ * `false` means this attempt no longer holds the lease, which is itself a reason not to execute.
+ */
+export async function markProviderInvocationStarted(lease: HeldExecutionLease): Promise<boolean> {
+    const marked = await db(EXECUTION_LEASES)
+        .where({ lease_key: lease.leaseKey, lease_generation: lease.generation })
+        .whereNull('settled_at')
+        .update({ provider_invocation_started: true });
+    return marked === 1;
+}
+
+/**
+ * Leaves an unsettled lease in place and says, on the row, why it is waiting.
+ *
+ * The lease is already retained by simply not releasing it; this adds the one thing an operator
+ * cannot reconstruct afterwards — what this attempt knew when it gave up. Without it a lapsed
+ * lease is indistinguishable from any other, and the safe decision becomes unmakeable.
+ */
+export async function retainLeaseForReconciliation(lease: HeldExecutionLease, reason: string): Promise<boolean> {
+    const retained = await db(EXECUTION_LEASES)
+        .where({ lease_key: lease.leaseKey, lease_generation: lease.generation })
+        .whereNull('settled_at')
+        .update({ reconciliation_reason: reason, reconciliation_requested_at: await databaseNow() });
+    return retained === 1;
+}
+
+/** One lapsed, unsettled lease as a reconciliation decision needs to see it. */
+export interface LapsedExecutionLease {
+    leaseKey: string;
+    taskId: string;
+    operationId: string;
+    holderGeneration: string;
+    acquiredAt: string;
+    expiresAt: string;
+    /** Whether that holder had already reached the provider. The whole decision turns on this. */
+    providerInvocationStarted: boolean;
+    reconciliationReason?: string;
+    /** What is already on file about this exact generation, so a second proof is not invented. */
+    stopProof?: { recordedBy: string; recordedAt: string; consumedAt?: string };
+}
+
+/**
+ * Every unsettled lease whose term has lapsed — the complete set of stuck operations.
+ *
+ * Derived from the database's own clock, so an operator's skewed workstation cannot make a live
+ * holder look abandoned in this listing.
+ */
+export async function lapsedExecutionLeases(): Promise<LapsedExecutionLease[]> {
+    const now = await databaseNow();
+    const rows = await db(EXECUTION_LEASES)
+        .whereNull('settled_at').where('expires_at', '<=', now)
+        .orderBy('expires_at') as ExecutionLeaseRow[];
+    const proofs = rows.length === 0 ? [] : await db(EXECUTOR_STOP_PROOFS)
+        .whereIn('lease_key', rows.map(row => row.lease_key)) as {
+            lease_key: string; lease_generation: string; recorded_by: string;
+            recorded_at: string; consumed_at: string | null;
+        }[];
+    return rows.map(row => {
+        const proof = proofs.find(candidate => candidate.lease_key === row.lease_key
+            && candidate.lease_generation === row.lease_generation);
+        return {
+            leaseKey: row.lease_key, taskId: row.task_id, operationId: row.operation_id,
+            holderGeneration: row.lease_generation, acquiredAt: row.acquired_at, expiresAt: row.expires_at,
+            providerInvocationStarted: Boolean(row.provider_invocation_started),
+            ...(row.reconciliation_reason ? { reconciliationReason: row.reconciliation_reason } : {}),
+            ...(proof ? { stopProof: { recordedBy: proof.recorded_by, recordedAt: proof.recorded_at,
+                ...(proof.consumed_at ? { consumedAt: proof.consumed_at } : {}) } } : {}),
+        };
+    });
+}
+
+/** Why a deliberate reconciliation was refused. Each one is a way the proof would have been false. */
+export type ExecutorStopRefusal =
+    | 'no such lease'
+    | 'the lease is settled and needs no reconciliation'
+    | 'the named generation no longer holds this lease'
+    | 'the term has not lapsed, so the executor is still reporting itself alive'
+    | 'a proof for this generation is already on file'
+    | 'a proof for this generation has already been spent'
+    | 'the confirmation did not match the generation being declared stopped'
+    | 'the proof must state what was verified, in the operator\'s own words';
+
+export type ExecutorStopOutcome = { recorded: true } | { recorded: false; refusal: ExecutorStopRefusal };
+
+/**
+ * The deliberate, checked way to record that a named executor stopped.
+ *
+ * `recordExecutorStopProof` is the raw write, and a raw write is the wrong shape for a hand
+ * operation whose only failure mode is an operator who is mistaken: a proof about a generation
+ * that is still running is a licence to pay twice, and it cannot be taken back — it will be spent
+ * by the very next delivery. So every way of being mistaken that the database can see is checked
+ * here, in one place, before anything is written:
+ *
+ * - the generation named must be the one CURRENTLY holding the lease, not one the operator copied
+ *   from an older log line;
+ * - the term must actually have lapsed, so a holder that is still heartbeating is never declared
+ *   dead;
+ * - the lease must be unsettled, so a finished operation is never reopened;
+ * - the generation must be typed twice and match, because the whole safety of this depends on
+ *   WHICH generation it names;
+ * - and a proof already on file is reported rather than overwritten, so two operators reconciling
+ *   the same incident cannot stack two admissions.
+ *
+ * What it cannot check is the only thing that matters — whether the container is really gone — so
+ * it demands that in words, and records who said it.
+ */
+export async function recordVerifiedExecutorStop(options: {
+    leaseKey: string; generation: string; confirmGeneration: string; proof: string; recordedBy: string;
+}): Promise<ExecutorStopOutcome> {
+    const refuse = (refusal: ExecutorStopRefusal): ExecutorStopOutcome => ({ recorded: false, refusal });
+    if (options.generation !== options.confirmGeneration) {
+        return refuse('the confirmation did not match the generation being declared stopped');
+    }
+    if (options.proof.trim().length < MINIMUM_STOP_PROOF_LENGTH || !options.recordedBy.trim()) {
+        return refuse('the proof must state what was verified, in the operator\'s own words');
+    }
+    const row = await db(EXECUTION_LEASES).where({ lease_key: options.leaseKey })
+        .first() as ExecutionLeaseRow | undefined;
+    if (!row) return refuse('no such lease');
+    if (row.settled_at) return refuse('the lease is settled and needs no reconciliation');
+    if (row.lease_generation !== options.generation) return refuse('the named generation no longer holds this lease');
+    if (row.expires_at > await databaseNow()) {
+        return refuse('the term has not lapsed, so the executor is still reporting itself alive');
+    }
+    const recorded = await recordExecutorStopProof({
+        leaseKey: options.leaseKey, generation: options.generation,
+        proof: options.proof, recordedBy: options.recordedBy,
+    });
+    if (recorded === 'already_recorded') return refuse('a proof for this generation is already on file');
+    if (recorded === 'already_consumed') return refuse('a proof for this generation has already been spent');
+    return { recorded: true };
+}
+
+/**
  * Releases an UNSETTLED lease this attempt still holds, so a legitimate retry need not wait out
  * the term. A settled lease is left exactly as it is — releasing it would re-permit paid work.
  *
- * This is the ONLY route back to an executable operation, and it is deliberately voluntary: the
- * caller is alive, holds the fence, and has established that nothing terminal of its own became
- * durable. Releasing on any weaker basis is how a still-running execution gets a twin.
+ * It refuses a lease whose attempt REACHED THE PROVIDER. Such an attempt knows it settled nothing;
+ * it does not know that nothing was charged, and those are different facts. Handing that lease
+ * back would make the next delivery pay again for work that may already be paid for, so the lease
+ * stays and the operation waits for a deliberate reconciliation instead.
+ *
+ * The condition is in the DELETE, not in the caller: a released lease is a decision about money,
+ * and the database is where that decision is made.
  */
 export async function releaseExecutionLease(lease: HeldExecutionLease): Promise<boolean> {
     const released = await db(EXECUTION_LEASES)
         .where({ lease_key: lease.leaseKey, lease_generation: lease.generation })
         .whereNull('settled_at')
+        .where('provider_invocation_started', false)
         .delete();
     return released === 1;
 }

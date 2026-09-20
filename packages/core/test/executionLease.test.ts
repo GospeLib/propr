@@ -14,6 +14,7 @@ import { after, before, describe, mock, test } from 'node:test';
 import knex, { type Knex } from 'knex';
 import { up as createExecutionLeases } from '../src/db/migrations/20260922000000_create_task_execution_leases.js';
 import { up as createStopProofs } from '../src/db/migrations/20260923000000_create_execution_lease_stop_proofs.js';
+import { up as addReconciliation } from '../src/db/migrations/20260924000000_add_execution_lease_reconciliation.js';
 
 const database: Knex = knex({
     client: 'better-sqlite3',
@@ -22,14 +23,19 @@ const database: Knex = knex({
 });
 await mock.module('../src/db/connection.js', { namedExports: { db: database } });
 const {
-    acquireExecutionLease, databaseNow, recordExecutorStopProof, releaseExecutionLease,
-    renewExecutionLease, settleExecutionLease,
+    acquireExecutionLease, databaseNow, lapsedExecutionLeases, markProviderInvocationStarted,
+    recordExecutorStopProof, recordVerifiedExecutorStop, releaseExecutionLease,
+    renewExecutionLease, retainLeaseForReconciliation, settleExecutionLease,
 } = await import('../src/utils/executionLease.js');
 
 const TTL_MS = 60_000;
 const leaseKey = () => `native-analysis:${randomUUID()}`;
 
-before(async () => { await createExecutionLeases(database); await createStopProofs(database); });
+before(async () => {
+    await createExecutionLeases(database);
+    await createStopProofs(database);
+    await addReconciliation(database);
+});
 after(async () => { await database.destroy(); });
 
 function request(key: string, generation: string, overrides: Record<string, unknown> = {}) {
@@ -190,5 +196,219 @@ describe('the right to run one paid execution is exclusive, durable and generati
         const drift = Math.abs(new Date(row.expires_at).getTime()
             - (new Date(await databaseNow()).getTime() + TTL_MS));
         assert.ok(drift < 5_000, `the term is derived from the database clock (drift ${drift}ms)`);
+    });
+});
+
+/**
+ * A failure interleaved BETWEEN spending the stop proof and taking the lease.
+ *
+ * The two statements used to be separately committed, and the gap between them had no way out of
+ * it: the proof is spent, the prior generation is still installed, and `recordExecutorStopProof`
+ * cannot write that generation's proof a second time — so every later attempt reads `unreconciled`
+ * for ever. Each of these makes the second statement fail, by a different mechanism, and asks the
+ * same question of all of them: is the proof still spendable afterwards?
+ *
+ * A trigger is used because the interleave has to land INSIDE the transaction, which is strictly
+ * the harder case: a renewal or a settlement that commits before the transaction opens is refused
+ * by the conditional UPDATE anyway.
+ */
+async function withTrigger(sql: string, run: () => Promise<void>): Promise<void> {
+    await database.raw(sql);
+    try { await run(); } finally { await database.raw('DROP TRIGGER IF EXISTS interleaved'); }
+}
+
+const proofRow = (key: string, generation: string) => database('task_execution_lease_stop_proofs')
+    .where({ lease_key: key, lease_generation: generation }).first();
+
+describe('spending a stop proof and taking the lease are one transaction', () => {
+    test('a failing takeover leaves the proof unspent, so the operation is not stuck for ever', async () => {
+        const key = leaseKey();
+        const abandoned = randomUUID();
+        await acquireExecutionLease(request(key, abandoned));
+        await lapseTerm(key);
+        await stopProof(key, abandoned);
+        await withTrigger(`CREATE TRIGGER interleaved BEFORE UPDATE OF lease_generation ON task_execution_leases
+            BEGIN SELECT RAISE(ABORT, 'SQLite refused the takeover'); END`, async () => {
+            // A database fault is never turned into a quiet refusal: it propagates, because "the
+            // write would not land" is not permission to start a second paid run either.
+            await assert.rejects(() => acquireExecutionLease(request(key, randomUUID())), /refused the takeover/);
+        });
+        assert.equal((await proofRow(key, abandoned)).consumed_at, null,
+            'the consumption left with the transaction that could not complete it');
+        const successor = randomUUID();
+        assert.equal((await acquireExecutionLease(request(key, successor))).outcome, 'acquired',
+            'and the proof still admits the successor it was written about');
+        assert.ok((await proofRow(key, abandoned)).consumed_at, 'spent, once, by the takeover that landed');
+    });
+
+    test('a renewal landing between the two statements refuses the takeover and keeps the proof', async () => {
+        const key = leaseKey();
+        const suspended = randomUUID();
+        await acquireExecutionLease(request(key, suspended));
+        await lapseTerm(key);
+        await stopProof(key, suspended);
+        await withTrigger(`CREATE TRIGGER interleaved AFTER UPDATE OF consumed_at ON task_execution_lease_stop_proofs
+            BEGIN UPDATE task_execution_leases SET expires_at = '9999-01-01T00:00:00.000Z'
+                WHERE lease_key = NEW.lease_key; END`, async () => {
+            const contender = await acquireExecutionLease(request(key, randomUUID()));
+            assert.notEqual(contender.outcome, 'acquired',
+                'the holder said it was alive after all, so nothing may take its lease');
+        });
+        assert.equal((await proofRow(key, suspended)).consumed_at, null,
+            'and the proof about the suspended generation is still on file, unspent');
+        assert.equal((await database('task_execution_leases').where({ lease_key: key }).first()).lease_generation,
+            suspended, 'with the prior generation still holding, exactly as before the attempt');
+    });
+
+    test('a settlement landing between the two statements refuses the takeover and keeps the proof', async () => {
+        const key = leaseKey();
+        const holder = randomUUID();
+        await acquireExecutionLease(request(key, holder));
+        await lapseTerm(key);
+        await stopProof(key, holder);
+        await withTrigger(`CREATE TRIGGER interleaved AFTER UPDATE OF consumed_at ON task_execution_lease_stop_proofs
+            BEGIN UPDATE task_execution_leases SET settled_at = '2026-01-01T00:00:00.000Z',
+                settled_state = 'completed' WHERE lease_key = NEW.lease_key; END`, async () => {
+            const contender = await acquireExecutionLease(request(key, randomUUID()));
+            assert.notEqual(contender.outcome, 'acquired', 'a settled operation is never taken over');
+        });
+        assert.equal((await proofRow(key, holder)).consumed_at, null);
+    });
+
+    test('a proof already on file is reported rather than silently ignored', async () => {
+        const key = leaseKey();
+        const generation = randomUUID();
+        await acquireExecutionLease(request(key, generation));
+        await lapseTerm(key);
+        assert.equal(await recordExecutorStopProof({ leaseKey: key, generation,
+            proof: 'the operator confirmed the container exited', recordedBy: 'operator:test' }), 'recorded');
+        assert.equal(await recordExecutorStopProof({ leaseKey: key, generation,
+            proof: 'the operator confirmed the container exited', recordedBy: 'operator:other' }), 'already_recorded',
+            'two operators recording the same fact must not stack two admissions');
+        assert.equal((await acquireExecutionLease(request(key, randomUUID()))).outcome, 'acquired');
+        assert.equal(await recordExecutorStopProof({ leaseKey: key, generation,
+            proof: 'the operator confirmed the container exited', recordedBy: 'operator:test' }), 'already_consumed',
+            'and a spent proof says so, instead of leaving "why is this still refused?" unanswerable');
+    });
+});
+
+describe('a lease is handed back only by an attempt that never reached the provider', () => {
+    test('an attempt that reached the provider cannot release, whatever it settled', async () => {
+        const key = leaseKey();
+        const generation = randomUUID();
+        await acquireExecutionLease(request(key, generation));
+        const lease = { leaseKey: key, generation, expiresAt: '' };
+        assert.equal(await markProviderInvocationStarted(lease), true);
+        assert.equal(await releaseExecutionLease(lease), false,
+            '"I settled nothing" is not "I spent nothing", and only the second permits a free retry');
+        assert.ok(await database('task_execution_leases').where({ lease_key: key }).first());
+    });
+
+    test('an attempt that never reached the provider releases at once', async () => {
+        const key = leaseKey();
+        const generation = randomUUID();
+        await acquireExecutionLease(request(key, generation));
+        assert.equal(await releaseExecutionLease({ leaseKey: key, generation, expiresAt: '' }), true);
+        assert.equal((await acquireExecutionLease(request(key, randomUUID()))).outcome, 'acquired');
+    });
+
+    test('a retained lease says why it is waiting, and a takeover clears that with it', async () => {
+        const key = leaseKey();
+        const stranded = randomUUID();
+        await acquireExecutionLease(request(key, stranded));
+        const lease = { leaseKey: key, generation: stranded, expiresAt: '' };
+        await markProviderInvocationStarted(lease);
+        assert.equal(await retainLeaseForReconciliation(lease, 'the provider was invoked and nothing came back'), true);
+        await lapseTerm(key);
+        const lapsed = (await lapsedExecutionLeases()).find(candidate => candidate.leaseKey === key);
+        assert.ok(lapsed, 'a lapsed, unsettled lease is listed for reconciliation');
+        assert.equal(lapsed.providerInvocationStarted, true,
+            'the one fact a reconciliation decision turns on is on the row, not in a lost log');
+        assert.equal(lapsed.reconciliationReason, 'the provider was invoked and nothing came back');
+        assert.equal(lapsed.stopProof, undefined);
+
+        await stopProof(key, stranded);
+        const listed = (await lapsedExecutionLeases()).find(candidate => candidate.leaseKey === key);
+        assert.equal(listed?.stopProof?.recordedBy, 'operator:test');
+        assert.equal(listed?.stopProof?.consumedAt, undefined,
+            'a proof on file but unspent is distinguishable from one already used');
+        assert.equal((await acquireExecutionLease(request(key, randomUUID()))).outcome, 'acquired');
+        const row = await database('task_execution_leases').where({ lease_key: key }).first();
+        assert.equal(Boolean(row.provider_invocation_started), false,
+            'the successor inherits the term, never the previous holder\'s spending');
+        assert.equal(row.reconciliation_reason, null);
+    });
+});
+
+describe('recording a verified executor stop refuses every mistake the database can see', () => {
+    const PROOF = 'docker ps shows no container for this task and the host was drained';
+
+    test('it records a proof about the current, lapsed, unsettled holder', async () => {
+        const key = leaseKey();
+        const generation = randomUUID();
+        await acquireExecutionLease(request(key, generation));
+        await lapseTerm(key);
+        assert.deepEqual(await recordVerifiedExecutorStop({ leaseKey: key, generation,
+            confirmGeneration: generation, proof: PROOF, recordedBy: 'operator:test' }), { recorded: true });
+        // It records a fact and nothing else: the lease still moves only through the ordinary
+        // atomic takeover, under the ordinary rules.
+        const row = await database('task_execution_leases').where({ lease_key: key }).first();
+        assert.equal(row.lease_generation, generation);
+        assert.equal(row.settled_at, null);
+    });
+
+    test('it refuses a live holder, a settled lease, a stale generation and an unconfirmed one', async () => {
+        const live = leaseKey();
+        const liveGeneration = randomUUID();
+        await acquireExecutionLease(request(live, liveGeneration));
+        assert.deepEqual(await recordVerifiedExecutorStop({ leaseKey: live, generation: liveGeneration,
+            confirmGeneration: liveGeneration, proof: PROOF, recordedBy: 'operator:test' }),
+        { recorded: false, refusal: 'the term has not lapsed, so the executor is still reporting itself alive' });
+
+        await lapseTerm(live);
+        assert.deepEqual(await recordVerifiedExecutorStop({ leaseKey: live, generation: liveGeneration,
+            confirmGeneration: randomUUID(), proof: PROOF, recordedBy: 'operator:test' }),
+        { recorded: false, refusal: 'the confirmation did not match the generation being declared stopped' });
+        assert.deepEqual(await recordVerifiedExecutorStop({ leaseKey: live, generation: randomUUID(),
+            confirmGeneration: 'mismatched', proof: PROOF, recordedBy: 'operator:test' }),
+        { recorded: false, refusal: 'the confirmation did not match the generation being declared stopped' });
+        const stale = randomUUID();
+        assert.deepEqual(await recordVerifiedExecutorStop({ leaseKey: live, generation: stale,
+            confirmGeneration: stale, proof: PROOF, recordedBy: 'operator:test' }),
+        { recorded: false, refusal: 'the named generation no longer holds this lease' });
+        assert.deepEqual(await recordVerifiedExecutorStop({ leaseKey: live, generation: liveGeneration,
+            confirmGeneration: liveGeneration, proof: 'gone', recordedBy: 'operator:test' }),
+        { recorded: false, refusal: 'the proof must state what was verified, in the operator\'s own words' });
+        assert.deepEqual(await recordVerifiedExecutorStop({ leaseKey: live, generation: liveGeneration,
+            confirmGeneration: liveGeneration, proof: PROOF, recordedBy: '  ' }),
+        { recorded: false, refusal: 'the proof must state what was verified, in the operator\'s own words' });
+        assert.equal(await proofRow(live, liveGeneration), undefined, 'and nothing was written by any of them');
+
+        const settled = leaseKey();
+        const settledGeneration = randomUUID();
+        await acquireExecutionLease(request(settled, settledGeneration));
+        await settleExecutionLease({ leaseKey: settled, generation: settledGeneration, expiresAt: '' }, 'completed');
+        await lapseTerm(settled);
+        assert.deepEqual(await recordVerifiedExecutorStop({ leaseKey: settled, generation: settledGeneration,
+            confirmGeneration: settledGeneration, proof: PROOF, recordedBy: 'operator:test' }),
+        { recorded: false, refusal: 'the lease is settled and needs no reconciliation' });
+
+        assert.deepEqual(await recordVerifiedExecutorStop({ leaseKey: leaseKey(), generation: randomUUID(),
+            confirmGeneration: 'no', proof: PROOF, recordedBy: 'operator:test' }),
+        { recorded: false, refusal: 'the confirmation did not match the generation being declared stopped' });
+    });
+
+    test('it refuses to stack a second admission on a proof that already exists or is spent', async () => {
+        const key = leaseKey();
+        const generation = randomUUID();
+        await acquireExecutionLease(request(key, generation));
+        await lapseTerm(key);
+        const declare = () => recordVerifiedExecutorStop({ leaseKey: key, generation,
+            confirmGeneration: generation, proof: PROOF, recordedBy: 'operator:test' });
+        assert.deepEqual(await declare(), { recorded: true });
+        assert.deepEqual(await declare(), { recorded: false, refusal: 'a proof for this generation is already on file' });
+        assert.equal((await acquireExecutionLease(request(key, randomUUID()))).outcome, 'acquired');
+        await lapseTerm(key);
+        assert.deepEqual(await declare(), { recorded: false, refusal: 'the named generation no longer holds this lease' });
     });
 });

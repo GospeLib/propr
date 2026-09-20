@@ -21,6 +21,7 @@ import {
 } from '@propr/shared';
 import { QueueBroadcaster } from './queueBroadcaster.js';
 import { TaskWatcherManager } from './taskWatcher.js';
+import { EzerStreamingService, EZER_REDIS_CHANNEL } from '../ep-ezer-follow-ups-s02.js';
 import {
   configureSocketAuthentication,
   type SocketAuthenticationOptions,
@@ -117,6 +118,7 @@ export class SocketService {
   private taskUpdateTails = new Map<string, Promise<void>>();
   private draftUpdateTails = new Map<string, Promise<void>>();
   private notificationProjection: NotificationProjectionService | null = null;
+  private ezerStreaming = new EzerStreamingService();
 
   constructor(
     httpServer: HttpServer,
@@ -151,6 +153,7 @@ export class SocketService {
       getQueueDependencies: () => this.queueDeps,
       getQueueBroadcaster: () => this.queueBroadcaster,
       taskWatcherManager: this.taskWatcherManager,
+      getEzerStreaming: () => this.ezerStreaming,
     });
 
     this.setupConnectionHandlers();
@@ -193,12 +196,20 @@ export class SocketService {
         REDIS_CHANNELS.DRAFTS,
         REDIS_CHANNELS.INDEXING,
         REDIS_CHANNELS.LIVE_DETAILS,
-        REDIS_CHANNELS.QUEUE_STATS
+        REDIS_CHANNELS.QUEUE_STATS,
+        EZER_REDIS_CHANNEL
       );
       this.isSubscribed = true;
-      console.log('[SocketService] Subscribed to Redis channels:', Object.values(REDIS_CHANNELS));
+      console.log(
+        '[SocketService] Subscribed to Redis channels:',
+        [...Object.values(REDIS_CHANNELS), EZER_REDIS_CHANNEL],
+      );
 
       this.subscriber.on('message', (channel: string, message: string) => {
+        if (channel === EZER_REDIS_CHANNEL) {
+          this.ezerStreaming.ingestSerialized(message);
+          return;
+        }
         try {
           const payload = JSON.parse(message) as EventPayload;
           this.handleEvent(channel, payload);
@@ -379,6 +390,11 @@ export class SocketService {
     return this.io;
   }
 
+  /** Get the Ezer journal-projection stream (EP-ezer-follow-ups-S02). */
+  getEzerStreaming(): EzerStreamingService {
+    return this.ezerStreaming;
+  }
+
   /** Get the number of connected clients */
   async getConnectedClientsCount(): Promise<number> {
     const sockets = await this.io.fetchSockets();
@@ -416,6 +432,8 @@ export class SocketService {
       }
 
       this.notificationProjection?.close();
+
+      this.ezerStreaming.close();
 
       await this.taskWatcherManager.closeAll();
 

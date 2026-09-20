@@ -1,9 +1,25 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {createHmac} from 'node:crypto';
+import {readFileSync} from 'node:fs';
+import {fileURLToPath} from 'node:url';
 import {forwardRoutingOwnerEvent,replyMalformedOwnerCommand,EZER_NOT_OWNER_DISPOSITION,EZER_COMMAND_NOT_ADMITTED_DISPOSITION} from '../src/intake/routingOwnerEvent.js';
 import type {PaginatedOctokitInstance} from '../src/auth/githubAuth.js';
 const secret='owner-relay-test-secret-at-least-32-bytes',deliveryId='real-routing-delivery-1234',installationId='161226896';
+/**
+ * The supported event types are READ FROM the production intake source rather than assumed, so a
+ * newly supported comment event cannot silently reopen the bypass this file exists to close. The
+ * module is deliberately not imported: `webhookHandler` pulls in the whole runtime (database,
+ * queues, GitHub auth) and keeps handles open, which a unit test must not do.
+ */
+const SUPPORTED_WEBHOOK_EVENTS=(()=>{
+ const source=readFileSync(fileURLToPath(new URL('../src/webhook/webhookHandler.ts',import.meta.url)),'utf8');
+ const declaration=/export const SUPPORTED_WEBHOOK_EVENTS\s*=\s*\[([\s\S]*?)\]\s*as const;/.exec(source);
+ if(!declaration)throw new Error('SUPPORTED_WEBHOOK_EVENTS is no longer readable from the production intake source');
+ return [...declaration[1].matchAll(/'([a-z_]+)'/g)].map(match=>match[1]);
+})();
+/** Every supported event type that can carry a comment body — the full `/ezer` attack surface. */
+const COMMENT_EVENT_TYPES=SUPPORTED_WEBHOOK_EVENTS.filter(eventType=>eventType.includes('comment'));
 const ownerUserId='7',ownerAuthor={id:7,type:'User',login:'ezer-owner'};
 process.env.EZER_OWNER_GITHUB_USER_ID=ownerUserId;
 test('native read relay validates correlated settlement and never writes a GitHub reply',async()=>{
@@ -90,11 +106,32 @@ test('forwards original authenticated delivery metadata and exact payload with e
   const body=JSON.parse(raw);assert.equal(body.deliveryId,deliveryId);assert.equal(body.installationId,installationId);assert.deepEqual(body.payload,payload);assert.equal(body.kind,'propr-relay-owner-event');assert.equal(body.installationToken,undefined);return new Response(JSON.stringify({accepted:true}));
  }});assert.equal(result,true);assert.equal(calls,1);
 });
-for(const mode of ['disabled','installation','repository','edited','missing-config','refused'])test(`refuses ${mode} without normal execution fallback`,async()=>{
- const payload=fixture();if(mode==='repository')payload.repository.full_name='GospeLib/main';if(mode==='edited')payload.action='edited';let calls=0;
- await assert.rejects(()=>forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,mode==='installation'?'other':installationId,{enabled:mode!=='disabled',baseUrl:'http://ezer:8791',secret:mode==='missing-config'?'':secret,fetchImpl:async()=>{calls++;return new Response('{}',{status:403});}}),/OWNER_RELAY_/);
+// MUTABLE state only: a flag an operator flips, a secret an operator supplies, a relay that is
+// down. The identical redelivery can succeed, which is exactly what withholding the ACK is for.
+for(const mode of ['disabled','missing-config','refused'])test(`refuses ${mode} without normal execution fallback, and retries it`,async()=>{
+ const payload=fixture();let calls=0;
+ await assert.rejects(()=>forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{enabled:mode!=='disabled',baseUrl:'http://ezer:8791',secret:mode==='missing-config'?'':secret,fetchImpl:async()=>{calls++;return new Response('{}',{status:403});}}),/OWNER_RELAY_/);
  assert.equal(calls,mode==='refused'?1:0);
 });
+// IMMUTABLE binding bytes: the action, the repository and the installation are fixed in the
+// delivered payload, so no redelivery can ever repair them. Throwing here withheld the ACK and
+// had the relay redeliver one permanently unbindable comment forever. Each is terminal instead —
+// answered once where a reply can be bound, ACKed silently where it cannot, never relayed and
+// never handed to the ordinary comment dispatcher.
+for(const [mode,replied] of [['installation',false],['repository',true],['edited',false]] as const)
+ test(`refuses ${mode} terminally, with no relay call and no redelivery loop`,async()=>{
+  const payload=fixture();if(mode==='repository')payload.repository.full_name='GospeLib/main';if(mode==='edited')payload.action='edited';
+  let calls=0,replies=0;
+  const options={enabled:true,baseUrl:'http://ezer:8791',secret,replyMalformed:async(event:Record<string,unknown>)=>{assert.deepEqual(event,payload);replies++;},fetchImpl:async()=>{calls++;return new Response('{}',{status:403});}};
+  const handled=await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,mode==='installation'?'other':installationId,options);
+  // Truthy either way, so RoutingWebSocketIntakeService ACKs it exactly once and never dispatches.
+  if(replied)assert.equal(handled,true);else assert.deepEqual(handled,EZER_COMMAND_NOT_ADMITTED_DISPOSITION);
+  assert.equal(replies,replied?1:0);assert.equal(calls,0);
+  // An identical redelivery is re-ACKed the same way, bounded: the reply helper is idempotent on
+  // its own marker, and no relay call is made on either attempt.
+  const again=await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,mode==='installation'?'other':installationId,options);
+  assert.deepEqual(again,handled);assert.equal(calls,0);
+ });
 test('ordinary events and unapproved control kinds are never sent to owner relay',async()=>{
  const payload=fixture();let replies=0;
  const options={enabled:true,baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;},fetchImpl:async()=>{throw new Error('must not forward');}};
@@ -176,7 +213,11 @@ test('approved StopUnit carriage is exact main created-comment only and disabled
  const options={enabled:true,stopEnabled:true,baseUrl:'http://ezer:8791',secret,fetchImpl:async()=>{sent++;return new Response(JSON.stringify({accepted:true}));}};
  assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),true);assert.equal(sent,1);
  await assert.rejects(()=>forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{...options,stopEnabled:false}),/OWNER_STOP_RELAY_NOT_ENABLED/);
- payload.repository.full_name='GospeLib/product-hub';await assert.rejects(()=>forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,options),/DELIVERY_NOT_BOUND/);assert.equal(sent,1);
+ // The manifest repository is not a stop surface; the mismatch is fixed in the delivered bytes,
+ // so it is answered once and ACKed rather than thrown into an endless redelivery loop.
+ let replies=0;payload.repository.full_name='GospeLib/product-hub';
+ assert.equal(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{...options,replyMalformed:async()=>{replies++;}}),true);
+ assert.equal(sent,1);assert.equal(replies,1);
 });
 
 test('a valid stop command on a result PR receives ordinary refusal and never reaches execution admission',async()=>{
@@ -199,7 +240,14 @@ test('the separately approved manifest/retry extension forwards exact created co
  assert.equal(await forwardRoutingOwnerEvent(retry,'issue_comment',deliveryId,installationId,options),true);
  const lane=fixture();lane.repository.full_name='GospeLib/main';lane.comment.body='/ezer retry EP-real-S02-T02 2';
  assert.equal(await forwardRoutingOwnerEvent(lane,'issue_comment',deliveryId,installationId,options),true);assert.equal(sends,3);
- (retry as any).issue={number:90,pull_request:{url:'pr'}};await assert.rejects(()=>forwardRoutingOwnerEvent(retry,'issue_comment',deliveryId,installationId,options),/OWNER_RETRY_ISSUE_REQUIRED/);assert.equal(sends,3);
+ // Wrong surface for a retry (a PR) and for a manifest approval (an issue): both are fixed in
+ // the delivered bytes, so both are answered once and ACKed, never thrown and never relayed.
+ let replies=0;const bounded={...options,replyMalformed:async()=>{replies++;}};
+ (retry as any).issue={number:90,pull_request:{url:'pr'}};
+ assert.equal(await forwardRoutingOwnerEvent(retry,'issue_comment',deliveryId,installationId,bounded),true);
+ const manifestOnIssue=fixture();manifestOnIssue.comment.body=manifest.comment.body;
+ assert.equal(await forwardRoutingOwnerEvent(manifestOnIssue,'issue_comment',deliveryId,installationId,bounded),true);
+ assert.equal(sends,3);assert.equal(replies,2);
 });
 
 test('pause/resume require their disabled-by-default flag and never fall through on malformed or PR commands',async()=>{
@@ -331,4 +379,77 @@ test('a non-owner exact command is refused even with no configured owner id at a
   assert.deepEqual(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{enabled:true,stopEnabled:true,planControlEnabled:true,pauseEnabled:true,routeEnabled:true,readEnabled:true,ownerUserId:'',baseUrl:'http://ezer:8791',secret,
    fetchImpl:async()=>{throw new Error('must not forward');}}),EZER_NOT_OWNER_DISPOSITION);
  }
+});
+
+test('the supported comment event types are exactly the two this path claims',()=>{
+ // A new comment-bearing event type added to production intake fails here first, because the
+ // generic dispatcher's slash parser aliases `/ezer` to `/fix` on every comment surface.
+ assert.deepEqual(COMMENT_EVENT_TYPES,['issue_comment','pull_request_review_comment']);
+ assert.ok(SUPPORTED_WEBHOOK_EVENTS.includes('issue_comment'));
+});
+/** A `pull_request_review_comment` delivery: no `issue`, the PR carried at the top level. */
+function reviewCommentPayload(body:string,user:Record<string,unknown>){
+ return{action:'created',installation:{id:161226896},repository:{id:10,full_name:'GospeLib/main'},
+  pull_request:{number:2338,url:'https://api.github.com/repos/GospeLib/main/pulls/2338'},
+  comment:{id:66,body,pull_request_review_id:900,user:{...user}}};
+}
+// Every supported comment event type, not just `issue_comment`. A review comment IS delivered by
+// production intake, and returning it unhandled handed it to the generic dispatcher, whose slash
+// parser aliases `/ezer` to `/fix` — so with the DEFAULT admission configuration a stranger could
+// enqueue work from a PR review comment without ever passing `ownerAuthored`.
+for(const eventType of COMMENT_EVENT_TYPES)
+ for(const [who,user] of NON_OWNER_AUTHORS)
+  for(const [name,body] of [...EXACT_COMMANDS.map(([name,body])=>[name,body] as const),['free prose','/ezer please ship S02'] as const,['bare address','/ezer'] as const])
+   test(`a ${name} ${eventType} from ${who} is claimed and refused, never dispatched (${eventType})`,async()=>{
+    const payload=eventType==='issue_comment'
+     ?{...fixture(),repository:{id:10,full_name:'GospeLib/main'},issue:{id:20,number:90},comment:{id:66,body,user:{...user}}}
+     :reviewCommentPayload(body,user);
+    let replies=0,calls=0;
+    const outcome=await forwardRoutingOwnerEvent(payload,eventType,deliveryId,installationId,{
+     enabled:true,stopEnabled:true,planControlEnabled:true,pauseEnabled:true,routeEnabled:true,readEnabled:true,
+     baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;},
+     fetchImpl:async()=>{calls++;throw new Error('a non-owner comment must never reach the owner relay');}});
+    // Never falsy: a falsy result is what reaches the ordinary comment dispatcher.
+    assert.deepEqual(outcome,EZER_NOT_OWNER_DISPOSITION);
+    assert.equal(replies,0);assert.equal(calls,0);
+   });
+// Owner-authored, but on a surface no owner command is carried from. Terminal — not thrown (which
+// would loop a delivery whose event type can never change) and not unhandled.
+for(const [name,body] of EXACT_COMMANDS.map(([name,body])=>[name,body] as const).concat([['free prose','/ezer please ship S02'] as const]))
+ test(`an owner ${name} on a pull_request_review_comment is ACKed terminally, never admitted`,async()=>{
+  const payload=reviewCommentPayload(body,ownerAuthor);
+  let replies=0,calls=0,readbacks=0;
+  const outcome=await forwardRoutingOwnerEvent(payload,'pull_request_review_comment',deliveryId,installationId,{
+   enabled:true,stopEnabled:true,planControlEnabled:true,pauseEnabled:true,routeEnabled:true,readEnabled:true,
+   baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;},onReadback:async()=>{readbacks++;},
+   fetchImpl:async()=>{calls++;throw new Error('a review comment must never reach the owner relay');}});
+  assert.deepEqual(outcome,EZER_COMMAND_NOT_ADMITTED_DISPOSITION);
+  assert.equal(replies,0);assert.equal(calls,0);assert.equal(readbacks,0);
+  // Identical redelivery: same terminal ACK, still no reply and no relay call.
+  assert.deepEqual(await forwardRoutingOwnerEvent(payload,'pull_request_review_comment',deliveryId,installationId,{
+   enabled:true,baseUrl:'http://ezer:8791',secret,replyMalformed:async()=>{replies++;},
+   fetchImpl:async()=>{calls++;throw new Error('must not forward');}}),EZER_COMMAND_NOT_ADMITTED_DISPOSITION);
+  assert.equal(replies,0);assert.equal(calls,0);
+ });
+test('a comment-less supported event is still handed to the ordinary dispatcher',async()=>{
+ // The claim is on comment bodies, not on event types: an `issues` or `pull_request` delivery
+ // carries no comment and must keep falling through to normal handling.
+ for(const eventType of SUPPORTED_WEBHOOK_EVENTS.filter(type=>!COMMENT_EVENT_TYPES.includes(type)))
+  assert.equal(await forwardRoutingOwnerEvent({action:'opened',repository:{full_name:'GospeLib/main'},issue:{number:90,body:'/ezer ship it'}},eventType,deliveryId,installationId,
+   {enabled:true,baseUrl:'http://ezer:8791',secret,fetchImpl:async()=>{throw new Error('must not forward');}}),false);
+});
+test('a reply the production helper can never bind is ACKed terminally, not redelivered forever',async()=>{
+ // GitHub never un-edits a comment, so the helper's own permanent refusals repeat identically on
+ // every redelivery. Terminal here; anything that could succeed later still withholds the ACK.
+ const payload={...fixture(),repository:{full_name:'GospeLib/main'},issue:{number:90},comment:{id:66,body:'/ezer please ship S02',user:{...ownerAuthor}}};
+ for(const permanent of ['OWNER_COMMAND_REPLY_UNBOUND','OWNER_COMMAND_REPLY_NOT_AUTHORIZED','OWNER_COMMAND_REPLY_COMMENT_CHANGED','OWNER_COMMAND_REPLY_TARGET_CHANGED']){
+  let attempts=0;
+  assert.deepEqual(await forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{enabled:true,baseUrl:'http://ezer:8791',secret,
+   replyMalformed:async()=>{attempts++;throw new Error(permanent);},fetchImpl:async()=>{throw new Error('must not forward');}}),EZER_COMMAND_NOT_ADMITTED_DISPOSITION);
+  assert.equal(attempts,1);
+ }
+ let attempts=0;
+ await assert.rejects(()=>forwardRoutingOwnerEvent(payload,'issue_comment',deliveryId,installationId,{enabled:true,baseUrl:'http://ezer:8791',secret,
+  replyMalformed:async()=>{attempts++;throw new Error('HttpError: 502 posting comment');},fetchImpl:async()=>{throw new Error('must not forward');}}),/502/);
+ assert.equal(attempts,1);
 });

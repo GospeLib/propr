@@ -47,6 +47,23 @@ const EZER_NOT_OWNER_DISPOSITION:DeliveryDisposition=Object.freeze({status:'igno
 /** Owner-authored, but on a delivery this path can neither admit nor answer; see above. */
 const EZER_COMMAND_NOT_ADMITTED_DISPOSITION:DeliveryDisposition=Object.freeze({status:'ignored',reason:'ezer_command_not_admitted',billing:Object.freeze({seatConsumed:false})});
 export {EZER_NOT_OWNER_DISPOSITION,EZER_COMMAND_NOT_ADMITTED_DISPOSITION};
+/**
+ * The only comment event type an owner command is ever carried from. ProPR's intake supports
+ * exactly two comment-bearing GitHub events — `issue_comment` and `pull_request_review_comment`
+ * (see SUPPORTED_WEBHOOK_EVENTS in ../webhook/webhookHandler.ts) — and the ordinary dispatcher's
+ * slash parser aliases `/ezer` to `/fix` on BOTH. Every owner command binds to a planning issue
+ * or a contract pull request delivered as `issue_comment`; a review comment can carry none of
+ * them, but it must still be CLAIMED here rather than returned unhandled.
+ */
+const OWNER_COMMAND_EVENT_TYPE='issue_comment';
+/**
+ * Reply-helper refusals that are permanent for a given delivery: the comment was edited or
+ * removed after it was delivered, its target is not what the delivered bytes said, or the reply
+ * could never be bound at all. GitHub never un-edits a comment, so an identical redelivery hits
+ * the identical refusal — ACK terminally instead of looping. Anything else the helper throws (a
+ * GitHub read or write failure, an ambiguous POST) still propagates and is retried.
+ */
+const TERMINAL_REPLY_FAILURES=new Set(['OWNER_COMMAND_REPLY_UNBOUND','OWNER_COMMAND_REPLY_NOT_AUTHORIZED','OWNER_COMMAND_REPLY_COMMENT_CHANGED','OWNER_COMMAND_REPLY_TARGET_CHANGED']);
 interface Options{enabled:boolean;stopEnabled?:boolean;planControlEnabled?:boolean;pauseEnabled?:boolean;routeEnabled?:boolean;readEnabled?:boolean;baseUrl:string;secret:string;ownerUserId?:string;fetchImpl?:typeof fetch;now?:()=>Date;replyMalformed?:(event:Record<string,unknown>,deliveryId:string)=>Promise<void>;onReadback?:(result:Record<string,unknown>)=>Promise<void>;}
 function object(value:unknown):Record<string,unknown>{return value!==null&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};}
 /**
@@ -84,13 +101,17 @@ export async function replyMalformedOwnerCommand(event:Record<string,unknown>,de
  const routeControl=ROUTE_COMMAND.test(trimmed);
  const pauseControl=PAUSE_COMMAND.test(trimmed)||RESUME_COMMAND.test(trimmed);
  const wrongStopSurface=STOP_COMMAND.test(trimmed)&&Boolean(issue.pull_request);
+ // An EXACT plan control on the wrong surface: `retry` belongs on an execution issue and
+ // `approve` on a contract pull request. Told apart from `unrecognized` for the same reason as
+ // `readControl` — the owner is not told a real command matches nothing.
+ const wrongPlanSurface=(RETRY_COMMAND.test(trimmed)&&Boolean(issue.pull_request))||(MANIFEST_COMMAND.test(trimmed)&&!issue.pull_request);
  const checkpointControl=OWNER_COMMAND_PREFIX.test(trimmed)&&!OWNER_COMMAND.test(trimmed);
  // An EXACT read command that could not be bound to a planning issue — the wrong surface, not
  // the wrong words. Told apart from `unrecognized` so the owner is not answered "this matches no
  // Ezer command" about a command that plainly is one.
  const readControl=READ_COMMAND.test(trimmed);
  // Anything else addressed to Ezer — free prose, or a recognised verb with wrong arguments.
- const unrecognized=!readControl&&!routeControl&&!pauseControl&&!wrongStopSurface&&!checkpointControl;
+ const unrecognized=!readControl&&!routeControl&&!pauseControl&&!wrongStopSurface&&!wrongPlanSurface&&!checkpointControl;
  // Answered on the comment's own surface whenever the event carries one (the owner wrote it
  // there), never on a repository inferred from a command it does not contain.
  const eventRepository=String(object(event.repository).full_name??'');
@@ -101,8 +122,8 @@ export async function replyMalformedOwnerCommand(event:Record<string,unknown>,de
  const {data:actual}=await api.request('GET /repos/{owner}/{repo}/issues/comments/{comment_id}',{owner,repo,comment_id:Number(comment.id)});
  if(actual.body!==comment.body||actual.user?.id!==actor.id||actual.created_at!==comment.created_at||actual.updated_at!==comment.updated_at||actual.created_at!==actual.updated_at||actual.issue_url!==`https://api.github.com/repos/${repository}/issues/${issue.number}`)throw new Error('OWNER_COMMAND_REPLY_COMMENT_CHANGED');
  if(wrongStopSurface){const {data:target}=await api.request('GET /repos/{owner}/{repo}/issues/{issue_number}',{owner,repo,issue_number:Number(issue.number)});if(!target.pull_request)throw new Error('OWNER_COMMAND_REPLY_TARGET_CHANGED');}
- const marker=`<!-- idempotency-key: ezer-invalid-${unrecognized?'unknown-command':readControl?'unit-read':routeControl?'unit-route':pauseControl?'unit-pause':wrongStopSurface?'running-stop':'review-stop'}-${comment.id} -->`;
- const body=readControl?`Could not answer the read requested in comment ${comment.id}: READ_COMMAND_NOT_ADMITTED.\n\nPost \`/ezer help\` or \`/ezer status\` on an Ezer planning issue in ${STOP_REPOSITORY} — not on a pull request — with the read capability enabled. A read reports what Ezer already holds; it plans, approves, starts and changes nothing, and this refusal read nothing and requested no execution.\n\n${marker}`:unrecognized?`Could not act on comment ${comment.id}: EZER_COMMAND_NOT_RECOGNIZED.\n\nComments beginning with \`/ezer\` are read as commands, not as instructions in prose. This comment matches no Ezer command, so nothing was planned, approved, paused, routed, retried or stopped, and no work was started or changed by it. Post \`/ezer help\` on a planning issue for the exact commands and their arguments. To direct new work, take it through the normal planning lifecycle rather than a free-text comment.\n\n${marker}`:routeControl?`Could not apply the route requested in comment ${comment.id}: CHANGE_ROUTE_COMMAND_NOT_ADMITTED.\n\nUse the exact command from Ezer on the canonical unit issue, with ChangeRoute enabled. A route selects one currently configured agent/model for the next unprepared admission. It does not change running work, scope or budget. No route or execution was requested by this refusal.\n\n${marker}`:pauseControl?`Could not apply the unit pause/resume requested in comment ${comment.id}: UNIT_PAUSE_COMMAND_NOT_ADMITTED.\n\nUse the current Ezer pause/resume command on the original execution issue, with the capability enabled and exact canonical unit ID; resume also requires the full current pause-event ID. PR comments cannot authorize this control or a repository correction. Pause lets the current worker finish under its original deadline and holds canonical continuation; resume releases only that recorded hold. No pause, resume or execution was requested by this refusal.\n\n${marker}`:wrongStopSurface?`Could not stop work requested in comment ${comment.id}: STOP_COMMAND_REQUIRES_EXECUTION_ISSUE.\n\nThis is a result pull request. Use Ezer's current running-work stop command on the original execution issue while that exact task is still running. Completed work cannot be cancelled. This PR comment cannot authorize a stop or repository correction. This refusal performs no stop and requests no execution. Check the originating Ezer lifecycle for the task's actual result.\n\n${marker}`:`Could not accept the review checkpoint requested in comment ${comment.id}: INVALID_REVIEW_STOP_COMMAND.\n\nPost a fresh, unedited comment using the complete command from Ezer's planning review status on one line. It must contain the exact stop ID, 40-character revision, sha256 digest with all 64 hexadecimal characters, and review comment ID, separated by single spaces. No review stop was accepted; no approval or execution occurred.\n\n${marker}`;
+ const marker=`<!-- idempotency-key: ezer-invalid-${unrecognized?'unknown-command':readControl?'unit-read':routeControl?'unit-route':pauseControl?'unit-pause':wrongPlanSurface?'unit-plan':wrongStopSurface?'running-stop':'review-stop'}-${comment.id} -->`;
+ const body=readControl?`Could not answer the read requested in comment ${comment.id}: READ_COMMAND_NOT_ADMITTED.\n\nPost \`/ezer help\` or \`/ezer status\` on an Ezer planning issue in ${STOP_REPOSITORY} — not on a pull request — with the read capability enabled. A read reports what Ezer already holds; it plans, approves, starts and changes nothing, and this refusal read nothing and requested no execution.\n\n${marker}`:unrecognized?`Could not act on comment ${comment.id}: EZER_COMMAND_NOT_RECOGNIZED.\n\nComments beginning with \`/ezer\` are read as commands, not as instructions in prose. This comment matches no Ezer command, so nothing was planned, approved, paused, routed, retried or stopped, and no work was started or changed by it. Post \`/ezer help\` on a planning issue for the exact commands and their arguments. To direct new work, take it through the normal planning lifecycle rather than a free-text comment.\n\n${marker}`:routeControl?`Could not apply the route requested in comment ${comment.id}: CHANGE_ROUTE_COMMAND_NOT_ADMITTED.\n\nUse the exact command from Ezer on the canonical unit issue, with ChangeRoute enabled. A route selects one currently configured agent/model for the next unprepared admission. It does not change running work, scope or budget. No route or execution was requested by this refusal.\n\n${marker}`:pauseControl?`Could not apply the unit pause/resume requested in comment ${comment.id}: UNIT_PAUSE_COMMAND_NOT_ADMITTED.\n\nUse the current Ezer pause/resume command on the original execution issue, with the capability enabled and exact canonical unit ID; resume also requires the full current pause-event ID. PR comments cannot authorize this control or a repository correction. Pause lets the current worker finish under its original deadline and holds canonical continuation; resume releases only that recorded hold. No pause, resume or execution was requested by this refusal.\n\n${marker}`:wrongPlanSurface?`Could not apply the plan control requested in comment ${comment.id}: PLAN_CONTROL_COMMAND_WRONG_SURFACE.\n\nPost \`/ezer retry\` on the original execution issue, and \`/ezer approve\` on the contract pull request it was requested from. This comment names the other surface, so nothing was retried, approved, started or changed by it, and no execution was requested by this refusal.\n\n${marker}`:wrongStopSurface?`Could not stop work requested in comment ${comment.id}: STOP_COMMAND_REQUIRES_EXECUTION_ISSUE.\n\nThis is a result pull request. Use Ezer's current running-work stop command on the original execution issue while that exact task is still running. Completed work cannot be cancelled. This PR comment cannot authorize a stop or repository correction. This refusal performs no stop and requests no execution. Check the originating Ezer lifecycle for the task's actual result.\n\n${marker}`:`Could not accept the review checkpoint requested in comment ${comment.id}: INVALID_REVIEW_STOP_COMMAND.\n\nPost a fresh, unedited comment using the complete command from Ezer's planning review status on one line. It must contain the exact stop ID, 40-character revision, sha256 digest with all 64 hexadecimal characters, and review comment ID, separated by single spaces. No review stop was accepted; no approval or execution occurred.\n\n${marker}`;
  const reply=makeIdempotent(
   ()=>api.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments',{owner,repo,issue_number:Number(issue.number),body}),
   async()=>{const comments=await api.paginate('GET /repos/{owner}/{repo}/issues/{issue_number}/comments',{owner,repo,issue_number:Number(issue.number),per_page:COMMENT_PAGE_SIZE});return comments.some(x=>x.user?.type==='Bot'&&x.body?.includes(marker));},
@@ -112,9 +133,15 @@ export async function replyMalformedOwnerCommand(event:Record<string,unknown>,de
  await reply();
 }
 export async function forwardRoutingOwnerEvent(payload:unknown,eventType:string,deliveryId:string,installationId:unknown,options:Options={enabled:process.env.EZER_OWNER_RELAY_ENABLED==='true',stopEnabled:process.env.EZER_OWNER_STOP_ENABLED==='true',planControlEnabled:process.env.EZER_OWNER_PLAN_CONTROL_ENABLED==='true',pauseEnabled:process.env.EZER_OWNER_PAUSE_ENABLED==='true',routeEnabled:process.env.EZER_OWNER_ROUTE_ENABLED==='true',readEnabled:process.env.EZER_OWNER_READ_ENABLED==='true',baseUrl:process.env.EZER_OWNER_RELAY_BASE_URL??'',secret:process.env.EZER_INTERNAL_API_SECRET??''}):Promise<boolean|DeliveryDisposition>{
- const event=object(payload),comment=object(event.comment),repository=object(event.repository),installation=object(event.installation);
- if(eventType!=='issue_comment'||typeof comment.body!=='string')return false;
- const body=comment.body.trim(),isStop=STOP_COMMAND.test(body),isManifest=MANIFEST_COMMAND.test(body),isRetry=RETRY_COMMAND.test(body),isPlanControl=PLAN_COMMAND_PREFIX.test(body),isPauseControl=PAUSE_COMMAND_PREFIX.test(body),isRouteControl=ROUTE_COMMAND_PREFIX.test(body);
+ const event=object(payload),comment=object(event.comment),repository=object(event.repository),installation=object(event.installation),issue=object(event.issue);
+ // Claimed on EVERY comment-bearing delivery, whatever the event type. Gating this path on
+ // `issue_comment` handed every `/ezer` PULL REQUEST REVIEW comment straight to the ordinary
+ // dispatcher, whose slash parser aliases `/ezer` to `/fix` — so with the default (unprotected)
+ // admission configuration a stranger's review comment could invalidate automatic work and
+ // enqueue a fix job without ever passing `ownerAuthored`. Anything carrying a comment body is
+ // inspected here instead, and nothing addressed to Ezer is ever returned unhandled.
+ if(typeof comment.body!=='string')return false;
+ const body=comment.body.trim();
  // Not addressed to Ezer at all: an ordinary comment, handled by the normal path.
  if(!EZER_ADDRESS_PREFIX.test(body))return false;
  // FAIL CLOSED FIRST, before every capability check and before any relay call: only the
@@ -123,65 +150,80 @@ export async function forwardRoutingOwnerEvent(payload:unknown,eventType:string,
  // relay, no GitHub read, no bot reply, and no fall-through to the ordinary comment dispatcher —
  // and is ACKed `ignored`, so a stranger can neither consume work nor loop the delivery.
  if(!ownerAuthored(comment,configuredOwnerUserId(options)))return EZER_NOT_OWNER_DISPOSITION;
+ // Owner-authored, but on a comment surface from which no owner command is ever carried. The
+ // event type is a property of the delivered bytes, so redelivery cannot change it: ACK
+ // terminally, with no reply and no fall-through.
+ if(eventType!==OWNER_COMMAND_EVENT_TYPE)return EZER_COMMAND_NOT_ADMITTED_DISPOSITION;
+ const isStop=STOP_COMMAND.test(body),isManifest=MANIFEST_COMMAND.test(body),isRetry=RETRY_COMMAND.test(body),isPlanControl=PLAN_COMMAND_PREFIX.test(body),isPauseControl=PAUSE_COMMAND_PREFIX.test(body),isRouteControl=ROUTE_COMMAND_PREFIX.test(body);
  const boundDelivery=event.action==='created'&&OWNER_SURFACE_REPOSITORIES.has(String(repository.full_name))&&String(installationId)===OWNER_RELAY_INSTALLATION&&String(installation.id)===OWNER_RELAY_INSTALLATION;
+ /**
+  * The single terminal refusal for an owner-authored delivery this path can neither admit nor
+  * relay. Bounded idempotent feedback is attempted only where a reply can ACTUALLY be bound: a
+  * `created` delivery, on a surface Ezer answers on, from the expected installation. Every one of
+  * those is a property of the DELIVERED BYTES, so an identical redelivery can never satisfy it —
+  * throwing withheld the ACK and had the relay redeliver the same permanently unbindable comment
+  * forever. Where the reply cannot be bound the delivery is ACKed `ignored` without any GitHub
+  * call at all, and a reply the helper itself refuses permanently (an edited or removed comment,
+  * a changed target, an unbindable shape) is ACKed the same way rather than retried. Neither
+  * outcome consumes a seat, and neither ever falls through to the ordinary comment dispatcher.
+  */
+ const answer=async():Promise<boolean|DeliveryDisposition>=>{
+  if(!boundDelivery)return EZER_COMMAND_NOT_ADMITTED_DISPOSITION;
+  try{await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);}
+  catch(error){if(TERMINAL_REPLY_FAILURES.has((error as Error).message))return EZER_COMMAND_NOT_ADMITTED_DISPOSITION;throw error;}
+  return true;
+ };
  // An exact command is the only thing ever admitted or relayed. Everything else addressed to
  // Ezer — a recognised verb with wrong arguments just as much as free prose — is answered once
  // with bounded idempotent feedback and ACKed, never thrown, so a permanently invalid comment
  // can never drive endless relay redelivery.
  const isExactCommand=READ_COMMAND.test(body)||isStop||isManifest||isRetry||PAUSE_COMMAND.test(body)||RESUME_COMMAND.test(body)||ROUTE_COMMAND.test(body)||OWNER_COMMAND.test(body);
  if(!isExactCommand){
-  // An unbound or relay-disabled delivery is consumed terminally rather than thrown, so stray
-  // `/ezer` chatter can never withhold an ACK — and rather than fallen through, so it can never
-  // reach the ordinary comment dispatcher either. `boundDelivery` requires `action === 'created'`,
-  // which is also what the reply helper requires (it re-reads the comment and refuses one whose
-  // `updated_at` moved), so an edited comment is never answered and never loops.
-  if(!options.enabled||!boundDelivery)return EZER_COMMAND_NOT_ADMITTED_DISPOSITION;
-  await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);
-  return true;
+  // A relay-disabled delivery is consumed terminally rather than thrown, so stray `/ezer`
+  // chatter can never withhold an ACK — and rather than fallen through, so it can never reach
+  // the ordinary comment dispatcher either.
+  if(!options.enabled)return EZER_COMMAND_NOT_ADMITTED_DISPOSITION;
+  return answer();
  }
- // An exact command whose capability is off, or which names the wrong surface, is refused the
- // same bounded way — but only where a reply can actually be bound: on a surface Ezer answers
- // on, and on a `created` delivery. An EDITED comment can never be answered, because the reply
- // helper re-reads it and refuses any comment whose `updated_at` has moved from its `created_at`;
- // calling it anyway threw, withheld the ACK, and had the relay redeliver the same permanently
- // unbindable comment forever. Both conditions are properties of the delivered bytes, so
- // redelivery cannot change them: ACK terminally, without a reply, instead.
- const refuse=async():Promise<boolean|DeliveryDisposition>=>{if(event.action!=='created'||!OWNER_SURFACE_REPOSITORIES.has(String(repository.full_name)))return EZER_COMMAND_NOT_ADMITTED_DISPOSITION;await(options.replyMalformed??replyMalformedOwnerCommand)(event,deliveryId);return true;};
  if(READ_COMMAND_PREFIX.test(body)){
   // TRANSIENT, so still thrown: a capability an operator turns on makes the SAME redelivery
   // succeed, which is exactly what withholding the ACK is for.
   if(!options.enabled||!options.readEnabled)throw Error('OWNER_READ_RELAY_NOT_ENABLED');
   const command=READ_COMMAND.exec(body);
   // PERMANENTLY UNBINDABLE, so never thrown. Every condition here is a property of the delivered
-  // payload itself — action, surface repository, issue-vs-PR, installation — so redelivery
-  // carries identical bytes and can never satisfy it. Throwing withheld the ACK and had the
-  // relay redeliver one permanently unbindable comment forever; that is the failure class
-  // 7382569b closed for malformed commands, and a read command on a PR surface was still in it.
-  // Answered once, bounded and idempotent, on the comment's own surface, then ACKed. Everything
-  // below that could succeed later — the relay POST, a receipt that does not correlate — still
-  // throws and is retried.
-  if(!command||event.action!=='created'||repository.full_name!==STOP_REPOSITORY||object(event.issue).pull_request||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)return refuse();
-  const receipt=await relay(event,eventType,deliveryId,installationId,options),correlation=object(receipt.correlation),result=object(receipt.result),links=object(result.links),issue=object(event.issue);
+  // payload itself — action, surface repository, issue-vs-PR, installation, and the numeric
+  // repository/issue identities the read session is keyed on — so redelivery carries identical
+  // bytes and can never satisfy it. Answered once, bounded and idempotent, on the comment's own
+  // surface, then ACKed. Everything below that could succeed later — the relay POST, a receipt
+  // that does not correlate — still throws and is retried.
+  if(!command||event.action!=='created'||repository.full_name!==STOP_REPOSITORY||issue.pull_request||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION||!Number.isSafeInteger(repository.id)||!Number.isSafeInteger(issue.id))return answer();
+  const receipt=await relay(event,eventType,deliveryId,installationId,options),correlation=object(receipt.correlation),result=object(receipt.result),links=object(result.links);
   const sessionId=`${READ_SESSION_NAMESPACE}:${repository.id}:${issue.id}`;
-  if(!Number.isSafeInteger(repository.id)||!Number.isSafeInteger(issue.id)||typeof receipt.operationId!=='string'||correlation.operationId!==receipt.operationId||result.operationId!==receipt.operationId||correlation.repository!==STOP_REPOSITORY||correlation.issueNumber!==issue.number||correlation.commentId!==comment.id||correlation.sessionId!==sessionId||links.sessionId!==sessionId||result.state!=='SUCCEEDED'||links.command!==command[1]||typeof links.text!=='string')throw Error('OWNER_READ_REPLY_NOT_BOUND');
+  if(typeof receipt.operationId!=='string'||correlation.operationId!==receipt.operationId||result.operationId!==receipt.operationId||correlation.repository!==STOP_REPOSITORY||correlation.issueNumber!==issue.number||correlation.commentId!==comment.id||correlation.sessionId!==sessionId||links.sessionId!==sessionId||result.state!=='SUCCEEDED'||links.command!==command[1]||typeof links.text!=='string')throw Error('OWNER_READ_REPLY_NOT_BOUND');
   if(options.onReadback)await options.onReadback(receipt);else log.info({deliveryId,readback:receipt},'Ezer authenticated native read settled');
   return true;
  }
+ // Wrong action, wrong repository, wrong installation: all properties of the delivered bytes, so
+ // all terminal rather than thrown. `answer()` decides whether the owner can be told.
  if(isRouteControl){
-  if(event.action!=='created'||repository.full_name!==STOP_REPOSITORY||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)throw new Error('OWNER_RELAY_DELIVERY_NOT_BOUND');
-  if(!options.enabled||!options.routeEnabled||object(event.issue).pull_request)return refuse();
+  if(event.action!=='created'||repository.full_name!==STOP_REPOSITORY||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)return answer();
+  if(!options.enabled||!options.routeEnabled||issue.pull_request)return answer();
  }
  if(isPauseControl){
-  if(event.action!=='created'||repository.full_name!==STOP_REPOSITORY||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)throw new Error('OWNER_RELAY_DELIVERY_NOT_BOUND');
-  if(!options.enabled||!options.pauseEnabled||object(event.issue).pull_request)return refuse();
+  if(event.action!=='created'||repository.full_name!==STOP_REPOSITORY||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)return answer();
+  if(!options.enabled||!options.pauseEnabled||issue.pull_request)return answer();
  }
+ // MUTABLE CONFIGURATION, so still thrown: an operator flipping the flag makes the identical
+ // redelivery succeed.
  if(isPlanControl&&!options.planControlEnabled)throw new Error('OWNER_PLAN_CONTROL_RELAY_NOT_ENABLED');
  if(isStop&&!options.stopEnabled)throw new Error('OWNER_STOP_RELAY_NOT_ENABLED');
  if(!options.enabled)throw new Error('OWNER_RELAY_NOT_ENABLED');
- if(event.action!=='created'||repository.full_name!==((isStop||isRetry||isPauseControl||isRouteControl)?STOP_REPOSITORY:OWNER_RELAY_REPOSITORY)||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)throw new Error('OWNER_RELAY_DELIVERY_NOT_BOUND');
- if(isRetry&&object(event.issue).pull_request)throw new Error('OWNER_RETRY_ISSUE_REQUIRED');
- if(isManifest&&!object(event.issue).pull_request)throw new Error('OWNER_MANIFEST_CONTRACT_PR_REQUIRED');
- if(isStop&&object(event.issue).pull_request)return refuse();
+ if(event.action!=='created'||repository.full_name!==((isStop||isRetry||isPauseControl||isRouteControl)?STOP_REPOSITORY:OWNER_RELAY_REPOSITORY)||String(installationId)!==OWNER_RELAY_INSTALLATION||String(installation.id)!==OWNER_RELAY_INSTALLATION)return answer();
+ // Issue-vs-PR is likewise fixed in the delivered bytes: a retry belongs on an execution issue,
+ // a manifest approval on the contract pull request, a stop on the execution issue.
+ if(isRetry&&issue.pull_request)return answer();
+ if(isManifest&&!issue.pull_request)return answer();
+ if(isStop&&issue.pull_request)return answer();
  await relay(event,eventType,deliveryId,installationId,options);
  return true;
 }

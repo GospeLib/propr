@@ -68,8 +68,15 @@ export const COMPLETION_HISTORY_NOT_DURABLE = 'COMPLETION_HISTORY_NOT_DURABLE';
 export const DURABLE_COMPLETION_ABSENT = 'DURABLE_COMPLETION_ABSENT';
 const MAX_DURABLE_COMPLETION_ATTEMPTS = 3;
 const DURABLE_COMPLETION_RETRY_DELAY_MS = 50;
-/** The settlement is its own logical transition of the same operation, and claims its own key. */
-const COMPLETION_PERSISTENCE_FAILED_SUFFIX = '#completion-persistence-failed';
+/**
+ * The settlement is its own logical transition of the same operation, and claims its own key.
+ *
+ * Exported because a caller that has to know whether ANY terminal record of its operation became
+ * durable — the native-analysis route, deciding whether it may hand its execution lease back —
+ * must be able to derive this identity too. Guessing it, or omitting it, would read a settled
+ * operation as unsettled and re-admit paid work.
+ */
+export const COMPLETION_PERSISTENCE_FAILED_SUFFIX = '#completion-persistence-failed';
 
 type CompletionStateManager = Pick<WorkerStateManager, 'updateTaskState' | 'markTaskFailed' | 'projectDurableCompletion'>;
 

@@ -191,7 +191,11 @@ export async function publishTaskStateTransition(
     };
 
     try {
-        await db('task_history').insert({
+        // A caller with a durable record of its own — the execution lease is the one that matters,
+        // because a terminal state whose lease is not settled re-admits paid work — commits it in
+        // THIS transaction. Without one, the insert runs exactly as it always has: a transaction
+        // held open around a write nobody needs to join buys nothing and blocks other writers.
+        const historyRow = {
             task_id: taskId,
             state: state.state,
             timestamp: state.updatedAt,
@@ -209,7 +213,16 @@ export async function publishTaskStateTransition(
                 prResult: metadata.prResult,
                 commitHash: metadata.commitHash,
             }),
-        });
+        };
+        if (metadata.durableCommit) {
+            const durableCommit = metadata.durableCommit;
+            await db.transaction(async transaction => {
+                await transaction('task_history').insert(historyRow);
+                await durableCommit(transaction);
+            });
+        } else {
+            await db('task_history').insert(historyRow);
+        }
         publication.historyPersisted = true;
         correlatedLogger.debug({ taskId, newState: state.state }, 'Task state update persisted to database');
     } catch (error) {

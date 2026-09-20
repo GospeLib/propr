@@ -168,9 +168,55 @@ function leaseQuery() {
     return query;
 }
 
-const databaseTable = (table: string) => table === 'task_terminal_transitions' ? claimQuery()
+interface ProofRow {
+    lease_key: string; lease_generation: string; proof: string; recorded_by: string;
+    recorded_at: string; consumed_at: string | null; consumed_by_generation: string | null;
+}
+const proofRows: ProofRow[] = [];
+
+/** The stop-proof table: an insert that admits one row per (key, generation), consumed by update. */
+function proofQuery() {
+    let criteria: Record<string, unknown> = {};
+    const nullColumns: string[] = [];
+    const matches = (row: ProofRow) =>
+        Object.entries(criteria).every(([key, value]) => row[key as keyof ProofRow] === value)
+        && nullColumns.every(column => row[column as keyof ProofRow] == null);
+    const append = async (row: ProofRow) => {
+        if (!proofRows.some(existing => existing.lease_key === row.lease_key
+            && existing.lease_generation === row.lease_generation)) proofRows.push({ ...row });
+        return [proofRows.length];
+    };
+    const query = {
+        insert: (row: ProofRow) => Object.assign(lazyResult(() => append(row)), {
+            onConflict: () => ({ ignore: () => lazyResult(() => append(row)) }),
+        }),
+        where: (value: Record<string, unknown>) => { criteria = { ...criteria, ...value }; return query; },
+        whereNull: (column: string) => { nullColumns.push(column); return query; },
+        first: async () => { const row = proofRows.find(matches); return row ? { ...row } : undefined; },
+        update: async (values: Partial<ProofRow>) => {
+            const affected = proofRows.filter(matches);
+            for (const row of affected) Object.assign(row, values);
+            return affected.length;
+        },
+    };
+    return query;
+}
+
+const tableDouble = (table: string) => table === 'task_terminal_transitions' ? claimQuery()
     : table === 'task_execution_leases' ? leaseQuery()
+    : table === 'task_execution_lease_stop_proofs' ? proofQuery()
     : table === 'tasks' ? tasksQuery() : historyQuery();
+/**
+ * The connection double, with the two things the route's settlement now needs of it: a clock read
+ * from the database rather than the process, and a transaction the terminal write and the lease
+ * settlement can share. The transaction here runs its body against the same tables — the ATOMICITY
+ * of that pair is asserted against real SQLite in `nativeAnalysisTerminalLeaseAtomicity.test.ts`,
+ * which is where a statement-level property belongs.
+ */
+const databaseTable = Object.assign(tableDouble, {
+    raw: async () => [{ now: new Date().toISOString() }],
+    transaction: async (run: (transaction: typeof databaseTable) => Promise<void>) => run(databaseTable),
+});
 
 await mock.module('../packages/core/src/db/connection.js', { namedExports: { db: databaseTable } });
 await mock.module('../packages/core/src/utils/eventPublisher.js', {
@@ -182,16 +228,18 @@ await mock.module('../packages/core/src/utils/logger.js', {
     namedExports: { generateCorrelationId: () => 'correlation-native-identity' },
 });
 
-const { claimTerminalTransition, terminalTransitionId, durableOperationIdentity } =
+const { claimTerminalTransition, terminalTransitionId, durableOperationIdentity, durableTerminalTransitionRecorded } =
     await import('../packages/core/src/utils/terminalTransitionClaim.js');
 const { durableExecutionCompletionGuard, nonExecutingCompletionGuard, isCompletionGuard, assertCompletionGuarded } =
     await import('../packages/core/src/utils/completionGuard.js');
 const { COMPLETION_DURABILITY_UNVERIFIABLE, CompletionDurabilityUnverifiableError, isCompletionDurabilityUnverifiable } =
     await import('../packages/core/src/utils/completionDurabilityOutcome.js');
 const { WorkerStateManager } = await import('../packages/core/src/utils/workerStateManager.js');
-const { publishCompletedWithDurableExecutionEvidence, certifyDurableCompletion, isDurableCompletionAbsent } =
+const { publishCompletedWithDurableExecutionEvidence, certifyDurableCompletion, isDurableCompletionAbsent,
+    COMPLETION_PERSISTENCE_FAILED_SUFFIX } =
     await import('../packages/core/src/utils/durableCompletionBarrier.js');
-const { acquireExecutionLease, releaseExecutionLease, renewExecutionLease, settleExecutionLease, startExecutionLeaseRenewal } =
+const { acquireExecutionLease, recordExecutorStopProof, releaseExecutionLease, renewExecutionLease,
+    settleExecutionLease, startExecutionLeaseRenewal } =
     await import('../packages/core/src/utils/executionLease.js');
 
 class SyntheticAgent {}
@@ -206,7 +254,8 @@ await mock.module('@propr/core', {
         getStateManager: () => { throw new Error('the test supplies its own state manager'); },
         runWithExecutionAbortSignal: async <T>(_signal: AbortSignal, run: () => Promise<T>) => run(),
         runWithPlannerAbortContext: async <T>(_taskId: string, _generation: string, run: () => Promise<T>) => run(),
-        durableOperationIdentity, claimTerminalTransition, terminalTransitionId,
+        durableOperationIdentity, claimTerminalTransition, terminalTransitionId, durableTerminalTransitionRecorded,
+        COMPLETION_PERSISTENCE_FAILED_SUFFIX, recordExecutorStopProof,
         durableExecutionCompletionGuard, nonExecutingCompletionGuard, isCompletionGuard, assertCompletionGuarded,
         publishCompletedWithDurableExecutionEvidence, certifyDurableCompletion, isDurableCompletionAbsent,
         acquireExecutionLease, releaseExecutionLease, renewExecutionLease, settleExecutionLease, startExecutionLeaseRenewal,
@@ -270,6 +319,7 @@ beforeEach(() => {
     historyRows.length = 0;
     claimRows.length = 0;
     leaseRows.length = 0;
+    proofRows.length = 0;
     taskRows.length = 0;
     nextHistoryId = 1;
 });

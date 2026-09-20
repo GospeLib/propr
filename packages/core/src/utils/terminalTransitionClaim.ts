@@ -61,3 +61,27 @@ export async function claimTerminalTransition(taskId: string, state: string, ope
     if (!claimed) throw new Error('the terminal transition identity was not durably claimed');
     return String(claimed.transition_id);
 }
+
+/**
+ * Whether the DURABLE history already holds this exact terminal transition.
+ *
+ * The completed case has its own reader, because publishing a completion needs a capability minted
+ * from the evidence. This one answers the other question a paid path has to ask before it runs
+ * anything: did THIS operation already reach a terminal state — failed and cancelled included?
+ * Those are settled outcomes that must not be executed again, and the Redis projection that used
+ * to answer for them can be lost with the process.
+ *
+ * A read that FAILS is not an absence: it throws, because "the database would not answer" is not
+ * permission to spend money again.
+ */
+export async function durableTerminalTransitionRecorded(taskId: string, transitionId: string,
+    state: string): Promise<boolean> {
+    if (!transitionId.trim()) throw new Error('no terminal transition identity was offered to read back');
+    let row: unknown;
+    try {
+        row = await db('task_history').where({ task_id: taskId, transition_id: transitionId, state }).first();
+    } catch (error) {
+        throw new Error(`the ${state} history could not be read back for ${transitionId}: ${(error as Error).message}`);
+    }
+    return Boolean(row);
+}

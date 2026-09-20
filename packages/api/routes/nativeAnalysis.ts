@@ -3,8 +3,9 @@ import {
     getStateManager, runWithExecutionAbortSignal, runWithPlannerAbortContext, TaskStates, SyntheticAgent,
     durableOperationIdentity, publishCompletedWithDurableExecutionEvidence, isCompletionDurabilityUnverifiable,
     terminalTransitionId, certifyDurableCompletion, isDurableCompletionAbsent,
+    claimTerminalTransition, durableTerminalTransitionRecorded, COMPLETION_PERSISTENCE_FAILED_SUFFIX,
     acquireExecutionLease, releaseExecutionLease, settleExecutionLease, startExecutionLeaseRenewal,
-    type Agent, type AnalyzeOptions, type WorkerStateManager,
+    type Agent, type AnalyzeOptions, type DurableCommit, type WorkerStateManager,
 } from '@propr/core';
 import { setAbortSignal } from './plannerAbortHandlers.js';
 const CANCELLATION_CHECKPOINT_TIMEOUT_MS = 2_000;
@@ -32,6 +33,16 @@ export type NativeAnalysisStateManager = Pick<WorkerStateManager,
 export const NATIVE_ANALYSIS_OPERATION_SETTLED = 'NATIVE_ANALYSIS_OPERATION_ALREADY_SETTLED';
 /** Another live attempt holds the execution lease for this operation; this one does not execute. */
 export const NATIVE_ANALYSIS_OPERATION_IN_PROGRESS = 'NATIVE_ANALYSIS_OPERATION_EXECUTION_IN_PROGRESS';
+/**
+ * An earlier attempt's lease term lapsed and NOTHING has proved that attempt stopped executing.
+ *
+ * A missed heartbeat is silence, not death: a suspended event loop, a stalled write or a paused
+ * container all produce it while the provider keeps running and keeps charging. So this is where
+ * the route stops, and it stays stopped until an operator or reconciler records durable proof
+ * (`recordExecutorStopProof`) that the named prior generation is gone. Refusing work that could
+ * be resumed is a smaller loss than paying twice for work that is still running.
+ */
+export const NATIVE_ANALYSIS_OPERATION_UNRECONCILED = 'NATIVE_ANALYSIS_OPERATION_EXECUTION_UNRECONCILED';
 
 /**
  * Whether the AUTHORITATIVE history already holds the completion of this operation.
@@ -174,6 +185,18 @@ export async function nativeAnalysis(
     // then it reads exactly like a fresh operation. So the durable history is asked directly,
     // under this operation's deterministic completed-transition identity.
     const completedTransitionId = terminalTransitionId(taskId, TaskStates.COMPLETED, operationIdentity);
+    // Every terminal identity this operation can ever reach, derived — not remembered — so a later
+    // question about "did anything terminal land" is asked of exact rows rather than of a flag.
+    // The last one is the identity the durability barrier claims when a completion cannot be
+    // persisted and the run is settled as failed carrying its evidence: that record is terminal
+    // too, and an operation that reached it must not be executed again either.
+    const terminalIdentities: readonly (readonly [string, string])[] = [
+        [TaskStates.COMPLETED, completedTransitionId],
+        [TaskStates.FAILED, terminalTransitionId(taskId, TaskStates.FAILED, operationIdentity)],
+        [TaskStates.CANCELLED, terminalTransitionId(taskId, TaskStates.CANCELLED, operationIdentity)],
+        [TaskStates.FAILED, terminalTransitionId(taskId, TaskStates.FAILED,
+            `${operationIdentity}${COMPLETION_PERSISTENCE_FAILED_SUFFIX}`)],
+    ];
     let durablyCompleted: boolean;
     // An unreadable history is not an absence, so it propagates — but not with this request's
     // cancellation listener still attached to a run that never started.
@@ -187,6 +210,17 @@ export async function nativeAnalysis(
         catch { /* the durable completion stands whether or not its projection could be restored */ }
         throw refusal(`${NATIVE_ANALYSIS_OPERATION_SETTLED}: ${taskId} is already ${TaskStates.COMPLETED}`);
     }
+    // `completed` is not the only settled outcome. Failed and cancelled are settled too — the
+    // projection check above refuses both — and that projection is exactly what a dead process or
+    // a flushed Redis takes away. Asked of the durable history instead, under the same derived
+    // identities, they answer after the projection is gone. An unreadable history is not an
+    // absence here either: it propagates rather than buying a second paid run.
+    for (const [terminal, transitionId] of terminalIdentities.slice(1)) {
+        let settled: boolean;
+        try { settled = await durableTerminalTransitionRecorded(taskId, transitionId, terminal); }
+        catch (error) { signal.removeEventListener('abort', requestCancellation); throw error; }
+        if (settled) throw refusal(`${NATIVE_ANALYSIS_OPERATION_SETTLED}: ${taskId} is already ${terminal}`);
+    }
     // Two redeliveries that both pass the checks above are both "not settled yet" and would both
     // pay. The right to execute is therefore taken durably and exclusively, in one atomic
     // statement, before the provider is reachable.
@@ -199,18 +233,45 @@ export async function nativeAnalysis(
     if (acquired.outcome === 'held') {
         throw refusal(`${NATIVE_ANALYSIS_OPERATION_IN_PROGRESS}: ${taskId} is executing under another attempt`);
     }
+    if (acquired.outcome === 'unreconciled') {
+        throw refusal(`${NATIVE_ANALYSIS_OPERATION_UNRECONCILED}: ${taskId} held a lease from ${acquired.holderGeneration}`
+            + ` whose term lapsed at ${acquired.expiresAt} with no proof that its executor stopped`);
+    }
     const lease = acquired.lease;
     let leaseSettled = false;
     // A lease this attempt no longer holds is recorded rather than swallowed: the terminal
     // transition identity still stops a second completed row, but losing the fence is the one
     // condition under which another attempt could have started, and that must be visible.
     const leaseFenceErrors: string[] = [];
+    /**
+     * Settles the lease INSIDE the transaction that writes the terminal history row.
+     *
+     * Settling afterwards left a window with a shape money can fall through: the terminal state is
+     * durable, the lease is not, the process dies, the term lapses and a later attempt reads an
+     * operation nothing appears to have settled. One transaction removes the window rather than
+     * narrowing it — either both rows are there or neither is.
+     *
+     * A settlement that affects no row means this attempt was fenced out; that is recorded, not
+     * thrown, because throwing would roll back a terminal record that is worth keeping.
+     */
+    const settleWithTerminalWrite = (terminal: string): DurableCommit => async transaction => {
+        leaseSettled = await settleExecutionLease(lease, terminal, transaction);
+        if (!leaseSettled) leaseFenceErrors.push(`the execution lease was no longer held at ${terminal}`);
+    };
+    /** The after-the-fact settlement, for the one path whose terminal write is not ours to join. */
     const settleLease = async (terminal: string) => {
         leaseSettled = await settleExecutionLease(lease, terminal);
         if (!leaseSettled) leaseFenceErrors.push(`the execution lease was no longer held at ${terminal}`);
     };
     const stopLeaseRenewal = startExecutionLeaseRenewal(lease, {
-        onLost: () => leaseFenceErrors.push('the execution lease was taken over while this attempt was running'),
+        // A CONFIRMED loss of the fence means another attempt may now be executing this same paid
+        // operation. Recording it is not enough — two live executions is exactly the outcome the
+        // lease exists to prevent — so this attempt is stopped through the route's own cancellation
+        // path, which writes the abort marker the executor is already watching.
+        onLost: () => {
+            leaseFenceErrors.push('the execution lease was taken over while this attempt was running');
+            void requestCancellation();
+        },
         onError: error => leaseFenceErrors.push(`the execution lease could not be renewed: ${error.message}`),
     });
     try {
@@ -246,7 +307,7 @@ export async function nativeAnalysis(
         await cancellationCheckpoint;
         let settlementError: string | undefined;
         const terminalState = signal.aborted ? TaskStates.CANCELLED : result.success ? TaskStates.COMPLETED : TaskStates.FAILED;
-        let terminalTransitionId: string | undefined;
+        let recordedTransitionId: string | undefined;
         const terminalHistoryMetadata = { ...evidence, ...schemaEvidence(), result, childStopped, containerStopped,
             // The terminal outcome a value-only reader needs, beside the raw result.
             agentOutcome: { success: result.success, executionTimeMs: result.executionTimeMs },
@@ -262,20 +323,29 @@ export async function nativeAnalysis(
             if (terminalState === TaskStates.COMPLETED) {
                 const completion = await publishCompletedWithDurableExecutionEvidence({
                     stateManager: state, taskId, operationId: operationIdentity,
-                    metadata: { requireDurableHistory: true, historyMetadata: terminalHistoryMetadata },
+                    // The settlement rides INTO the barrier's own history transaction, so the
+                    // published completion and the settled lease commit together.
+                    metadata: { requireDurableHistory: true, historyMetadata: terminalHistoryMetadata,
+                        durableCommit: settleWithTerminalWrite(TaskStates.COMPLETED) },
                 });
-                terminalTransitionId = completion.transitionId;
+                recordedTransitionId = completion.transitionId;
                 if (completion.outcome === 'settled_failed') {
                     settlementError = 'the completed history could not be persisted; the run was settled as failed with its evidence';
                 }
                 // Either outcome is a DURABLE settlement of this operation — a published
                 // completion or a failed record carrying the same evidence — so the lease is
-                // settled and no later attempt may ever pay for this operation again.
-                await settleLease(completion.outcome === 'published' ? TaskStates.COMPLETED : TaskStates.FAILED);
+                // settled and no later attempt may ever pay for this operation again. The
+                // settled-as-failed record is written by the barrier under its OWN identity and
+                // its own transaction, which this attempt cannot join, so that one settlement is
+                // made after the fact; it is also the one case the release rule below has to
+                // recognise, which is why that rule reads the history rather than a flag.
+                if (!leaseSettled) await settleLease(completion.outcome === 'published' ? TaskStates.COMPLETED : TaskStates.FAILED);
             } else {
+                recordedTransitionId = await claimTerminalTransition(taskId, terminalState, operationIdentity);
                 await state.updateTaskState(taskId, terminalState,
-                    { requireDurableHistory: true, historyMetadata: terminalHistoryMetadata });
-                await settleLease(terminalState);
+                    { requireDurableHistory: true, transitionId: recordedTransitionId,
+                        historyMetadata: terminalHistoryMetadata,
+                        durableCommit: settleWithTerminalWrite(terminalState) });
             }
         } catch (error) {
             settlementError = (error as Error).message;
@@ -285,7 +355,7 @@ export async function nativeAnalysis(
         return { ...result, execution: { ...evidence, ...schemaEvidence(), childStopped, containerStopped,
             terminalRecorded: settlementError === undefined,
             ...(leaseFenceErrors.length === 0 ? {} : { leaseFenceErrors: [...leaseFenceErrors] }),
-            ...(terminalTransitionId === undefined ? {} : { terminalTransitionId }),
+            ...(recordedTransitionId === undefined ? {} : { terminalTransitionId: recordedTransitionId }),
             ...(settlementError === undefined ? {} : { settlementError }),
             // Durability could not be established either way: a caller must NOT treat this as
             // "nothing landed" and repeat the operation. Re-running it reaches the same task and
@@ -297,13 +367,18 @@ export async function nativeAnalysis(
         let settlementError: string | undefined;
         const terminalState = signal.aborted ? TaskStates.CANCELLED : TaskStates.FAILED;
         try {
+            // The same rule as the success path: the terminal record and the settlement of the
+            // right to run are one transaction, because a failed or cancelled operation is
+            // settled and must not be executed again either.
             await state.updateTaskState(taskId, terminalState, {
                 requireDurableHistory: true,
+                transitionId: await claimTerminalTransition(taskId, terminalState, operationIdentity),
                 historyMetadata: { ...evidence, childStopped, containerStopped, cancellationAcknowledged: signal.aborted,
-                    cancellationCheckpointErrors: [...cancellationCheckpointErrors] },
+                    cancellationCheckpointErrors: [...cancellationCheckpointErrors],
+                    ...(leaseFenceErrors.length === 0 ? {} : { leaseFenceErrors: [...leaseFenceErrors] }) },
                 error: { message: (error as Error).message },
+                durableCommit: settleWithTerminalWrite(terminalState),
             });
-            await settleLease(terminalState);
         } catch (failure) { settlementError = (failure as Error).message; }
         throw Object.assign(new Error((error as Error).message, { cause: error }), {
             execution: { ...evidence, childStopped, containerStopped,
@@ -312,10 +387,25 @@ export async function nativeAnalysis(
     } finally {
         signal.removeEventListener('abort', requestCancellation);
         stopLeaseRenewal();
-        // A lease that was never settled belonged to an attempt that did not settle the
-        // operation, so it is handed back at once: a retry of an UNSETTLED operation is
-        // legitimate work, and making it wait out the term would be a false refusal. A settled
-        // lease is left exactly as it is — releasing that one would re-permit paid work.
-        if (!leaseSettled) { try { await releaseExecutionLease(lease); } catch { /* it lapses on its own */ } }
+        // Handing the lease back is the ONE route from "this operation was not settled" to "this
+        // operation may run again", and it is now the only one: an expired term grants nothing.
+        // So it is given only on evidence, never on the absence of a flag. The history is asked
+        // whether ANY terminal identity of this operation became durable — including the one the
+        // barrier claims when it settles an unrecordable completion as failed — and only a
+        // confirmed absence releases. A write that failed is not an absence: it can have
+        // committed and lost its acknowledgement, and an unreadable history says nothing at all.
+        // Either way the lease stays, and the operation waits for reconciliation instead of
+        // paying twice.
+        if (!leaseSettled) {
+            let nothingTerminalIsDurable = false;
+            try {
+                const recorded = await Promise.all(terminalIdentities
+                    .map(([terminal, transitionId]) => durableTerminalTransitionRecorded(taskId, transitionId, terminal)));
+                nothingTerminalIsDurable = recorded.every(found => !found);
+            } catch { nothingTerminalIsDurable = false; }
+            if (nothingTerminalIsDurable) {
+                try { await releaseExecutionLease(lease); } catch { /* it stays until it is reconciled */ }
+            }
+        }
     }
 }

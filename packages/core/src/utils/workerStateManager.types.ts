@@ -122,6 +122,14 @@ export interface CancellationMetadata {
     containerId?: string;
 }
 
+/**
+ * A durable write committed in the same transaction as a task-history row.
+ *
+ * Named here rather than inlined so a caller in another package can declare one without reaching
+ * for the database client itself.
+ */
+export type DurableCommit = (transaction: import('knex').Knex.Transaction) => Promise<void>;
+
 export interface UpdateMetadata {
     /** Refuse execution/settlement when its authoritative database history was not persisted. */
     requireDurableHistory?: boolean;
@@ -139,6 +147,15 @@ export interface UpdateMetadata {
      * the constraint instead of duplicating the row.
      */
     transitionId?: string;
+    /**
+     * A durable record the caller needs committed ATOMICALLY with this transition's history row.
+     *
+     * It runs inside the same SQLite transaction as the `task_history` insert, so the two land
+     * together or not at all. The execution lease is the case this exists for: a terminal state
+     * that is durable while its lease is not leaves a window in which a lost projection reads the
+     * operation as unrun, and paid work is admitted a second time.
+     */
+    durableCommit?: DurableCommit;
     isRetry?: boolean;
     error?: {
         message: string;

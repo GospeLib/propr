@@ -39,6 +39,14 @@ const TRANSITION_CLAIM = 'claimTerminalTransition';
  */
 const EVIDENCE_CERTIFICATION = 'certifyDurableCompletion';
 /**
+ * Taking the durable, mutually exclusive RIGHT to run one paid execution.
+ *
+ * This is the only call that excludes a second execution. The transition claim and the barrier
+ * below it deduplicate a settled operation's RECORD after the fact, which is a different and
+ * strictly later guarantee: by the time either speaks, the provider has run and charged.
+ */
+const EXECUTION_LEASE_ACQUISITION = 'acquireExecutionLease';
+/**
  * Callees that write a task state. Anything naming `TaskState` is a transition API — the state
  * manager's `updateTaskState*`, the CAS helpers and the transition builder alike — so a completed
  * value reaching one publishes a completion, however that value was spelled or laundered.
@@ -63,6 +71,8 @@ export interface SourceFacts {
     /** Publishes an executed completion itself: claims a durable identity and mints its capability. */
     mintsExecutionCapability: boolean;
     claimsTerminalTransition: boolean;
+    /** Takes the execution lease: the operation cannot be executed twice, not merely recorded once. */
+    acquiresExecutionLease: boolean;
     /** Publishes only what the durable history proves, under an identity someone else claimed. */
     certifiesDurableCompletion: boolean;
     nonExecutingReasons: string[];
@@ -192,7 +202,8 @@ function analyzeSource(relativePath: string, source: string, modelMethods: Set<s
     const invoked = new Set<string>();
     const facts: SourceFacts = {
         path: relativePath, publishesCompleted: false, completionSites: [], usesBarrier: false,
-        mintsExecutionCapability: false, claimsTerminalTransition: false, certifiesDurableCompletion: false,
+        mintsExecutionCapability: false, claimsTerminalTransition: false, acquiresExecutionLease: false,
+        certifiesDurableCompletion: false,
         nonExecutingReasons: [], invokesModelExecution: false, modelExecutionCalls: [], imports: [],
     };
 
@@ -220,6 +231,7 @@ function analyzeSource(relativePath: string, source: string, modelMethods: Set<s
             if (name === BARRIER_CALL) facts.usesBarrier = true;
             if (name === EXECUTION_GUARD) facts.mintsExecutionCapability = true;
             if (name === TRANSITION_CLAIM) facts.claimsTerminalTransition = true;
+            if (name === EXECUTION_LEASE_ACQUISITION) facts.acquiresExecutionLease = true;
             if (name === EVIDENCE_CERTIFICATION) facts.certifiesDurableCompletion = true;
             if (name === NON_EXECUTING_GUARD) {
                 const reason = node.arguments[0];
@@ -292,6 +304,47 @@ export function publishesUnderClaimedIdentity(entry: SourceFacts): boolean {
  */
 export function publishesCertifiedEvidence(entry: SourceFacts): boolean {
     return entry.certifiesDurableCompletion && !entry.mintsExecutionCapability;
+}
+
+/** Every analysed module this one can reach through the modules it actually INVOKES, itself included. */
+export function invocationClosure(start: string, facts: Map<string, SourceFacts>): string[] {
+    const seen = new Set<string>([start]);
+    const queue = [start];
+    while (queue.length > 0) {
+        const current = queue.shift() as string;
+        for (const next of facts.get(current)?.imports ?? []) {
+            if (seen.has(next)) continue;
+            seen.add(next);
+            queue.push(next);
+        }
+    }
+    return [...seen];
+}
+
+/**
+ * The modules from which a paid provider execution can START.
+ *
+ * A path that reaches a model execution but is itself invoked by another analysed module is a
+ * step on someone else's path, not an entry to one; listing those would bury the handful of
+ * places where the decision to spend money is actually made. Roots are derived from the
+ * invocation graph, never enumerated by hand.
+ */
+export function paidExecutionEntryPoints(facts: Map<string, SourceFacts>): string[] {
+    const invoked = new Set<string>();
+    for (const entry of facts.values()) for (const target of entry.imports) invoked.add(target);
+    return [...facts.keys()]
+        .filter(path => reachesModelExecution(path, facts).length > 0 && !invoked.has(path))
+        .sort();
+}
+
+/** How a paid path is protected against running the SAME logical operation's provider call twice. */
+export type PaidExecutionProtection = 'execution exclusion' | 'post-execution deduplication' | 'neither';
+
+export function paidExecutionProtection(start: string, facts: Map<string, SourceFacts>): PaidExecutionProtection {
+    const closure = invocationClosure(start, facts).map(path => facts.get(path) as SourceFacts);
+    if (closure.some(entry => entry.acquiresExecutionLease)) return 'execution exclusion';
+    if (closure.some(entry => entry.claimsTerminalTransition || entry.usesBarrier)) return 'post-execution deduplication';
+    return 'neither';
 }
 
 export function reachesModelExecution(start: string, facts: Map<string, SourceFacts>): string[] {

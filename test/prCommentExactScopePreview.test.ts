@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { completionCoreExports } from './helpers/completionCoreDoubles.js';
+import { completionCoreExports, completionDatabase } from './helpers/completionCoreDoubles.js';
 import { mock, test } from 'node:test';
 import { buildVisualPreviewPrompt } from '../packages/core/src/services/visualPreviewService.js';
 
@@ -135,6 +135,9 @@ for (const exactScope of [true, false]) test(`actual PR-comment publication ${ex
  */
 test('a PR-comment completion whose durability is unverifiable settles nothing terminal', async () => {
   refuseCompletedHistoryWrite = true;
+  // ...and the read-back that would establish whether it committed cannot be performed either.
+  completionDatabase.reset();
+  completionDatabase.failReadBack = true;
   taskStateWrites.length = 0;
   const job = { id: 'fixture-job', data: {} };
   const error = await handlePostExecution({ state: {

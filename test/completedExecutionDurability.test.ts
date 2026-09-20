@@ -215,6 +215,18 @@ const { durableExecutionCompletionGuard, nonExecutingCompletionGuard } =
 // the database double above rather than a stub that could not fail.
 const { claimTerminalTransition, terminalTransitionId, durableOperationIdentity, TERMINAL_OPERATION_IDENTITY_MISSING } =
     await import('../packages/core/src/utils/terminalTransitionClaim.js');
+// The barrier itself now lives in core, beside the state manager, because the native-analysis
+// route in packages/api needs the same one. It is imported for real, writing through the doubles
+// above, so what is exercised here is the production mechanism and not a copy of it.
+const { publishCompletedWithDurableExecutionEvidence: coreBarrier, carriesTerminalExecutionEvidence: coreEvidence,
+    certifyDurableCompletion, isDurableCompletionAbsent, COMPLETION_WITHOUT_EXECUTION_EVIDENCE: CORE_NO_EVIDENCE,
+    COMPLETION_HISTORY_NOT_DURABLE: CORE_NOT_DURABLE, DURABLE_COMPLETION_ABSENT } =
+    await import('../packages/core/src/utils/durableCompletionBarrier.js');
+const { COMPLETION_DURABILITY_UNVERIFIABLE: CORE_UNVERIFIABLE, CompletionDurabilityUnverifiableError: CoreUnverifiableError,
+    isCompletionDurabilityUnverifiable: coreIsUnverifiable } =
+    await import('../packages/core/src/utils/completionDurabilityOutcome.js');
+const { ClaudeResultPhases: CORE_RESULT_PHASES } =
+    await import('../packages/core/src/utils/workerStateManager.types.js');
 
 await mock.module('@propr/core', {
     namedExports: {
@@ -228,6 +240,16 @@ await mock.module('@propr/core', {
         terminalTransitionId,
         durableOperationIdentity,
         TERMINAL_OPERATION_IDENTITY_MISSING,
+        publishCompletedWithDurableExecutionEvidence: coreBarrier,
+        carriesTerminalExecutionEvidence: coreEvidence,
+        certifyDurableCompletion, isDurableCompletionAbsent,
+        COMPLETION_WITHOUT_EXECUTION_EVIDENCE: CORE_NO_EVIDENCE,
+        COMPLETION_HISTORY_NOT_DURABLE: CORE_NOT_DURABLE,
+        DURABLE_COMPLETION_ABSENT,
+        COMPLETION_DURABILITY_UNVERIFIABLE: CORE_UNVERIFIABLE,
+        CompletionDurabilityUnverifiableError: CoreUnverifiableError,
+        isCompletionDurabilityUnverifiable: coreIsUnverifiable,
+        ClaudeResultPhases: CORE_RESULT_PHASES,
         redactSecrets: (value: string) => value,
         resolveAgentTerminationReason: () => undefined,
         filterCommentByAuthor: () => ({ shouldFilter: false }),

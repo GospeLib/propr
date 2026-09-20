@@ -45,14 +45,17 @@ export function attachPRCommentTaskStateFinalizers(
             .then(result => {
                 if (result.outcome === 'finalized') {
                     logger.info({ taskId }, 'Finalized PR comment task from BullMQ job state');
+                } else if (result.outcome === 'projection_reconciled') {
+                    logger.info({ taskId },
+                        'Caught the projection up to a durable completion the executing job had already published');
                 } else if (result.outcome === 'partial_publication') {
                     logger.error({ taskId, publication: result.publication },
                         'Finalized PR comment task in Redis with incomplete publication');
                 } else if (result.outcome === 'task_missing') {
                     logger.warn({ taskId }, 'Could not finalize PR comment task because its state is missing');
                 } else if (result.outcome === 'unverifiable_completion') {
-                    logger.error({ taskId },
-                        'PR comment job failed with an unverifiable completion; the task was deliberately left unsettled');
+                    logger.error({ taskId, reason: result.unverifiableReason },
+                        'PR comment job outcome carried an unverifiable completion; the task was deliberately left unsettled');
                 } else if (result.outcome === 'retry_pending') {
                     logger.debug({ taskId }, 'PR comment job failure is retryable; task was not finalized');
                 } else {

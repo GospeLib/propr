@@ -31,6 +31,14 @@ const NON_EXECUTING_GUARD = 'nonExecutingCompletionGuard';
 const EXECUTION_GUARD = 'durableExecutionCompletionGuard';
 const TRANSITION_CLAIM = 'claimTerminalTransition';
 /**
+ * The one way a publisher may certify an execution it did not itself run: it hands the caller's
+ * transition identity to the barrier, which reads the durable completed row for exactly that
+ * identity and mints the capability only if the row is there. It cannot assert a completion, only
+ * relay one — which is what the finalizer was doing wrongly when it stamped a NON-EXECUTING
+ * capability on an executing job's outcome.
+ */
+const EVIDENCE_CERTIFICATION = 'certifyDurableCompletion';
+/**
  * Callees that write a task state. Anything naming `TaskState` is a transition API — the state
  * manager's `updateTaskState*`, the CAS helpers and the transition builder alike — so a completed
  * value reaching one publishes a completion, however that value was spelled or laundered.
@@ -42,6 +50,8 @@ const STATE_PROPERTY = /^(state|newState|targetState)$/;
 const COMPLETION_CALLEE = /^mark(Task)?Completed$/;
 /** Query filters and on-disk markers also spell `state: 'completed'`; a transition names the enum. */
 const DATA_QUERY_CALLEE = /^(where|andWhere|orWhere|whereIn|first|select|filter|find)$/;
+/** How far above a property assignment to look for the query call it belongs to. */
+const QUERY_ARGUMENT_DEPTH = 4;
 
 export interface SourceFacts {
     /** Repository-relative path. */
@@ -53,6 +63,8 @@ export interface SourceFacts {
     /** Publishes an executed completion itself: claims a durable identity and mints its capability. */
     mintsExecutionCapability: boolean;
     claimsTerminalTransition: boolean;
+    /** Publishes only what the durable history proves, under an identity someone else claimed. */
+    certifiesDurableCompletion: boolean;
     nonExecutingReasons: string[];
     invokesModelExecution: boolean;
     modelExecutionCalls: string[];
@@ -157,6 +169,21 @@ function resolveStringArgument(node: ts.Expression | undefined, constants: Map<s
     return '[non-literal reason]';
 }
 
+/**
+ * Whether this node sits inside the argument of a query call.
+ *
+ * `where({ state: TaskStates.COMPLETED })` names the enum — the read-back of a completed row has
+ * every reason to — but it selects rows; it transitions nothing. Judging it a completion would
+ * make the rule unreadable exactly where completions are being verified.
+ */
+function withinDataQuery(node: ts.Node): boolean {
+    let current: ts.Node | undefined = node.parent;
+    for (let depth = 0; current && depth < QUERY_ARGUMENT_DEPTH; depth++, current = current.parent) {
+        if (ts.isCallExpression(current)) return DATA_QUERY_CALLEE.test(calleeName(current));
+    }
+    return false;
+}
+
 function analyzeSource(relativePath: string, source: string, modelMethods: Set<string>): SourceFacts {
     const file = ts.createSourceFile(relativePath, source, ts.ScriptTarget.ES2022, true);
     const aliases = collectCompletedAliases(file);
@@ -165,7 +192,7 @@ function analyzeSource(relativePath: string, source: string, modelMethods: Set<s
     const invoked = new Set<string>();
     const facts: SourceFacts = {
         path: relativePath, publishesCompleted: false, completionSites: [], usesBarrier: false,
-        mintsExecutionCapability: false, claimsTerminalTransition: false,
+        mintsExecutionCapability: false, claimsTerminalTransition: false, certifiesDurableCompletion: false,
         nonExecutingReasons: [], invokesModelExecution: false, modelExecutionCalls: [], imports: [],
     };
 
@@ -193,6 +220,7 @@ function analyzeSource(relativePath: string, source: string, modelMethods: Set<s
             if (name === BARRIER_CALL) facts.usesBarrier = true;
             if (name === EXECUTION_GUARD) facts.mintsExecutionCapability = true;
             if (name === TRANSITION_CLAIM) facts.claimsTerminalTransition = true;
+            if (name === EVIDENCE_CERTIFICATION) facts.certifiesDurableCompletion = true;
             if (name === NON_EXECUTING_GUARD) {
                 const reason = node.arguments[0];
                 facts.nonExecutingReasons.push(resolveStringArgument(reason, stringConstants));
@@ -215,6 +243,7 @@ function analyzeSource(relativePath: string, source: string, modelMethods: Set<s
         // query filters and on-disk markers are written, and neither transitions a task.
         if (ts.isPropertyAssignment(node) && STATE_PROPERTY.test(node.name.getText(file))
             && !ts.isStringLiteralLike(node.initializer)
+            && !withinDataQuery(node)
             && argumentCarriesCompleted(node.initializer, aliases)) {
             facts.publishesCompleted = true;
             const line = file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1;
@@ -250,6 +279,19 @@ export async function analyzeCompletionBoundary(): Promise<Map<string, SourceFac
 /** Whether this publisher discharges the durability requirement itself, rather than via the barrier. */
 export function publishesUnderClaimedIdentity(entry: SourceFacts): boolean {
     return entry.mintsExecutionCapability && entry.claimsTerminalTransition;
+}
+
+/**
+ * Whether this publisher only RELAYS a completion, certified against the durable history under
+ * an identity claimed elsewhere.
+ *
+ * This is the category the module-granular analysis previously had no name for, and so could not
+ * police: a publisher that runs no model execution but certifies one another path ran. Calling
+ * itself non-executing was true and beside the point, because what it was publishing was an
+ * executing job's outcome.
+ */
+export function publishesCertifiedEvidence(entry: SourceFacts): boolean {
+    return entry.certifiesDurableCompletion && !entry.mintsExecutionCapability;
 }
 
 export function reachesModelExecution(start: string, facts: Map<string, SourceFacts>): string[] {

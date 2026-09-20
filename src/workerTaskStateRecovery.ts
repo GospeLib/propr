@@ -252,7 +252,15 @@ export async function startWorkerTaskStateRecovery(
             );
             cursor = result.nextCursor;
             backlog = result.backlog ?? [];
-            logger.info(result.summary, 'Reconciled stale PR comment task states');
+            // An unverifiable completion is not a quiet skip: work may be delivered, stuck or
+            // about to be retried, so the run that found one is reported at a level an alert
+            // can key on, with the count in the summary it already publishes.
+            if (result.summary.unverifiableCompletions > 0) {
+                logger.error(result.summary,
+                    'Reconciled stale PR comment task states, leaving unverifiable completions unsettled');
+            } else {
+                logger.info(result.summary, 'Reconciled stale PR comment task states');
+            }
             return true;
         } catch (error) {
             if (!closed) {

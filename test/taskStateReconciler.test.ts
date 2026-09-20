@@ -78,6 +78,7 @@ function createStateManager(tasks: TaskStateData[]) {
         scanNonTerminalTasks: mock.fn(async () => ({ tasks, nextCursor: '17' })),
         getTaskState: mock.fn(),
         updateTaskStateIfCurrentDetailed: mock.fn(),
+        projectDurableCompletion: mock.fn(),
     };
 }
 
@@ -113,6 +114,7 @@ test('recovers completed and failed BullMQ outcomes through the shared finalizer
         recovered: 2,
         skipped: 0,
         errors: 0,
+        unverifiableCompletions: 0,
     });
     assert.equal(finalizeCompletedPRCommentTask.mock.calls[0].arguments[1]?.status, 'complete');
     assert.match(finalizeFailedPRCommentTask.mock.calls[0].arguments[1].message, /agent crashed/);
@@ -179,6 +181,7 @@ test('leaves an untyped issue task with comments untouched', async () => {
         recovered: 0,
         skipped: 1,
         errors: 0,
+        unverifiableCompletions: 0,
     });
     assert.equal(queue.getJob.mock.calls.length, 0);
     assert.equal(inspectContainer.mock.calls.length, 0);
@@ -207,6 +210,7 @@ test('leaves future-dated work untouched when the stale threshold is zero', asyn
         recovered: 0,
         skipped: 1,
         errors: 0,
+        unverifiableCompletions: 0,
     });
     assert.equal(queue.getJob.mock.calls.length, 0);
     assert.equal(inspectContainer.mock.calls.length, 0);
@@ -336,4 +340,68 @@ test('legacy container inspection is non-destructive and distinguishes Docker ou
 test('invalid and future timestamps are not treated as stale', () => {
     assert.equal(taskAgeMs('not-a-date', NOW), null);
     assert.equal(taskAgeMs(new Date(NOW + 1_000).toISOString(), NOW), null);
+});
+
+/**
+ * An unverifiable completion is the one reconciliation outcome an operator has to act on: work
+ * may be delivered, stuck, or about to be retried, and the reconciler cannot tell which. Counting
+ * it as an ordinary `skipped` made a run of exactly those read as a clean sweep — the summary
+ * said "nothing to do" about the condition that re-dispatched a finished story six times.
+ */
+test('unverifiable completions are accounted for separately, not as ordinary skips', async () => {
+    const completed = makeTask('pr-comments-unverifiable-completed');
+    const failed = makeTask('pr-comments-unverifiable-failed');
+    const unverifiable = { outcome: 'unverifiable_completion' as const, stateChanged: false,
+        unverifiableReason: 'COMPLETION_DURABILITY_UNVERIFIABLE: the read-back failed' };
+    const completedImplementation = finalizeCompletedPRCommentTask.mock.mockImplementation;
+    const failedImplementation = finalizeFailedPRCommentTask.mock.mockImplementation;
+    finalizeCompletedPRCommentTask.mock.mockImplementation(async () => unverifiable as never);
+    finalizeFailedPRCommentTask.mock.mockImplementation(async () => unverifiable as never);
+    try {
+        const jobs = new Map<string, unknown>([
+            [completed.taskId, { returnvalue: { status: 'complete' }, getState: async () => 'completed' }],
+            [failed.taskId, { failedReason: 'COMPLETION_DURABILITY_UNVERIFIABLE: the read-back failed',
+                getState: async () => 'failed' }],
+        ]);
+        const result = await reconcileStalePRCommentTasks({
+            queue: { getJob: async taskId => jobs.get(taskId) as never },
+            stateManager: createStateManager([completed, failed]),
+            now: NOW,
+        });
+
+        assert.deepEqual(result.summary, {
+            scanned: 2,
+            stale: 2,
+            live: 0,
+            recovered: 0,
+            skipped: 0,
+            errors: 2,
+            unverifiableCompletions: 2,
+        }, 'both the completed-job and failed-job paths must account for it, and neither as a skip');
+    } finally {
+        finalizeCompletedPRCommentTask.mock.mockImplementation(completedImplementation);
+        finalizeFailedPRCommentTask.mock.mockImplementation(failedImplementation);
+    }
+});
+
+test('an orphaned task whose completion cannot be verified is not counted as a skip either', async () => {
+    const orphaned = makeTask('pr-comments-orphaned-unverifiable');
+    const failedImplementation = finalizeFailedPRCommentTask.mock.mockImplementation;
+    finalizeFailedPRCommentTask.mock.mockImplementation(async () => ({
+        outcome: 'unverifiable_completion' as const, stateChanged: false,
+    }) as never);
+    try {
+        const result = await reconcileStalePRCommentTasks({
+            queue: { getJob: async () => undefined },
+            stateManager: createStateManager([orphaned]),
+            inspectContainer: async () => 'not_found' as const,
+            now: NOW,
+        });
+
+        assert.equal(result.summary.unverifiableCompletions, 1);
+        assert.equal(result.summary.skipped, 0);
+        assert.equal(result.summary.errors, 1);
+    } finally {
+        finalizeFailedPRCommentTask.mock.mockImplementation(failedImplementation);
+    }
 });

@@ -212,7 +212,16 @@ async function publishCompletionComment(options: CompletionCommentPublicationOpt
     }
 }
 
-export async function handlePostExecution(params: PostExecutionParams, taskUrl: string): Promise<{ commitHash?: string; partial: boolean }> {
+export async function handlePostExecution(params: PostExecutionParams, taskUrl: string): Promise<{
+    commitHash?: string;
+    partial: boolean;
+    /**
+     * The identity the barrier claimed for this completion, present only when the completed row
+     * is durable under it. The job result carries it onward so the BullMQ finalizer can verify
+     * that exact row rather than mint a second, evidence-free completion of its own.
+     */
+    terminalTransitionId?: string;
+}> {
     const {
         state,
         job,
@@ -281,7 +290,7 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
 
         // `completed` is published only once the final execution evidence is durable; the
         // evidence rides on the completed entry itself. See completedExecutionDurability.ts.
-        await publishCompletedWithDurableExecutionEvidence({
+        const completion = await publishCompletedWithDurableExecutionEvidence({
             stateManager, taskId, correlatedLogger,
             // The queue job owns this attempt; its id is unchanged across every redelivery.
             operationId: durableOperationIdentity('pr-comment-job', job.id ?? taskId),
@@ -306,7 +315,8 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
         });
 
         await persistCommitHash(taskId, commitResult?.commitHash, correlatedLogger);
-        return { commitHash: commitResult?.commitHash, partial };
+        return { commitHash: commitResult?.commitHash, partial,
+            ...(completion.outcome === 'published' ? { terminalTransitionId: completion.transitionId } : {}) };
     } finally {
         try {
             await cleanupPreparedVisualPreviewEvidence(preparedVisualPreview);

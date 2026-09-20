@@ -225,7 +225,8 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
     if (validation.skip) {
         if (state.ezerAdmissionVerified) throw new Error(`Admitted PR comment cannot execute: ${validation.reason}`);
         correlatedLogger.info({ pullRequestNumber, reason: validation.reason }, 'Skipping PR comment processing');
-        return { status: 'skipped', reason: validation.reason, pullRequestNumber };
+        // Nothing has executed yet, and the finalizer settles a skip only on that proof.
+        return { status: 'skipped', reason: validation.reason, pullRequestNumber, preExecutionSkip: true };
     }
 
     const { prData, unprocessedComments: validUnprocessed, llm: resolvedLlm } = validation;
@@ -278,7 +279,7 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
             correlatedLogger,
             correlationId,
         });
-        return { status: 'skipped', reason: 'no_authorized_review_findings', pullRequestNumber };
+        return { status: 'skipped', reason: 'no_authorized_review_findings', pullRequestNumber, preExecutionSkip: true };
     }
 
     await markSelectedUltrafixFindings(
@@ -425,7 +426,12 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
 
     await handleUltrafixContinuation('fix', { job, stateManager, taskId, redisClient, repoOwner, repoName, pullRequestNumber, correlatedLogger, correlationId });
 
-    return { status: postResult.partial ? 'partial' : 'complete', commit: postResult.commitHash, pullRequestNumber, claudeResult: { success: state.claudeResult.success } };
+    return { status: postResult.partial ? 'partial' : 'complete', commit: postResult.commitHash, pullRequestNumber,
+        claudeResult: { success: state.claudeResult.success },
+        // The identity the durability barrier claimed for this completion. The BullMQ finalizer
+        // verifies that exact durable row; without it, it refuses to settle rather than append a
+        // second completion carrying no execution evidence.
+        ...(postResult.terminalTransitionId === undefined ? {} : { terminalTransitionId: postResult.terminalTransitionId }) };
 }
 
 export async function processPullRequestCommentJob(job: Job<CommentJobData>): Promise<JobResult> {

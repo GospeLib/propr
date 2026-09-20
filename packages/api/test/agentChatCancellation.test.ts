@@ -42,7 +42,7 @@ test('native disconnect during awaited agent resolution cannot start paid author
     const res = Object.assign(new EventEmitter(), { writableEnded: false, destroyed: false,
         json() { throw Error('no disconnected publication'); }, status() { return res; } }) as unknown as Response;
     try {
-        const stateManager = { async createTaskState() {}, async updateTaskState() {}, async updateHistoryMetadata() {} };
+        const stateManager = { async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() {}, async updateTaskState() {}, async updateHistoryMetadata() {} };
         const route = createAgentRoutes({ stateManager: stateManager as never }).router.stack.find(layer => layer.route?.path === '/chat')!.route!;
         const pending = route.stack[0].handle(req, res, () => undefined);
         await entered;
@@ -64,7 +64,7 @@ test('native profile requires a verified binding before admission', async () => 
     const agent = { config: { type: 'claude' }, analyze: async () => ({ success: true, response: '', modelUsed: 'fixture' }) } as unknown as Agent;
     await assert.rejects(nativeAnalysis(agent, 'fixture', { options: { analysisProfile: 'planning-artifact' },
         signal: new AbortController().signal, dependencies: { stateManager: {
-            async createTaskState() { admitted = true; }, async updateTaskState() {}, async updateHistoryMetadata() {},
+            async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() { admitted = true; }, async updateTaskState() {}, async updateHistoryMetadata() {},
         } as never },
     }), /execution binding required/);
     assert.equal(admitted, false);
@@ -76,7 +76,7 @@ test('failed native admission settles the projection and preserves its execution
         analyze: async () => { throw new Error('must not author'); } } as unknown as Agent, 'input', {
         options: { analysisProfile: 'planning-artifact' }, signal: new AbortController().signal,
         binding: executionBinding('input'), dependencies: { stateManager: {
-            async createTaskState() { throw new Error('Admission history unavailable'); },
+            async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() { throw new Error('Admission history unavailable'); },
             async updateTaskState(_taskId, state) { states.push(state); },
             async updateHistoryMetadata() {},
         } },
@@ -90,11 +90,14 @@ test('failed native admission settles the projection and preserves its execution
 
 test('final settlement failure preserves the paid result without recasting execution as failed', async () => {
     const states: string[] = [];
+    const failures: Error[] = [];
     const agent = { config: { type: 'claude', id: 'fixture', alias: 'fixture' },
         analyze: async () => ({ success: true, response: 'valid paid response', modelUsed: 'fixture' }) } as unknown as Agent;
     const result = await nativeAnalysis(agent, 'fixture', { options: { analysisProfile: 'planning-artifact' },
         binding: executionBinding('fixture'), signal: new AbortController().signal, dependencies: { stateManager: {
-            async createTaskState() {}, async updateHistoryMetadata() {},
+            async getTaskState() { return null; }, async createTaskState() {}, async updateHistoryMetadata() {},
+            async markTaskFailed(_id: string, error: Error) { failures.push(error); return {}; },
+            async projectDurableCompletion() { return 'projected'; },
             async updateTaskState(_id: string, state: string) {
                 states.push(state);
                 if (state === 'completed') throw new Error('Final history unavailable');
@@ -104,10 +107,17 @@ test('final settlement failure preserves the paid result without recasting execu
     });
     assert.equal(result.response, 'valid paid response');
     assert.equal(result.success, true);
-    assert.equal(result.execution.terminalRecorded, false);
-    assert.match(result.execution.settlementError ?? '', /Final history unavailable/);
+    assert.equal(result.execution.terminalRecorded, false, 'the caller is told its completion was not recorded');
+    // The shared barrier owns what happens next, and it is not "throw the run away": a completion
+    // whose row is confirmed absent is settled as a durable `failed` record carrying the same
+    // execution evidence, so it can be neither read as a delivered success nor re-dispatched as
+    // an unrun task. That policy is the queue paths' policy — this route no longer has its own.
+    assert.match(result.execution.settlementError ?? '', /settled as failed with its evidence/);
+    assert.equal(failures.length, 1);
+    assert.match(failures[0].message, /COMPLETION_HISTORY_NOT_DURABLE.*Final history unavailable/);
     assert.ok(result.execution.taskId);
-    assert.deepEqual(states, ['claude_execution', 'completed']);
+    assert.deepEqual(states, ['claude_execution', 'completed', 'completed', 'completed'],
+        'the barrier retries a confirmed-absent write before it settles anything');
 });
 test('native binding rejects altered prompt bytes before admission or authoring', async () => {
     let admitted = false;
@@ -119,7 +129,7 @@ test('native binding rejects altered prompt bytes before admission or authoring'
             requestId: 'request', operationId: 'operation', inputDigest: `sha256:${'a'.repeat(64)}`,
             repository: 'owner/repo', providerInputDigest: `sha256:${'b'.repeat(64)}`,
         }, dependencies: { stateManager: {
-            async createTaskState() { admitted = true; }, async updateTaskState() {}, async updateHistoryMetadata() {},
+            async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() { admitted = true; }, async updateTaskState() {}, async updateHistoryMetadata() {},
         } as never },
     }), /provider input binding/);
     assert.equal(admitted, false);
@@ -136,7 +146,7 @@ test('native planning rejects unbound optional context before admission or autho
     await assert.rejects(nativeAnalysis(agent, 'bound prompt', {
         options: { analysisProfile: 'planning-artifact', context: 'unbound additional input' },
         binding: executionBinding('bound prompt'), signal: new AbortController().signal,
-        dependencies: { stateManager: { async createTaskState() { admitted = true; },
+        dependencies: { stateManager: { async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() { admitted = true; },
             async updateTaskState() {}, async updateHistoryMetadata() {} } as never },
     }), /does not accept additional context/);
     assert.equal(admitted, false);
@@ -152,7 +162,7 @@ test('native chat disconnect stops its exact executor child and rejects late pub
     const history: Array<Record<string, unknown>> = [];
     let abortMarker = false;
     const stateManager = {
-        async createTaskState() {},
+        async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() {},
         async updateTaskState(_taskId: string, _state: string, metadata: { historyMetadata: Record<string, unknown> }) { history.push(metadata.historyMetadata); },
         async updateHistoryMetadata(_taskId: string, _state: string, metadata: Record<string, unknown>) { history.push(metadata); },
     };
@@ -271,7 +281,7 @@ test('native timeout writes its exact abort marker before child cessation', asyn
     let markerWhileChildAlive = false;
     const checkpointed: Record<string, unknown>[] = [];
     let markerAfterDurableIntent = false;
-    const stateManager = { async createTaskState() {}, async updateTaskState() {},
+    const stateManager = { async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() {}, async updateTaskState() {},
         async updateHistoryMetadata(_taskId: string, _state: string, metadata: Record<string, unknown>) { checkpointed.push(metadata); } };
     await exerciseNativeAnalysis(async (_prompt, options) => {
         const result = await executeDockerCommand(process.execPath,
@@ -295,7 +305,7 @@ test('native timeout writes its exact abort marker before child cessation', asyn
 test('native analysis requires durable history for admission and execution checkpoints', async () => {
     const required: boolean[] = [];
     const stateManager = {
-        async createTaskState(_task: string, _issue: unknown, _correlation: unknown, policy?: { requireDurableHistory?: boolean }) {
+        async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState(_task: string, _issue: unknown, _correlation: unknown, policy?: { requireDurableHistory?: boolean }) {
             required.push(policy?.requireDurableHistory === true);
         },
         async updateTaskState(_task: string, _state: string, metadata?: { requireDurableHistory?: boolean }) {
@@ -311,7 +321,7 @@ test('native analysis requires durable history for admission and execution check
 test('disconnect checkpoint failures are handled immediately and retained at settlement', async () => {
     const settlements: Array<Record<string, unknown>> = [];
     const stateManager = {
-        async createTaskState() {},
+        async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() {},
         async updateTaskState(_task: string, _state: string, metadata: { historyMetadata: Record<string, unknown> }) {
             settlements.push(metadata.historyMetadata);
         },
@@ -334,7 +344,7 @@ test('planning-artifact profile applies bounded semantic controls without trunca
     const prompt = 'all 17 requirements and every existing story path remain verbatim';
     const checkpoints: string[] = [];
     const stateManager = {
-        async createTaskState() { checkpoints.push('created'); },
+        async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() { checkpoints.push('created'); },
         async updateTaskState() { checkpoints.push('state'); },
         async updateHistoryMetadata() { checkpoints.push('metadata'); },
     };

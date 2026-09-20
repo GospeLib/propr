@@ -44,6 +44,15 @@ export interface LastError {
  */
 export type ClaudeResultPhase = 'provisional' | 'final';
 
+/**
+ * The phase values themselves, so the single reader of them — the durability barrier — and the
+ * writers in the job tree name the same constant rather than two copies of a string literal.
+ */
+export const ClaudeResultPhases = {
+    PROVISIONAL: 'provisional',
+    FINAL: 'final',
+} as const satisfies Record<string, ClaudeResultPhase>;
+
 export interface ClaudeResultSummary {
     success: boolean;
     /** Provisional start-time placeholder vs. the execution's real outcome. Absent on legacy records. */

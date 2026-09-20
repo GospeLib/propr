@@ -16,6 +16,7 @@ import {
     compareAndSetTaskStateData,
     compareAndSetTaskState,
     publishAndReconcileTaskTransition,
+    publishTaskTransitionEvent,
     cancellationMetadata,
     MAX_ATOMIC_UPDATE_ATTEMPTS,
     waitForAtomicUpdateRetry,
@@ -23,6 +24,7 @@ import {
 import { scanNonTerminalTaskStates } from './workerStateScan.js';
 import { persistHistoryMetadata } from './workerStateHistoryMetadata.js';
 import { persistTaskAdmission } from './workerStateAdmission.js';
+import { certifyDurableCompletion } from './durableCompletionBarrier.js';
 
 const TERMINAL_TASK_STATES = new Set<TaskState>([
     TaskStates.COMPLETED,
@@ -189,6 +191,58 @@ export class WorkerStateManager {
             taskId, key: this.getTaskKey(taskId), stateExpiry: this.stateExpiry, current, transition, metadata,
         });
         return { state: transition.state, publication };
+    }
+
+    /**
+     * Catches the projection up to a completion the durable history ALREADY proves.
+     *
+     * This publishes no completion of its own: it re-reads the completed row for the caller's
+     * exact transition identity and can only proceed with the capability that read mints, so a
+     * caller that did not run the execution — a reconciliation, a queue-event finalizer — can
+     * relay a completion but never assert one. Nothing is appended to `task_history`; only the
+     * Redis snapshot and the realtime event are brought into line.
+     *
+     * An evidence-free completion appended here is the exact defect this replaces: the barrier's
+     * re-published transition was rejected by the unique index, the rejection was swallowed,
+     * Redis stayed nonterminal, and the next finalizer read that as "unsettled" and wrote a
+     * second, unkeyed completed row whose metadata carried no execution evidence at all.
+     */
+    async projectDurableCompletion(taskId: string, options: {
+        transitionId: string;
+        reason?: string;
+        historyMetadata?: Record<string, unknown>;
+    }): Promise<'projected' | 'already_completed' | 'terminal_conflict' | 'task_missing'> {
+        const completionGuard = await certifyDurableCompletion(taskId, options.transitionId);
+        const key = this.getTaskKey(taskId);
+        for (let attempt = 0; attempt < MAX_ATOMIC_UPDATE_ATTEMPTS; attempt++) {
+            const stateJson = await this.redis.get(key);
+            if (!stateJson) return 'task_missing';
+            const current = JSON.parse(stateJson) as TaskStateData;
+            if (current.state === TaskStates.COMPLETED) return 'already_completed';
+            if (TERMINAL_TASK_STATES.has(current.state)) {
+                logger.error({ taskId, currentState: current.state, transitionId: options.transitionId },
+                    'A durable completion cannot be projected over a different terminal state');
+                return 'terminal_conflict';
+            }
+            const metadata: UpdateMetadata = {
+                completionGuard,
+                transitionId: options.transitionId,
+                reason: options.reason,
+                historyMetadata: options.historyMetadata,
+            };
+            const transition = buildTaskStateTransition(current, TaskStates.COMPLETED, metadata);
+            const updated = await compareAndSetTaskStateData(this.redis, {
+                key, stateExpiry: this.stateExpiry, currentJson: stateJson, state: transition.state,
+            });
+            if (!updated) {
+                await waitForAtomicUpdateRetry(attempt);
+                continue;
+            }
+            await publishTaskTransitionEvent(taskId, transition, metadata,
+                { historyPersisted: true, eventPublished: false, errors: [] });
+            return 'projected';
+        }
+        throw new Error(`Durable completion projection conflicted ${MAX_ATOMIC_UPDATE_ATTEMPTS} times for taskId: ${taskId}`);
     }
 
     /**

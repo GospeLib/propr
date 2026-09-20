@@ -12,15 +12,16 @@
  * - `claudeResult.resultPhase === 'final'` — the execution returned; `success` is the real outcome.
  * - a genuine failure is `resultPhase: 'final'` with `success: false` (and a terminal failed entry).
  */
-import { TaskStates } from '@propr/core';
-import type { ClaudeResultPhase, ClaudeResultSummary, WorkerStateManager } from '@propr/core';
+import { ClaudeResultPhases, TaskStates } from '@propr/core';
+import type { ClaudeResultSummary, WorkerStateManager } from '@propr/core';
 import type { Logger } from 'pino';
 
-/** The two records an execution can have. Runtime home of the phase labels. */
-export const ClaudeResultPhases = {
-    PROVISIONAL: 'provisional',
-    FINAL: 'final',
-} as const satisfies Record<string, ClaudeResultPhase>;
+/**
+ * The two records an execution can have. The constants live in core, beside the
+ * `ClaudeResultPhase` type and the durability barrier that reads them; this tree keeps the name
+ * it has always imported.
+ */
+export { ClaudeResultPhases };
 
 type ExecutionResultStateManager = Pick<WorkerStateManager, 'updateHistoryMetadata'>;
 

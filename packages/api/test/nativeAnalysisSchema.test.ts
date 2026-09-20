@@ -23,7 +23,7 @@ test('native admission refuses a synthetic facade before routing or recording ph
   await assert.rejects(nativeAnalysis(synthetic, PROMPT, {
     options: { analysisProfile: 'planning-artifact', responseSchema: SCHEMA }, binding: binding(),
     signal: new AbortController().signal, dependencies: { stateManager: {
-      async createTaskState() { admitted = true; }, async updateTaskState() {}, async updateHistoryMetadata() {},
+      async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() { admitted = true; }, async updateTaskState() {}, async updateHistoryMetadata() {},
     } },
   }), /authenticated Claude CLI executor/);
   assert.equal(admitted, false);
@@ -42,7 +42,7 @@ for (const scenario of ['missing digest', 'foreign digest', 'missing schema', 'm
     await assert.rejects(nativeAnalysis({ config: { type: 'claude' }, async analyze() { authored = true; } } as unknown as Agent,
       PROMPT, { options: { analysisProfile: 'planning-artifact', responseSchema: responseSchema as AnalyzeOptions['responseSchema'] }, binding: execution,
         signal: new AbortController().signal, dependencies: { stateManager: {
-          async createTaskState() { admitted = true; }, async updateTaskState() {}, async updateHistoryMetadata() {},
+          async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() { admitted = true; }, async updateTaskState() {}, async updateHistoryMetadata() {},
         } } }), /response schema/);
     assert.equal(admitted, false);
     assert.equal(authored, false);
@@ -61,7 +61,7 @@ for (const scenario of ['matching', 'omitted CLI schema', 'changed CLI schema', 
     } as unknown as Agent;
     const pending = nativeAnalysis(agent, PROMPT, { options: { analysisProfile: 'planning-artifact', responseSchema: SCHEMA },
       binding: binding(), signal: new AbortController().signal, dependencies: { stateManager: {
-        async createTaskState() {}, async updateTaskState() {},
+        async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() {}, async updateTaskState() {},
         async updateHistoryMetadata(_task, _state, metadata) { checkpoints.push(metadata); },
       } } });
     if (scenario.includes('CLI schema')) await assert.rejects(pending, /CLI response schema binding changed/);

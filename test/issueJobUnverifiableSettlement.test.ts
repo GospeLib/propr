@@ -11,7 +11,7 @@
  * caller-side defect through.
  */
 import assert from 'node:assert/strict';
-import { completionCoreExports } from './helpers/completionCoreDoubles.js';
+import { completionCoreExports, completionDatabase } from './helpers/completionCoreDoubles.js';
 import { beforeEach, describe, mock, test } from 'node:test';
 
 const TASK_STATES = {
@@ -48,12 +48,8 @@ await mock.module('@propr/core', {
         logger: log,
         redactSecrets: (value: string) => value,
         resolveAgentTerminationReason: () => undefined,
-        // The read-back the barrier performs after an ambiguous write. Refusing it is what makes
-        // a completion unverifiable: it may have committed, and nothing can establish whether.
-        db: () => ({ where: () => ({ first: async () => {
-            if (refuseCompletedHistoryWrite) throw new Error('database refused the history read-back');
-            return undefined;
-        }, update: async () => undefined }) }),
+        // Other consumers of the barrel still read the database through it.
+        db: () => ({ where: () => ({ first: async () => undefined, update: async () => undefined }) }),
         findPlanIssueByRepoAndNumber: async () => null,
         PlanIssueStatus: { CLOSED: 'closed' },
         triggerNextPendingIssue: async () => undefined,
@@ -92,11 +88,18 @@ function completionParams() {
 beforeEach(() => {
     writes.length = 0;
     refuseCompletedHistoryWrite = false;
+    completionDatabase.reset();
 });
+
+/** The write is ambiguous AND the read-back that would settle it also fails. */
+function refuseCompletionAndItsReadBack(): void {
+    refuseCompletedHistoryWrite = true;
+    completionDatabase.failReadBack = true;
+}
 
 describe('an unverifiable completion is settled as nothing on the issue path', () => {
     test('markTaskComplete propagates it instead of swallowing it into a silent non-terminal task', async () => {
-        refuseCompletedHistoryWrite = true;
+        refuseCompletionAndItsReadBack();
 
         await assert.rejects(() => markTaskComplete(completionParams()), /COMPLETION_DURABILITY_UNVERIFIABLE/);
 
@@ -107,7 +110,7 @@ describe('an unverifiable completion is settled as nothing on the issue path', (
 
     test('the job-level failure handler declines to settle it', async () => {
         const unverifiable = await markTaskComplete(completionParams()).then(() => undefined, (error: unknown) => error);
-        refuseCompletedHistoryWrite = true;
+        refuseCompletionAndItsReadBack();
         const raised = await markTaskComplete(completionParams()).then(() => undefined, (error: unknown) => error);
         assert.ok(raised, 'the second attempt raises the unverifiable outcome');
         assert.equal(unverifiable, undefined, 'while a healthy completion raises nothing');

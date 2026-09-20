@@ -42,10 +42,14 @@ function makeTask(state: TaskState = TaskStates.PROCESSING): TaskStateData {
     };
 }
 
+const DURABLE_TRANSITION_ID = 'completed:durable-key';
+
 function createStore(
     initialState: TaskStateData,
     failedCasAttempts = 0,
     publication = { historyPersisted: true, eventPublished: true, errors: [] as string[] },
+    /** The transition identities this store's durable history can certify. */
+    durableCompletions: string[] = [DURABLE_TRANSITION_ID],
 ) {
     let current = structuredClone(initialState);
     let remainingFailedCasAttempts = failedCasAttempts;
@@ -86,15 +90,23 @@ function createStore(
             publication,
         };
     });
-    return { getTaskState, updateTaskStateIfCurrentDetailed, current: () => current };
+    // Stands in for the real projection: it refuses anything the durable history does not hold,
+    // and it appends no history row — the two properties the finalizer depends on.
+    const projectDurableCompletion = mock.fn(async (_taskId: string, options: { transitionId: string }) => {
+        if (!durableCompletions.includes(options.transitionId)) {
+            throw new Error(`DURABLE_COMPLETION_ABSENT: no completed history row for ${options.transitionId}`);
+        }
+        if (current.state === TaskStates.COMPLETED) return 'already_completed' as const;
+        if (current.state === TaskStates.FAILED || current.state === TaskStates.CANCELLED) return 'terminal_conflict' as const;
+        current.state = TaskStates.COMPLETED;
+        current.updatedAt = new Date(Date.parse(current.updatedAt) + 1).toISOString();
+        return 'projected' as const;
+    });
+    return { getTaskState, updateTaskStateIfCurrentDetailed, projectDurableCompletion, current: () => current };
 }
 
 test('completed PR comment results close nonterminal task states', async (t) => {
     const cases = [
-        { status: 'complete', expected: TaskStates.COMPLETED },
-        { status: 'completed', expected: TaskStates.COMPLETED },
-        { status: 'partial', expected: TaskStates.COMPLETED },
-        { status: 'skipped', expected: TaskStates.COMPLETED },
         { status: 'cancelled', expected: TaskStates.CANCELLED },
         { status: 'requeued', expected: TaskStates.CANCELLED },
         { status: 'rescheduled', expected: TaskStates.CANCELLED },
@@ -113,6 +125,72 @@ test('completed PR comment results close nonterminal task states', async (t) => 
             assert.equal(store.current().state, testCase.expected);
         });
     }
+});
+
+/**
+ * An executed outcome is the report of a job that RAN a model execution. The finalizer runs none
+ * of its own, so it has no standing to certify one: it may only relay the completion the durable
+ * history already holds, under the identity the executing path claimed. Everything else is a
+ * refusal — never a completion minted here with a non-executing capability, which is precisely
+ * the evidence-free row a value-only consumer re-dispatches on.
+ */
+test('an executed outcome is relayed from the durable history, never minted here', async (t) => {
+    for (const status of ['complete', 'completed', 'partial'] as const) {
+        await t.test(`${status} is projected from its claimed identity`, async () => {
+            const store = createStore(makeTask());
+            const result = await finalizeCompletedPRCommentTask(
+                'task-123',
+                { status, terminalTransitionId: DURABLE_TRANSITION_ID },
+                store,
+            );
+            assert.equal(result.outcome, 'projection_reconciled');
+            assert.equal(result.stateChanged, true);
+            assert.equal(store.current().state, TaskStates.COMPLETED);
+            assert.equal(store.updateTaskStateIfCurrentDetailed.mock.calls.length, 0,
+                'nothing may be appended to the history for a completion this module did not run');
+        });
+
+        await t.test(`${status} without a claimed identity is refused`, async () => {
+            const store = createStore(makeTask());
+            const result = await finalizeCompletedPRCommentTask('task-123', { status }, store);
+            assert.equal(result.outcome, 'unverifiable_completion');
+            assert.equal(result.stateChanged, false);
+            assert.equal(store.current().state, TaskStates.PROCESSING);
+            assert.equal(store.updateTaskStateIfCurrentDetailed.mock.calls.length, 0);
+        });
+
+        await t.test(`${status} whose claimed row is not durable is refused`, async () => {
+            const store = createStore(makeTask());
+            const result = await finalizeCompletedPRCommentTask(
+                'task-123',
+                { status, terminalTransitionId: 'completed:never-written' },
+                store,
+            );
+            assert.equal(result.outcome, 'unverifiable_completion');
+            assert.match(result.unverifiableReason ?? '', /DURABLE_COMPLETION_ABSENT/);
+            assert.equal(store.current().state, TaskStates.PROCESSING);
+        });
+    }
+});
+
+test('a skip settles here only when the result proves it preceded any execution', async (t) => {
+    await t.test('a proven pre-execution skip completes', async () => {
+        const store = createStore(makeTask());
+        const result = await finalizeCompletedPRCommentTask(
+            'task-123',
+            { status: 'skipped', reason: 'no_authorized_review_findings', preExecutionSkip: true },
+            store,
+        );
+        assert.equal(result.outcome, 'finalized');
+        assert.equal(store.current().state, TaskStates.COMPLETED);
+    });
+
+    await t.test('an unproven skip is refused rather than completed', async () => {
+        const store = createStore(makeTask());
+        const result = await finalizeCompletedPRCommentTask('task-123', { status: 'skipped' }, store);
+        assert.equal(result.outcome, 'unverifiable_completion');
+        assert.equal(store.current().state, TaskStates.PROCESSING);
+    });
 });
 
 test('unknown completed results are recorded as failures', async () => {
@@ -145,16 +223,29 @@ test('failure finalization sanitizes errors before persisting them', async () =>
 
 test('finalization never overwrites an existing terminal state', async () => {
     const store = createStore(makeTask(TaskStates.CANCELLED));
-    const result = await finalizeCompletedPRCommentTask('task-123', { status: 'complete' }, store);
+    const result = await finalizeCompletedPRCommentTask('task-123', { status: 'failed' }, store);
 
     assert.equal(result.outcome, 'already_terminal');
     assert.equal(store.current().state, TaskStates.CANCELLED);
     assert.equal(store.updateTaskStateIfCurrentDetailed.mock.calls.length, 0);
 });
 
+test('a durable completion is never projected over a different terminal state', async () => {
+    const store = createStore(makeTask(TaskStates.CANCELLED));
+    const result = await finalizeCompletedPRCommentTask(
+        'task-123',
+        { status: 'complete', terminalTransitionId: DURABLE_TRANSITION_ID },
+        store,
+    );
+
+    assert.equal(result.outcome, 'unverifiable_completion',
+        'a completion and a cancellation disagreeing is an operator problem, not something to overwrite');
+    assert.equal(store.current().state, TaskStates.CANCELLED);
+});
+
 test('finalization retries a compare-and-set conflict with fresh state', async () => {
     const store = createStore(makeTask(), 1);
-    const result = await finalizeCompletedPRCommentTask('task-123', { status: 'skipped' }, store);
+    const result = await finalizeCompletedPRCommentTask('task-123', { status: 'skipped', preExecutionSkip: true }, store);
 
     assert.equal(result.outcome, 'finalized');
     assert.equal(store.current().state, TaskStates.COMPLETED);
@@ -164,7 +255,7 @@ test('finalization retries a compare-and-set conflict with fresh state', async (
 test('finalization keeps retrying after five compare-and-set conflicts', async () => {
     const store = createStore(makeTask(), 5);
 
-    const result = await finalizeCompletedPRCommentTask('task-123', { status: 'complete' }, store);
+    const result = await finalizeCompletedPRCommentTask('task-123', { status: 'skipped', preExecutionSkip: true }, store);
 
     assert.equal(result.outcome, 'finalized');
     assert.equal(store.updateTaskStateIfCurrentDetailed.mock.calls.length, 6);
@@ -208,7 +299,7 @@ test('processor reasons are sanitized and bounded before persistence', async () 
     const secret = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn';
     await finalizeCompletedPRCommentTask(
         'task-123',
-        { status: 'skipped', reason: `${secret}${'x'.repeat(1_000)}` },
+        { status: 'skipped', preExecutionSkip: true, reason: `${secret}${'x'.repeat(1_000)}` },
         store,
     );
 
@@ -226,7 +317,7 @@ test('finalization explicitly reports incomplete durable publication', async () 
         errors: ['history: unavailable'],
     });
 
-    const result = await finalizeCompletedPRCommentTask('task-123', { status: 'complete' }, store);
+    const result = await finalizeCompletedPRCommentTask('task-123', { status: 'skipped', preExecutionSkip: true }, store);
 
     assert.equal(result.outcome, 'partial_publication');
     assert.equal(result.stateChanged, true);

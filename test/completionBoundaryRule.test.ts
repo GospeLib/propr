@@ -26,6 +26,7 @@ import {
     modelExecutionMethodNames,
     reachesModelExecution,
     publishesUnderClaimedIdentity,
+    publishesCertifiedEvidence,
     ANALYZED_ROOTS,
     type SourceFacts,
 } from './helpers/completionBoundaryAnalysis.js';
@@ -52,7 +53,7 @@ await mock.module('../packages/core/src/utils/logger.js', {
 });
 const { buildTaskStateTransition } = await import('../packages/core/src/utils/workerStateTransition.js');
 
-const BARRIER_MODULE = 'src/jobs/completedExecutionDurability.ts';
+const BARRIER_MODULE = 'packages/core/src/utils/durableCompletionBarrier.ts';
 const TRANSITION_ID = 'completed:7b1f';
 
 const facts = await analyzeCompletionBoundary();
@@ -124,6 +125,8 @@ describe('the repository-wide rule sees what a regex sweep could not', () => {
             assert.ok([...facts.keys()].some(path => path.startsWith(`${root}/`)), `${root} must be analysed`);
         }
         assert.ok(facts.has(BARRIER_MODULE), 'including the barrier itself');
+        assert.equal(facts.get('src/jobs/completedExecutionDurability.ts')?.publishesCompleted, false,
+            'the job tree names the barrier but no longer holds a second implementation of it');
         assert.ok(facts.has('packages/core/src/utils/workerStateManager.ts'),
             'and the state-transition API outside src/, where the previous sweep never looked');
     });
@@ -194,6 +197,11 @@ describe('the repository-wide rule sees what a regex sweep could not', () => {
                     + ' barrier, or claim a durable transition identity and mint the execution capability itself');
                 continue;
             }
+            // A publisher that runs no execution may still be publishing one: the module-granular
+            // view cannot see that a queue finalizer is certifying an executing job's outcome. So
+            // "no execution of my own" is not on its own a licence to declare a completion —
+            // either it relays one the durable history proves, or it states why none was needed.
+            if (publishesCertifiedEvidence(entry)) continue;
             assert.equal(entry.nonExecutingReasons.length, entry.completionSites.length,
                 `${detail} but runs no model execution, so every site must declare nonExecutingCompletionGuard with a reason`);
             for (const reason of entry.nonExecutingReasons) {
@@ -202,9 +210,20 @@ describe('the repository-wide rule sees what a regex sweep could not', () => {
         }
     });
 
+    test('the one publisher that certifies another path\'s execution can only relay it', () => {
+        const projector = facts.get('packages/core/src/utils/workerStateManager.ts') as SourceFacts;
+        assert.ok(projector.publishesCompleted, 'the projection publishes a completed transition');
+        assert.ok(publishesCertifiedEvidence(projector),
+            'and it may only do so against a durable row for the caller\'s exact identity');
+        assert.equal(projector.mintsExecutionCapability, false,
+            'it never mints the execution capability itself: the certification does, or nothing does');
+        assert.deepEqual(projector.nonExecutingReasons, [],
+            'and it must not declare itself non-executing, which is the excuse this category replaces');
+    });
+
     test('the ledger of non-executing publishers is derived from the sources, never hand-kept', () => {
         const derived = publishers
-            .filter(entry => !entry.usesBarrier && !publishesUnderClaimedIdentity(entry))
+            .filter(entry => !entry.usesBarrier && !publishesUnderClaimedIdentity(entry) && !publishesCertifiedEvidence(entry))
             .map(entry => ({ path: entry.path, reasons: [...new Set(entry.nonExecutingReasons)], executions: reachesModelExecution(entry.path, facts) }))
             .sort((a, b) => a.path.localeCompare(b.path));
         assert.deepEqual(derived, [
@@ -215,19 +234,20 @@ describe('the repository-wide rule sees what a regex sweep could not', () => {
             },
             {
                 path: 'src/jobs/prCommentTaskFinalizer.ts',
-                reasons: ['reconciles a task from its BullMQ job outcome; it executes nothing itself'],
+                reasons: ['the job skipped before any agent ran, which its result proves; nothing executed to have evidence of'],
                 executions: [],
             },
         ], 'a new exempt publisher, or one that starts executing, changes this derivation and fails here');
     });
 
-    test('the native analysis route publishes an executed completion under a claimed identity', () => {
+    test('the native analysis route publishes its executed completion through the common barrier', () => {
         const route = facts.get('packages/api/routes/nativeAnalysis.ts') as SourceFacts;
         assert.ok(route, 'a completion writer outside src/, which the previous sweep never looked at');
-        assert.ok(route.publishesCompleted && route.invokesModelExecution,
-            'it runs a model execution and publishes completed in the same call');
-        assert.ok(publishesUnderClaimedIdentity(route),
-            'so it claims a durable transition identity and presents the execution capability');
+        assert.ok(route.invokesModelExecution, 'it runs a model execution');
+        assert.ok(route.usesBarrier,
+            'and settles it through the same barrier as the queued paths — same claimed identity, same read-back');
+        assert.equal(route.mintsExecutionCapability, false,
+            'a route that mints its own capability is a second set of rules about publishing a completion');
     });
 
     test('prCommentReviewJob does run a model execution, and completes through the barrier', () => {

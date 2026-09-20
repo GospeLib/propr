@@ -11,10 +11,14 @@ export { persistLlmLog, createLlmLogFromAnalysis, createLlmLogFromAgentExecution
 export type { LlmLogEntry, WorkReference, WorkType } from './utils/llmLogger.js';
 export type { LLMMetricsSummary, LLMMetricsData, RecordMetricsOptions, ClaudeResult as LLMClaudeResult, IssueRef as LLMIssueRef, ModelPricing, ExtractedMetrics, AggregatedMetrics, CostCheckMetrics, PersistMetrics, ConversationDetail, LLMMetricsSummaryResult, ModelMetrics, DailyMetric, HighCostAlert, ConversationStep, TokenUsage, ExecutionType } from './utils/llmMetrics.types.js';
 export { WorkerStateManager, getStateManager, closeStateManager, TaskStates } from './utils/workerStateManager.js';
+export { ClaudeResultPhases } from './utils/workerStateManager.types.js';
 export { taskStateExpectation, MAX_ATOMIC_UPDATE_ATTEMPTS, waitForAtomicUpdateRetry } from './utils/workerStateTransition.js';
 export { durableExecutionCompletionGuard, nonExecutingCompletionGuard, isCompletionGuard, assertCompletionGuarded, UNGUARDED_TASK_COMPLETION, COMPLETION_GUARD_IDENTITY_MISMATCH } from './utils/completionGuard.js';
 export type { CompletionGuard } from './utils/completionGuard.js';
 export { claimTerminalTransition, terminalTransitionId, durableOperationIdentity, TERMINAL_OPERATION_IDENTITY_MISSING } from './utils/terminalTransitionClaim.js';
+export { publishCompletedWithDurableExecutionEvidence, carriesTerminalExecutionEvidence, certifyDurableCompletion, isDurableCompletionAbsent, COMPLETION_WITHOUT_EXECUTION_EVIDENCE, COMPLETION_HISTORY_NOT_DURABLE, DURABLE_COMPLETION_ABSENT } from './utils/durableCompletionBarrier.js';
+export type { DurableCompletionOptions, DurableCompletionResult } from './utils/durableCompletionBarrier.js';
+export { COMPLETION_DURABILITY_UNVERIFIABLE, CompletionDurabilityUnverifiableError, isCompletionDurabilityUnverifiable } from './utils/completionDurabilityOutcome.js';
 export { hashTaskAttemptToken } from './utils/taskAttemptGeneration.js';
 export { getEventPublisher, closeEventPublisher, EventPublisher } from './utils/eventPublisher.js';
 export type { TaskState, IssueRef, HistoryEntry, LastError, ClaudeResultSummary, ClaudeResultPhase, PRResult, TaskStateData, TaskStateExpectation, TaskStatePublicationResult, TaskStateUpdateResult, UpdateMetadata, TaskResult, ResumableTaskInfo, NonTerminalTaskScanResult, WorkerStateManagerOptions } from './utils/workerStateManager.types.js';

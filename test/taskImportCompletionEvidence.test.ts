@@ -10,7 +10,7 @@
  * durable failure and is never published as completed.
  */
 import assert from 'node:assert/strict';
-import { completionCoreExports } from './helpers/completionCoreDoubles.js';
+import { completionCoreExports, completionDatabase } from './helpers/completionCoreDoubles.js';
 import { beforeEach, describe, mock, test } from 'node:test';
 
 const TASK_STATES = {
@@ -77,12 +77,6 @@ await mock.module('@propr/core', {
         TaskStates: TASK_STATES,
         ErrorCategories: ERROR_CATEGORIES,
         logger: { ...coreLogger, withCorrelation: () => coreLogger },
-        // The read-back the barrier performs after an ambiguous write. Refusing it is what makes
-        // a completion unverifiable: it may have committed, and nothing can establish whether.
-        db: () => ({ where: () => ({ first: async () => {
-            if (refuseCompletedHistoryWrite) throw new Error('database refused the history read-back');
-            return undefined;
-        } }) }),
         getStateManager: () => stateManager,
         getAuthenticatedOctokit: async () => ({ auth: async () => ({ token: 'github-token' }) }),
         withRetry: async (operation: () => Promise<unknown>) => operation(),
@@ -142,6 +136,7 @@ beforeEach(() => {
     failures.length = 0;
     markTaskCompletedCalls = 0;
     refuseCompletedHistoryWrite = false;
+    completionDatabase.reset();
     agentResult = {
         success: true,
         logs: 'logs',
@@ -201,6 +196,9 @@ describe('the task-import job records terminal execution evidence', () => {
      */
     test('a completion whose durability cannot be established never becomes a failed record', async () => {
         refuseCompletedHistoryWrite = true;
+        // The read-back the barrier performs after that ambiguous write also fails. That is what
+        // makes the completion unverifiable: it may have committed, and nothing can establish it.
+        completionDatabase.failReadBack = true;
 
         await assert.rejects(() => processTaskImportJob(taskImportJob()),
             /COMPLETION_DURABILITY_UNVERIFIABLE/);

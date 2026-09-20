@@ -14,7 +14,7 @@ import { durableOperationIdentity, type WorkerStateManager } from '@propr/core';
 import type { Job } from 'bullmq';
 import type { Logger } from 'pino';
 import type { ReviewResult } from './prReviewRunner.js';
-import { publishCompletedWithDurableExecutionEvidence } from './completedExecutionDurability.js';
+import { publishCompletedWithDurableExecutionEvidence, type DurableCompletionResult } from './completedExecutionDurability.js';
 
 export interface ReviewExecutionOutcome {
     success: boolean;
@@ -34,7 +34,11 @@ export function reviewExecutionOutcome(reviewResults: ReviewResult[]): ReviewExe
     };
 }
 
-/** Publishes the review run's completion through the durability barrier, with its evidence. */
+/**
+ * Publishes the review run's completion through the durability barrier, with its evidence, and
+ * hands back the identity it was claimed under. The job result carries that identity onward: it
+ * is the only thing that lets the BullMQ finalizer verify this completion rather than mint one.
+ */
 export async function publishReviewCompletion(options: {
     stateManager: WorkerStateManager;
     taskId: string;
@@ -42,9 +46,9 @@ export async function publishReviewCompletion(options: {
     reviewResults: ReviewResult[];
     ultrafixHistoryMeta: Record<string, unknown> | undefined;
     correlatedLogger: Logger;
-}): Promise<void> {
+}): Promise<DurableCompletionResult> {
     const { stateManager, taskId, job, reviewResults, ultrafixHistoryMeta, correlatedLogger } = options;
-    await publishCompletedWithDurableExecutionEvidence({
+    return publishCompletedWithDurableExecutionEvidence({
         stateManager, taskId, correlatedLogger,
         // The queue job owns this attempt and keeps its id across every redelivery.
         operationId: durableOperationIdentity('pr-comment-review-job', job.id ?? taskId),

@@ -9,6 +9,7 @@ import {
 import {
     finalizeCompletedPRCommentTask,
     finalizeFailedPRCommentTask,
+    type PRCommentTaskFinalizationResult,
 } from './jobs/prCommentTaskFinalizer.js';
 
 export const DEFAULT_RECONCILIATION_STALE_MS = 15 * 60 * 1000;
@@ -26,7 +27,7 @@ export interface ReconciliationQueue {
 
 export type ReconciliationStateManager = Pick<
     WorkerStateManager,
-    'scanNonTerminalTasks' | 'getTaskState' | 'updateTaskStateIfCurrentDetailed'
+    'scanNonTerminalTasks' | 'getTaskState' | 'updateTaskStateIfCurrentDetailed' | 'projectDurableCompletion'
 >;
 
 export type TaskContainerLiveness = 'running' | 'not_found' | 'unavailable';
@@ -38,6 +39,14 @@ export interface TaskStateReconciliationSummary {
     recovered: number;
     skipped: number;
     errors: number;
+    /**
+     * Tasks left deliberately unsettled because a completion may be durable and could not be
+     * verified. Counted apart from `skipped` — and inside `errors` — because it is the one
+     * outcome an operator must act on: an ordinary skip means "nothing to do here", while this
+     * means work may be delivered, stuck, or about to be retried, and the reconciler cannot tell
+     * which. Folding it into `skipped` is what made a run of these read as a clean sweep.
+     */
+    unverifiableCompletions: number;
 }
 
 export interface TaskStateReconciliationOptions {
@@ -125,6 +134,30 @@ async function runWithinRemainingBudget<T>(
     });
 }
 
+/**
+ * Records one finalization outcome, keeping an unverifiable completion out of `skipped`.
+ *
+ * `stateChanged: false` covers two completely different facts: "this task was already settled,
+ * nothing to do" and "a completion may exist and we could not establish it". Only the second is
+ * actionable, so it is counted on its own and as an error, and logged at a level an alert can
+ * key on.
+ */
+function recordFinalizationOutcome(
+    taskId: string,
+    result: PRCommentTaskFinalizationResult,
+    summary: TaskStateReconciliationSummary,
+): void {
+    if (result.outcome === 'unverifiable_completion') {
+        summary.unverifiableCompletions++;
+        summary.errors++;
+        logger.error({ taskId, outcome: result.outcome, reason: result.unverifiableReason },
+            'Task reconciliation left a task unsettled because its completion could not be verified');
+        return;
+    }
+    if (result.stateChanged) summary.recovered++;
+    else summary.skipped++;
+}
+
 function isPRCommentTask(task: TaskStateData): boolean {
     if (task.issueRef.type !== undefined) return task.issueRef.type === 'pr_comment';
     return task.taskId.startsWith('pr-comment-')
@@ -202,8 +235,7 @@ async function finalizeFromJob(
             deadline,
             signal,
         );
-        if (result.stateChanged) summary.recovered++;
-        else summary.skipped++;
+        recordFinalizationOutcome(task.taskId, result, summary);
         return;
     }
     if (jobState === 'failed') {
@@ -217,8 +249,7 @@ async function finalizeFromJob(
             deadline,
             signal,
         );
-        if (result.stateChanged) summary.recovered++;
-        else summary.skipped++;
+        recordFinalizationOutcome(task.taskId, result, summary);
         return;
     }
     logger.warn({ taskId: task.taskId, jobState }, 'Skipped stale task with an unrecognized BullMQ state');
@@ -274,8 +305,7 @@ async function reconcileTask(
         deadline,
         signal,
     );
-    if (result.stateChanged) summary.recovered++;
-    else summary.skipped++;
+    recordFinalizationOutcome(task.taskId, result, summary);
 }
 
 export async function reconcileStalePRCommentTasks(
@@ -314,6 +344,7 @@ export async function reconcileStalePRCommentTasks(
             recovered: 0,
             skipped: 0,
             errors: 0,
+            unverifiableCompletions: 0,
         };
         let backlogStart = page.tasks.length;
         const context: ReconciliationRunContext = {

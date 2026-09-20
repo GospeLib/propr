@@ -1,13 +1,14 @@
 import { randomUUID, createHash } from 'node:crypto';
 import {
     getStateManager, runWithExecutionAbortSignal, runWithPlannerAbortContext, TaskStates, SyntheticAgent,
-    claimTerminalTransition, durableOperationIdentity, durableExecutionCompletionGuard,
-    type Agent, type AnalyzeOptions, type UpdateMetadata, type WorkerStateManager,
+    durableOperationIdentity, publishCompletedWithDurableExecutionEvidence, isCompletionDurabilityUnverifiable,
+    type Agent, type AnalyzeOptions, type WorkerStateManager,
 } from '@propr/core';
 import { setAbortSignal } from './plannerAbortHandlers.js';
 const CANCELLATION_CHECKPOINT_TIMEOUT_MS = 2_000;
 const NATIVE_INPUT_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const NATIVE_REPOSITORY_PATTERN = /^[^/\s]+\/[^/\s]+$/;
+const TERMINAL_NATIVE_STATES = new Set<string>([TaskStates.COMPLETED, TaskStates.FAILED, TaskStates.CANCELLED]);
 export function nativeAnalysisFailureExecution(error: unknown): Record<string, never> | { execution: Record<string, unknown> } {
     const execution = (error as { execution?: Record<string, unknown> })?.execution;
     return execution === undefined ? {} : { execution };
@@ -22,7 +23,25 @@ export interface NativeAnalysisBinding {
     repository: string;
 }
 export type NativeAnalysisStateManager = Pick<WorkerStateManager,
-    'createTaskState' | 'updateTaskState' | 'updateHistoryMetadata'>;
+    'createTaskState' | 'updateTaskState' | 'updateHistoryMetadata' | 'getTaskState' | 'markTaskFailed'
+    | 'projectDurableCompletion'>;
+
+/** The task already holds a terminal state for this admitted operation; it may not run again. */
+export const NATIVE_ANALYSIS_OPERATION_SETTLED = 'NATIVE_ANALYSIS_OPERATION_ALREADY_SETTLED';
+
+/**
+ * The task identity of one admitted native-analysis operation.
+ *
+ * A random id per request is worthless across the failure it has to survive: the process dies
+ * after the completed history row commits, the caller retries the SAME admitted operation, and a
+ * fresh id makes a fresh task — and therefore a fresh terminal transition identity — so the
+ * completion that is already durable is invisible and the paid work is repeated. Deriving the id
+ * from the operation identity instead means the retry addresses the same task, claims the same
+ * transition, and the barrier's read-back recognises what already landed.
+ */
+export function nativeAnalysisTaskId(operationId: string): string {
+    return `native-analysis-${createHash('sha256').update(operationId).digest('hex').slice(0, 32)}`;
+}
 export interface NativeAnalysisDependencies {
     stateManager?: NativeAnalysisStateManager;
     setAbortSignal?: typeof setAbortSignal;
@@ -57,7 +76,10 @@ export async function nativeAnalysis(
     validateBinding(binding, prompt, options.responseSchema);
     const state = dependencies.stateManager ?? getStateManager();
     const requestId = binding.requestId;
-    const taskId = randomUUID();
+    const operationIdentity = durableOperationIdentity('native-analysis', binding.operationId);
+    const taskId = nativeAnalysisTaskId(binding.operationId);
+    // The attempt generation stays per-attempt on purpose: it fences executor ownership for THIS
+    // attempt, which is the opposite of what the task and transition identities are for.
     const attemptGeneration = randomUUID();
     const [repoOwner, repoName] = binding.repository.split('/');
     const evidence = {
@@ -103,8 +125,17 @@ export async function nativeAnalysis(
     };
     signal.addEventListener('abort', requestCancellation, { once: true });
     if (signal.aborted) requestCancellation();
+    // A redelivery of the same admitted operation finds the task that operation already created.
+    // One that already settled is refused outright rather than re-executed: repeating the paid run
+    // is the loss this identity exists to prevent. It is checked before the settlement handler is
+    // in scope, so a refusal can never write anything over the terminal state it just found.
+    const existing = await state.getTaskState(taskId);
+    if (existing && TERMINAL_NATIVE_STATES.has(existing.state)) {
+        signal.removeEventListener('abort', requestCancellation);
+        throw new Error(`${NATIVE_ANALYSIS_OPERATION_SETTLED}: ${taskId} is already ${existing.state}`);
+    }
     try {
-        await state.createTaskState(taskId, {
+        if (!existing) await state.createTaskState(taskId, {
             number: 0, repoOwner, repoName, type: 'analysis', ...evidence,
             providerInput: { prompt, ...(options.responseSchema === undefined ? {} : { responseSchema: options.responseSchema }),
                 ...(options.context === undefined ? {} : { context: options.context }) },
@@ -136,29 +167,45 @@ export async function nativeAnalysis(
         await cancellationCheckpoint;
         let settlementError: string | undefined;
         const terminalState = signal.aborted ? TaskStates.CANCELLED : result.success ? TaskStates.COMPLETED : TaskStates.FAILED;
+        let terminalTransitionId: string | undefined;
+        const terminalHistoryMetadata = { ...evidence, ...schemaEvidence(), result, childStopped, containerStopped,
+            // The terminal outcome a value-only reader needs, beside the raw result.
+            agentOutcome: { success: result.success, executionTimeMs: result.executionTimeMs },
+            cancellationAcknowledged: signal.aborted, cancellationCheckpointErrors: [...cancellationCheckpointErrors] };
         try {
-            // This route runs a model execution and publishes its own `completed`, so it claims a
-            // durable transition identity and presents the execution capability exactly as the
-            // queued paths do. A claim or write that fails leaves the terminal record unwritten
-            // and says so on the receipt; it never settles the run as something it was not.
-            let completionKey: UpdateMetadata = {};
+            // This route runs a model execution and publishes its own `completed`, so it goes
+            // through the same durability barrier as the queued paths — the same claimed
+            // identity, the same strict write, and the same exact read-back of THAT identity
+            // when the write is ambiguous. A parallel settlement here would be a second set of
+            // rules about when a completion may be published: it was one, and it reported a
+            // committed completion as unrecorded, which is how the paid work got repeated.
             if (terminalState === TaskStates.COMPLETED) {
-                const transitionId = await claimTerminalTransition(taskId, TaskStates.COMPLETED,
-                    durableOperationIdentity('native-analysis', binding.operationId));
-                completionKey = { transitionId, completionGuard: durableExecutionCompletionGuard(transitionId) };
+                const completion = await publishCompletedWithDurableExecutionEvidence({
+                    stateManager: state, taskId, operationId: operationIdentity,
+                    metadata: { requireDurableHistory: true, historyMetadata: terminalHistoryMetadata },
+                });
+                terminalTransitionId = completion.transitionId;
+                if (completion.outcome === 'settled_failed') {
+                    settlementError = 'the completed history could not be persisted; the run was settled as failed with its evidence';
+                }
+            } else {
+                await state.updateTaskState(taskId, terminalState,
+                    { requireDurableHistory: true, historyMetadata: terminalHistoryMetadata });
             }
-            await state.updateTaskState(taskId, terminalState,
-                { requireDurableHistory: true, ...completionKey,
-                    historyMetadata: { ...evidence, ...schemaEvidence(), result, childStopped, containerStopped,
-                        // The terminal outcome a value-only reader needs, beside the raw result.
-                        agentOutcome: { success: result.success, executionTimeMs: result.executionTimeMs },
-                        cancellationAcknowledged: signal.aborted, cancellationCheckpointErrors: [...cancellationCheckpointErrors] } });
-        } catch (error) { settlementError = (error as Error).message; }
+        } catch (error) {
+            settlementError = (error as Error).message;
+        }
         // Execution already returned: bookkeeping failure is not a second model
         // outcome. Preserve its paid response, but explicitly refuse a settled receipt.
         return { ...result, execution: { ...evidence, ...schemaEvidence(), childStopped, containerStopped,
             terminalRecorded: settlementError === undefined,
-            ...(settlementError === undefined ? {} : { settlementError }) } };
+            ...(terminalTransitionId === undefined ? {} : { terminalTransitionId }),
+            ...(settlementError === undefined ? {} : { settlementError }),
+            // Durability could not be established either way: a caller must NOT treat this as
+            // "nothing landed" and repeat the operation. Re-running it reaches the same task and
+            // the same transition identity, which is what makes that recoverable.
+            ...(settlementError !== undefined && isCompletionDurabilityUnverifiable(settlementError)
+                ? { completionDurabilityUnverifiable: true } : {}) } };
     } catch (error) {
         await cancellationCheckpoint;
         let settlementError: string | undefined;

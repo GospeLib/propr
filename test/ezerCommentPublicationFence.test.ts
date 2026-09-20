@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { completionCoreExports } from './helpers/completionCoreDoubles.js';
 import { mock, test } from 'node:test';
 import * as visualPreview from '../packages/core/src/services/visualPreviewService.js';
 
@@ -14,7 +15,7 @@ const updateTaskState = mock.fn(async () => undefined);
 const patchComment = mock.fn(async () => ({ data: { html_url: 'https://example.test/comment/1', body: 'completion' } }));
 
 await mock.module('@propr/core', {
-    namedExports: { ...publicationPolicy, ...visualPreview,
+    namedExports: { ...publicationPolicy, ...visualPreview, ...completionCoreExports,
         loadRepositoryVisualPreviewSettings: async () => ({ enabled: false, types: [] }),
         prepareVisualPreviewEvidence: async () => ({ evidence: { assets: [], toolSuggestions: [] } }),
         cleanupPreparedVisualPreviewEvidence: async () => undefined,

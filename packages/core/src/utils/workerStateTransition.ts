@@ -223,6 +223,37 @@ export async function publishTaskStateTransition(
 
     if (metadata.requireDurableHistory && !publication.historyPersisted) return publication;
 
+    await publishTaskTransitionEvent(taskId, transition, metadata, publication);
+
+    if (!publication.historyPersisted || !publication.eventPublished) {
+        correlatedLogger.error({
+            taskId,
+            version: state.version,
+            historyPersisted: publication.historyPersisted,
+            eventPublished: publication.eventPublished,
+            errors: publication.errors,
+        }, 'Task state changed in Redis but publication was only partially successful');
+    }
+    return publication;
+}
+
+/**
+ * Announces a transition that is already in Redis, WITHOUT writing history.
+ *
+ * The realtime event is a projection of the durable history, exactly like the Redis snapshot. A
+ * reconciliation that is catching both up to a history row that already exists must publish the
+ * event and append nothing — re-running the history insert would either duplicate the row or, if
+ * the unique index rejects it and the rejection is swallowed, leave the projection behind while
+ * the caller believes it was caught up.
+ */
+export async function publishTaskTransitionEvent(
+    taskId: string,
+    transition: TaskStateTransition,
+    metadata: UpdateMetadata,
+    publication: TaskStatePublicationResult,
+): Promise<TaskStatePublicationResult> {
+    const { state, previousState } = transition;
+    const correlatedLogger = logger.withCorrelation(state.correlationId);
     try {
         publication.eventPublished = await getEventPublisher().publishTaskUpdate({
             taskId,
@@ -242,16 +273,6 @@ export async function publishTaskStateTransition(
             taskId,
             version: state.version,
         }, 'Failed to publish task state update event');
-    }
-
-    if (!publication.historyPersisted || !publication.eventPublished) {
-        correlatedLogger.error({
-            taskId,
-            version: state.version,
-            historyPersisted: publication.historyPersisted,
-            eventPublished: publication.eventPublished,
-            errors: publication.errors,
-        }, 'Task state changed in Redis but publication was only partially successful');
     }
     return publication;
 }

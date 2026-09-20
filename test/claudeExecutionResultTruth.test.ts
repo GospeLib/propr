@@ -8,6 +8,7 @@
  * the history actually sees.
  */
 import assert from 'node:assert/strict';
+import { ClaudeResultPhases as CORE_RESULT_PHASES } from '../packages/core/src/utils/workerStateManager.types.js';
 import { readFile } from 'node:fs/promises';
 import { beforeEach, describe, mock, test } from 'node:test';
 
@@ -115,9 +116,17 @@ await mock.module('../packages/core/src/utils/logger.js', {
 
 // --------------------------------------------------- Barrel double for src/jobs
 
+// The durability barrier and the unverifiable outcome live in core now, so the barrel double has
+// to carry them. They are the real modules, reading through the database double installed above.
+const barrier = await import('../packages/core/src/utils/durableCompletionBarrier.js');
+const durabilityOutcome = await import('../packages/core/src/utils/completionDurabilityOutcome.js');
+
 await mock.module('@propr/core', {
     namedExports: {
+        ...barrier,
+        ...durabilityOutcome,
         TaskStates: TASK_STATES,
+        ClaudeResultPhases: CORE_RESULT_PHASES,
         logger: { ...coreLogger, withCorrelation: () => coreLogger },
         db: (table: string) => table === 'task_history' ? taskHistoryQuery() : taskHistoryQuery(),
         filterCommentByAuthor: () => ({ shouldFilter: false }),

@@ -1,5 +1,5 @@
 import { test, mock, describe, beforeEach } from 'node:test';
-import { completionCoreExports } from './helpers/completionCoreDoubles.js';
+import { completionCoreExports, completionDatabase } from './helpers/completionCoreDoubles.js';
 import assert from 'node:assert';
 
 // --- Mock Setup ---
@@ -175,13 +175,7 @@ await mock.module('@propr/core', {
         ErrorCategories: { POST_PROCESSING: 'post_processing' },
         redactSecrets: (value: string) => value,
         resolveAgentTerminationReason: (result: { terminationReason?: string }) => result.terminationReason,
-        db: () => ({ where: () => ({
-            first: async () => {
-                if (refuseCompletedHistoryWrite) throw new Error('database refused the history read-back');
-                return undefined;
-            },
-            update: async () => undefined,
-        }) }),
+        db: () => ({ where: () => ({ first: async () => undefined, update: async () => undefined }) }),
         ensureRepoCloned: mockEnsureRepoCloned,
         createWorktreeFromExistingBranch: mockCreateWorktreeFromExistingBranch,
         getRepoUrl: mockGetRepoUrl,
@@ -279,6 +273,7 @@ function resetAllMocks() {
     mockRedisStore.clear();
     mockSettings = {};
     refuseCompletedHistoryWrite = false;
+    completionDatabase.reset();
 }
 
 describe('processMergeConflictJob', () => {
@@ -540,6 +535,8 @@ describe('processMergeConflictJob', () => {
      */
     test('a completion whose durability cannot be established never becomes a failed record', async () => {
         refuseCompletedHistoryWrite = true;
+        // The read-back that would establish whether the completed row committed also fails.
+        completionDatabase.failReadBack = true;
 
         await assert.rejects(() => processMergeConflictJob(createMockJob()), /COMPLETION_DURABILITY_UNVERIFIABLE/);
 

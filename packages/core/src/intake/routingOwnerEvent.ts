@@ -76,12 +76,19 @@ export {EZER_NOT_OWNER_DISPOSITION,EZER_COMMAND_NOT_ADMITTED_DISPOSITION};
  * Otherwise the terminal {@link EZER_NOT_OWNER_DISPOSITION}: ACKed `ignored`, no seat consumed, no
  * fall-through to the dispatcher, and no withheld ACK an outsider could use to force redelivery.
  */
-export function claimEzerAddressedComment(comment:unknown,ownerUserId:string=process.env.EZER_OWNER_GITHUB_USER_ID??''):DeliveryDisposition|null{
- const claim=classifyEzerAddressedComment(comment,ownerUserId);
+export function claimEzerAddressedComment(comment:unknown):DeliveryDisposition|null{
+ const claim=classifyEzerAddressedComment(comment,process.env.EZER_OWNER_GITHUB_USER_ID??'');
  if(!claim.addressed)return null;
  return claim.ownerAuthored?null:EZER_NOT_OWNER_DISPOSITION;
 }
-/** Shared classification behind BOTH the refusal and the resolution, so the two can never drift. */
+/**
+ * Shared classification behind BOTH the refusal and the resolution, so the two can never drift.
+ * PRIVATE — not exported. The `ownerUserId` parameter is a test-only dependency-injection seam;
+ * both exported entry points ({@link claimEzerAddressedComment},
+ * {@link resolveOwnerEzerCommandBody}) always read the configured owner from
+ * `process.env.EZER_OWNER_GITHUB_USER_ID` themselves and never forward a caller-supplied value,
+ * so no importer of this module can redefine who the owner is.
+ */
 function classifyEzerAddressedComment(comment:unknown,ownerUserId:string):{addressed:false}|{addressed:true;ownerAuthored:boolean;body:string}{
  const candidate=object(comment);
  if(typeof candidate.body!=='string')return{addressed:false};
@@ -106,8 +113,8 @@ function classifyEzerAddressedComment(comment:unknown,ownerUserId:string):{addre
  *
  * @returns the rewritten body when the configured owner addressed Ezer, otherwise `null`.
  */
-export function resolveOwnerEzerCommandBody(comment:unknown,ownerUserId:string=process.env.EZER_OWNER_GITHUB_USER_ID??''):string|null{
- const claim=classifyEzerAddressedComment(comment,ownerUserId);
+export function resolveOwnerEzerCommandBody(comment:unknown):string|null{
+ const claim=classifyEzerAddressedComment(comment,process.env.EZER_OWNER_GITHUB_USER_ID??'');
  if(!claim.addressed||!claim.ownerAuthored)return null;
  const firstNewline=claim.body.indexOf('\n');
  const firstLine=firstNewline===-1?claim.body:claim.body.slice(0,firstNewline);

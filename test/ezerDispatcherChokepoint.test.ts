@@ -293,3 +293,27 @@ test('/ezer acquires a command meaning only for the configured owner', async () 
     assert.strictEqual(resolveOwnerEzerCommandBody({ body: '/EZER do a thing', user: OWNER_USER }), null,
         'the alias table was case-sensitive; so is this');
 });
+
+test('a caller cannot redefine the owner by supplying its own numeric id', async () => {
+    // The exported resolver must read the configured owner internally and unconditionally — it
+    // must not accept a caller-supplied owner id at all. `resolveOwnerEzerCommandBody` takes a
+    // single `comment` parameter now, so there is no second positional argument through which an
+    // importer could ever smuggle its own owner id, however it calls the function. We still probe
+    // at runtime (via an unsafe cast, since TypeScript itself now refuses the call at compile
+    // time) to prove that even a caller who bypasses the type system cannot move the owner.
+    const { resolveOwnerEzerCommandBody } = await import('../packages/core/src/intake/routingOwnerEvent.js');
+    const hostileWithOwnClaimedId = { id: 123, type: 'User' as const, login: 'drive-by-stranger' };
+    const body = '/ezer run hostile work';
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const bypassAttempt = (resolveOwnerEzerCommandBody as any)(
+        { body, user: hostileWithOwnClaimedId },
+        '123', // the exact reproduction: try to make the resolver believe id 123 is the owner
+    );
+    assert.strictEqual(bypassAttempt, null,
+        'a non-owner cannot resolve /ezer by supplying their own numeric id as a second argument — ' +
+        'the exported resolver ignores any argument beyond `comment` and reads the configured owner itself');
+
+    // Sanity: the same hostile comment is refused through the normal single-argument call too.
+    assert.strictEqual(resolveOwnerEzerCommandBody({ body, user: hostileWithOwnClaimedId }), null);
+});

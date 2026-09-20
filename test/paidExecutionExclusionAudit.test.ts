@@ -230,6 +230,15 @@ describe('the rule distinguishes a leased call from an unleased one in the same 
  *   of `const` hops — or the module load read inline as `require('child_process').spawn(…)`;
  * - the same property written with brackets and a STRING LITERAL name, `cp['spawn']`.
  *
+ * A destructuring is in scope only when its ROOT binding's module source is resolvable from a
+ * `VariableDeclaration` INITIALIZER — `const { spawn } = <expression naming child_process>`. That
+ * is deliberately narrower than "any binding": a `for...of` loop variable and a `catch` clause
+ * binding are also root object-binding patterns, but neither one's `VariableDeclaration` carries an
+ * initializer to resolve — a `for...of` binding's module identity would have to come from statically
+ * typing what the iterable yields, and a `catch` binding's from statically typing what the `try`
+ * block throws. Both are dataflow questions this analysis does not attempt, so both stay outside
+ * the claim; see "WHAT IS NOT PROVEN" below.
+ *
  * Value references count, not only direct calls, so `promisify(execFile)` is inventoried where it
  * is written. No module is skipped, including the executor's own. Nothing in any of those forms
  * can be added without this list changing, and the hostile fixtures below show each one being
@@ -238,10 +247,14 @@ describe('the rule distinguishes a leased call from an unleased one in the same 
  * WHAT IS NOT PROVEN. A property name that is not a literal (`cp[whichever]`), a namespace handed
  * through a parameter or stored on an object and reached from there, a process created by `eval`
  * or a native addon, a paid call made over HTTP to a provider API rather than by spawning, and a
- * dependency spawning on this repository's behalf are all outside it. It says nothing about
- * `packages/cli` or `propr-ui`, which the program excludes. Read it as "a process creation written
- * in one of the forms above cannot enter these sources unnoticed", never as "no paid work can
- * happen by any other means".
+ * dependency spawning on this repository's behalf are all outside it. So is a `for...of` loop
+ * binding destructured from its iterable (`for (const { spawn } of [require('child_process')])`)
+ * and a `catch` clause binding destructured from the thrown value (`catch ({ spawn })`) — both are
+ * valid, source-provable bindings to a real process-creation primitive, but neither carries the
+ * `VariableDeclaration` initializer this analysis resolves module identity from, so both are
+ * invisible to it. It says nothing about `packages/cli` or `propr-ui`, which the program excludes.
+ * Read it as "a process creation written in one of the forms above cannot enter these sources
+ * unnoticed", never as "no paid work can happen by any other means".
  */
 describe('every process creation written in a recognised form is inventoried and classified', () => {
     // Freezing ALL of them — not only the ones this analysis calls billable — is what makes a new
@@ -797,6 +810,44 @@ describe('every form the containment claim names is exercised, not believed', ()
             `,
         });
         assert.deepEqual(found, [], 'a rest element collects the remainder, it does not name one property');
+    });
+
+    // The next two are NOT watched-failing evidence of a fix — there is no fix here. They assert
+    // the CURRENT, documented behaviour named in "WHAT IS NOT PROVEN" above: a for-of loop binding
+    // and a catch clause binding are both invisible to this analysis, because neither's
+    // `VariableDeclaration` carries an initializer to resolve module identity from. Each fixture's
+    // primitive is reachable by a real call inside the usage-tracking wrapper, so an empty result
+    // here is the gap being named, not a coincidental miss of an untested call site.
+    test('DOCUMENTED GAP: a for-of binding destructured from its iterable is invisible to this analysis', () => {
+        const found = fixtureProcessCreationSites({
+            'forOfGap.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                export async function forOfGap(prompt: string) {
+                    for (const { spawn } of [require('node:child_process')]) {
+                        return executeWithUsageTracking('run', async () => spawn('docker ' + prompt));
+                    }
+                }
+            `,
+        });
+        assert.deepEqual(found, [],
+            'a for-of loop variable has no VariableDeclaration initializer, so this destructuring resolves nothing — documented, not fixed');
+    });
+
+    test('DOCUMENTED GAP: a catch binding destructured from the thrown value is invisible to this analysis', () => {
+        const found = fixtureProcessCreationSites({
+            'catchGap.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                export async function catchGap(prompt: string) {
+                    try {
+                        throw require('node:child_process');
+                    } catch ({ spawn }: any) {
+                        return executeWithUsageTracking('run', async () => spawn('docker ' + prompt));
+                    }
+                }
+            `,
+        });
+        assert.deepEqual(found, [],
+            'a catch clause binding has no VariableDeclaration initializer, so this destructuring resolves nothing — documented, not fixed');
     });
 });
 

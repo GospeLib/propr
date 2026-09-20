@@ -6,9 +6,11 @@
  * record for a stopped admitted execution before any destructive worktree cleanup.
  */
 import { resolveAgentTerminationReason, ErrorCategories } from '@propr/core';
-import type { ClaudeCodeResponse, CommitResult, WorkerStateManager } from '@propr/core';
+import type { ClaudeCodeResponse, CommitResult, UpdateMetadata, WorkerStateManager } from '@propr/core';
 import type { PostProcessingResult } from './issueJobHelpers.js';
 import { buildAgentOutcome } from './executionOutcome.js';
+import { finalClaudeExecutionResult } from './claudeExecutionResult.js';
+import { publishCompletedWithDurableExecutionEvidence } from './completedExecutionDurability.js';
 
 export function getTaskCompletionStatus(claudeResult: ClaudeCodeResponse | null, postProcessingResult: PostProcessingResult | null): string {
   if (postProcessingResult?.pr && claudeResult && resolveAgentTerminationReason(claudeResult)) {
@@ -30,6 +32,33 @@ function buildTerminalEvidence(claudeResult: ClaudeCodeResponse | null, postProc
     // The checkpoint push failed: name the retained local worktree (and its local commit,
     // already in executionCheckpoint.sha) so recovery can find the partial work.
     ...(retainedWorktreePath ? { retainedWorktreePath } : {}),
+  };
+}
+
+/** Everything the completed entry must carry: the PR/commit record and the terminal evidence. */
+function completionMetadata(
+  claudeResult: ClaudeCodeResponse | null,
+  taskResult: { prUrl?: string; prNumber?: number },
+  commitResultData: { commitHash: string; commitMessage: string } | null,
+  evidence: Record<string, unknown>,
+): UpdateMetadata {
+  const finalResult = claudeResult
+    ? finalClaudeExecutionResult({
+      success: claudeResult.success,
+      sessionId: claudeResult.sessionId,
+      conversationId: claudeResult.conversationId,
+      executionTime: claudeResult.executionTime,
+    })
+    : undefined;
+  return {
+    reason: 'Task completed successfully',
+    prResult: taskResult,
+    ...(finalResult ? { claudeResult: finalResult } : {}),
+    historyMetadata: {
+      pr: (taskResult.prUrl && taskResult.prNumber) ? { number: taskResult.prNumber, url: taskResult.prUrl } : null,
+      commitResult: commitResultData,
+      ...evidence,
+    },
   };
 }
 
@@ -85,5 +114,11 @@ export async function markTaskTerminalState(params: TerminalStateParams, policy:
   }
 
   if (policy.requireDurableHistory) throw Error('DURABLE_TERMINAL_STATE_ONLY_FOR_FAILED_EXECUTION');
-  await stateManager.markTaskCompleted(taskId, taskResult);
+  // `completed` is published only once this evidence is durable, and the evidence rides on the
+  // completed entry itself so the two cannot come apart. See completedExecutionDurability.ts.
+  await publishCompletedWithDurableExecutionEvidence({
+    stateManager,
+    taskId,
+    metadata: completionMetadata(claudeResult, taskResult, commitResultData, evidence),
+  });
 }

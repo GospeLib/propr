@@ -22,6 +22,9 @@ await mock.module('ioredis', { namedExports: { Redis: class {} } });
 await mock.module('node:child_process', { namedExports: { execFileSync: () => head } });
 await mock.module('@propr/core', { namedExports: {
   logger: { ...log, withCorrelation: () => log }, TaskStates: { PROCESSING: 'processing', COMPLETED: 'completed' },
+  // The completed-publication durability barrier categorises its own bookkeeping failure, and
+  // the terminal agentOutcome it records redacts the agent's final output.
+  ErrorCategories: { POST_PROCESSING: 'post_processing' }, redactSecrets: (value: string) => value,
   findRunningDockerContainerForTask: async () => undefined, inspectLegacyDockerContainerLivenessForTask: async () => 'not_found',
   getAuthenticatedOctokit: async () => octokit, getStateManager: () => stateManager,
   retryConfigs: {}, withRetry: async (call: () => unknown) => call(), hashTaskAttemptToken: (value: string) => value,

@@ -14,7 +14,6 @@ import {
     renderVisualPreviewSection,
     renderVisualPreviewUploadFailureSection,
     resolveAgentTerminationReason,
-    TaskStates,
     VISUAL_PREVIEW_SLOT,
 } from '@propr/core';
 import type {
@@ -30,6 +29,9 @@ import { buildCommitMessage } from './prCommentJobUtils.js';
 import { markReviewFindingsProcessed } from './reviewCommentGatherer.js';
 import type { AIReviewComment } from './reviewCommentGatherer.js';
 import { resolveUltrafixHistoryMeta } from './ultrafixJobHelpers.js';
+import { finalClaudeExecutionResult } from './claudeExecutionResult.js';
+import { publishCompletedWithDurableExecutionEvidence } from './completedExecutionDurability.js';
+import { buildAgentOutcome } from './executionOutcome.js';
 import type { GitHubToken } from './githubTypes.js';
 import {
     isVisualPreviewUploadAuthenticationError,
@@ -276,16 +278,28 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
 
         const ultrafixHistoryMeta = await resolveUltrafixHistoryMeta(job, { repoOwner, repoName, pullRequestNumber }, redisClient);
 
-        await stateManager.updateTaskState(taskId, TaskStates.COMPLETED, {
-            reason: partial ? 'PR comment processing published partial work after interrupted execution' : 'PR comment processing completed successfully',
-            commitHash: commitResult?.commitHash,
-            historyMetadata: {
-                commandMode: job.data.commandMode || 'default',
-                githubComment: { url: completionComment.data.html_url, body: completionComment.data.body },
-                ...(unprocessedReviewComments.length > 0 && { consumedReviewCommentIds: unprocessedReviewComments.map(c => c.id) }),
-                ...(partial && { incompleteExecution: { reason: terminationReason } }),
-                ...ultrafixHistoryMeta,
-            }
+        // `completed` is published only once the final execution evidence is durable; the
+        // evidence rides on the completed entry itself. See completedExecutionDurability.ts.
+        await publishCompletedWithDurableExecutionEvidence({
+            stateManager, taskId, correlatedLogger,
+            metadata: {
+                reason: partial ? 'PR comment processing published partial work after interrupted execution' : 'PR comment processing completed successfully',
+                commitHash: commitResult?.commitHash,
+                claudeResult: finalClaudeExecutionResult({
+                    success: state.claudeResult.success,
+                    sessionId: state.claudeResult.sessionId,
+                    conversationId: state.claudeResult.conversationId,
+                    executionTime: state.claudeResult.executionTime,
+                }),
+                historyMetadata: {
+                    commandMode: job.data.commandMode || 'default',
+                    githubComment: { url: completionComment.data.html_url, body: completionComment.data.body },
+                    ...(unprocessedReviewComments.length > 0 && { consumedReviewCommentIds: unprocessedReviewComments.map(c => c.id) }),
+                    ...(partial && { incompleteExecution: { reason: terminationReason } }),
+                    ...ultrafixHistoryMeta,
+                    agentOutcome: buildAgentOutcome(state.claudeResult),
+                }
+            },
         });
 
         await persistCommitHash(taskId, commitResult?.commitHash, correlatedLogger);

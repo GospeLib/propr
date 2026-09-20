@@ -13,6 +13,8 @@ import {
 import type { ClaudeCodeResponse, JobResult, WorkerStateManager, WorktreeInfo } from '@propr/core';
 import { createContainerIdCallbackForPR, createSessionIdCallbackForPR } from './prCommentJobHelpers.js';
 import { recordFinalClaudeExecutionResult } from './claudeExecutionResult.js';
+import { publishCompletedWithDurableExecutionEvidence } from './completedExecutionDurability.js';
+import { buildAgentOutcome } from './executionOutcome.js';
 import { AI_COMMIT_AUTHOR } from './commitAuthor.js';
 import { agentResultToClaudeResponse, toClaudeResult } from './prCommentJobUtils.js';
 import {
@@ -197,12 +199,21 @@ export async function handleMergeWithAgent(options: {
     await octokit.request('PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}', {
         owner: repoOwner, repo: repoName, comment_id: startingCommentId, body: comment,
     });
-    await stateManager.updateTaskState(taskId, TaskStates.COMPLETED, {
-        reason: 'Merge conflict resolution completed successfully', commitHash: finalCommitHash,
-        historyMetadata: await buildMergeCompletionHistoryMetadata({
-            stateManager, taskId, pullRequestNumber, baseBranch, headBranch: branchName,
-            model: claudeResult.model || resolvedModel, commitHash: finalCommitHash, correlatedLogger,
-        }),
+    // `completed` is published only once the final execution evidence is durable; the evidence
+    // rides on the completed entry itself. See completedExecutionDurability.ts.
+    await publishCompletedWithDurableExecutionEvidence({
+        stateManager, taskId, correlatedLogger,
+        metadata: {
+            reason: 'Merge conflict resolution completed successfully', commitHash: finalCommitHash,
+            claudeResult: executionSummary,
+            historyMetadata: {
+                ...await buildMergeCompletionHistoryMetadata({
+                    stateManager, taskId, pullRequestNumber, baseBranch, headBranch: branchName,
+                    model: claudeResult.model || resolvedModel, commitHash: finalCommitHash, correlatedLogger,
+                }),
+                agentOutcome: buildAgentOutcome(claudeResult),
+            },
+        },
     });
     try {
         await db('tasks').where({ task_id: taskId }).update({ commit_hash: finalCommitHash });

@@ -12,6 +12,9 @@ after(async () => {
 
 function createStateManager() {
   return {
+    // A completion is published through the durability barrier, as a `completed` transition that
+    // carries its terminal execution evidence and refuses to publish unless it persists.
+    updateTaskState: mock.fn(async () => undefined),
     markTaskCompleted: mock.fn(async () => undefined),
     markTaskFailed: mock.fn(async () => undefined),
   };
@@ -73,11 +76,18 @@ describe('issue job terminal state', () => {
     });
 
     assert.equal(stateManager.markTaskFailed.mock.callCount(), 0);
-    assert.equal(stateManager.markTaskCompleted.mock.callCount(), 1);
-    const [taskId, result] = stateManager.markTaskCompleted.mock.calls[0].arguments;
+    assert.equal(stateManager.markTaskCompleted.mock.callCount(), 0, 'completed is never published unguarded');
+    assert.equal(stateManager.updateTaskState.mock.callCount(), 1);
+    const [taskId, state, metadata] = stateManager.updateTaskState.mock.calls[0].arguments;
     assert.equal(taskId, 'partial-agent-task');
-    assert.equal(result.status, 'partial_with_pr');
-    assert.equal(result.prNumber, 42);
+    assert.equal(state, 'completed');
+    assert.equal(metadata.requireDurableHistory, true, 'completed only publishes once its history is durable');
+    assert.equal(metadata.prResult.status, 'partial_with_pr');
+    assert.equal(metadata.prResult.prNumber, 42);
+    // The evidence a consumer needs rides on the completed entry itself.
+    assert.equal(metadata.claudeResult.resultPhase, 'final');
+    assert.equal(metadata.historyMetadata.agentOutcome.success, false);
+    assert.equal(metadata.historyMetadata.agentOutcome.terminationReason, 'max_turns');
   });
 
   test('records a stopped admitted execution checkpoint and truthful outcome on the failed history entry', async () => {

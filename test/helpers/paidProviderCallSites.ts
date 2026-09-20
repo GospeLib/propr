@@ -553,20 +553,93 @@ export function analyzeProcessCreationSites(program: ts.Program, rootDirectory: 
         }
         return false;
     };
+    /** `await`, parentheses and `as` wrappers removed, so the expression underneath can be read. */
+    const unwrap = (expression: ts.Expression): ts.Expression => {
+        let current = expression;
+        for (;;) {
+            if (ts.isAwaitExpression(current)) current = current.expression;
+            else if (ts.isParenthesizedExpression(current)) current = current.expression;
+            else if (ts.isAsExpression(current) || ts.isNonNullExpression(current)) current = current.expression;
+            else return current;
+        }
+    };
+    /** Whether this expression IS the load of the module — `require('child_process')`, `import(…)`. */
+    const isChildProcessModuleLoad = (expression: ts.Expression): boolean => {
+        const call = unwrap(expression);
+        if (!ts.isCallExpression(call)) return false;
+        const isImport = call.expression.kind === ts.SyntaxKind.ImportKeyword
+            || (ts.isIdentifier(call.expression) && call.expression.text === 'require');
+        const specifier = call.arguments[0];
+        return isImport && specifier !== undefined && ts.isStringLiteralLike(specifier)
+            && CHILD_PROCESS_SPECIFIERS.includes(specifier.text);
+    };
     /** Whether this destructuring came out of `child_process`, however it was imported. */
     const destructuredFromChildProcess = (declaration: ts.BindingElement): boolean => {
         let current: ts.Node = declaration;
         while (current.parent && !ts.isVariableDeclaration(current.parent)) current = current.parent;
         const variable = current.parent;
         if (!variable || !ts.isVariableDeclaration(variable) || !variable.initializer) return false;
-        const initializer = ts.isAwaitExpression(variable.initializer)
-            ? variable.initializer.expression : variable.initializer;
-        if (!ts.isCallExpression(initializer)) return false;
-        const isImport = initializer.expression.kind === ts.SyntaxKind.ImportKeyword
-            || (ts.isIdentifier(initializer.expression) && initializer.expression.text === 'require');
-        const specifier = initializer.arguments[0];
-        return isImport && specifier !== undefined && ts.isStringLiteralLike(specifier)
-            && CHILD_PROCESS_SPECIFIERS.includes(specifier.text);
+        return isChildProcessModuleLoad(variable.initializer);
+    };
+    /**
+     * Whether this expression NAMES the `child_process` module itself, rather than one export of it.
+     *
+     * The typed forms resolve through the checker, because their symbol is declared in Node's own
+     * `.d.ts`. The COMMONJS NAMESPACE forms have no such symbol — `const cp = require('node:
+     * child_process')` gives `cp` an ordinary variable declaration whose type is `any`, and
+     * `require('node:child_process').spawn(…)` gives the property access no symbol at all — so
+     * neither reaches the declaring-file test and both were invisible to this inventory. They are
+     * ordinary first-party syntax, so they are read syntactically: the module load itself, an
+     * identifier declared equal to one (through any number of `const` hops), or a namespace import.
+     */
+    const namesChildProcessModule = (expression: ts.Expression, seen = new Set<ts.Node>()): boolean => {
+        const target = unwrap(expression);
+        if (isChildProcessModuleLoad(target)) return true;
+        if (!ts.isIdentifier(target)) return false;
+        // The LOCAL symbol, not the aliased one: a namespace import of a module the fixture
+        // program cannot resolve aliases to nothing, and the declaration that names the module
+        // specifier is the local binding's own.
+        const local = checker.getSymbolAtLocation(target);
+        for (const declaration of local?.getDeclarations() ?? []) {
+            if (seen.has(declaration)) continue;
+            seen.add(declaration);
+            if (ts.isNamespaceImport(declaration) || ts.isImportClause(declaration)) {
+                // `import * as cp` nests one level deeper than `import cp`, so the declaration is
+                // walked up to rather than indexed into.
+                const clause = ts.isNamespaceImport(declaration) ? declaration.parent : declaration;
+                const specifier = clause.parent.moduleSpecifier;
+                if (ts.isStringLiteralLike(specifier) && CHILD_PROCESS_SPECIFIERS.includes(specifier.text)) return true;
+            }
+            if (ts.isVariableDeclaration(declaration) && declaration.initializer
+                && namesChildProcessModule(declaration.initializer, seen)) return true;
+        }
+        return false;
+    };
+    /**
+     * A process-creation API reached as a PROPERTY of the module namespace.
+     *
+     * Only consulted when the checker resolved nothing, so a typed `import * as cp` — whose
+     * `cp.spawn` already resolves into `child_process.d.ts` — is still counted once, by symbol.
+     */
+    const namespacedChildProcessApi = (node: ts.Identifier): string | undefined => {
+        const access = node.parent;
+        if (!ts.isPropertyAccessExpression(access) || access.name !== node) return undefined;
+        if (!PROCESS_CREATION_APIS.includes(node.text)) return undefined;
+        return namesChildProcessModule(access.expression) ? `child_process.${node.text}` : undefined;
+    };
+    /**
+     * The same thing written with brackets and a literal name: `cp['spawn'](…)`.
+     *
+     * There is no identifier to resolve here at all, so this is the one place the analysis reads a
+     * STRING — and it reads it only as the property name, with the module still decided by the
+     * expression it is taken from. A name that is not a literal (`cp[whichever]`) stays outside
+     * what these sources can be said to prove.
+     */
+    const bracketedChildProcessApi = (node: ts.ElementAccessExpression): string | undefined => {
+        if (!ts.isStringLiteralLike(node.argumentExpression)) return undefined;
+        const name = node.argumentExpression.text;
+        if (!PROCESS_CREATION_APIS.includes(name)) return undefined;
+        return namesChildProcessModule(node.expression) ? `child_process.${name}` : undefined;
     };
     /**
      * What this identifier ultimately names, following import aliases AND local `const` aliases.
@@ -626,17 +699,17 @@ export function analyzeProcessCreationSites(program: ts.Program, rootDirectory: 
         const visit = (node: ts.Node): void => {
             const isUsageTracking = ts.isCallExpression(node) && resolvesTo(node, USAGE_TRACKING_MODULE, USAGE_TRACKING);
             if (isUsageTracking) billed += 1;
-            if (ts.isIdentifier(node) && !bindingSite(node)) {
-                const primitive = primitiveOf(node);
-                if (primitive) {
-                    sites.push({
-                        path: relativePath,
-                        line: file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1,
-                        enclosing: enclosingName(node),
-                        primitive,
-                        modelRun: billed > 0,
-                    });
-                }
+            const primitive = ts.isIdentifier(node) && !bindingSite(node)
+                ? primitiveOf(node) ?? namespacedChildProcessApi(node)
+                : ts.isElementAccessExpression(node) ? bracketedChildProcessApi(node) : undefined;
+            if (primitive) {
+                sites.push({
+                    path: relativePath,
+                    line: file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1,
+                    enclosing: enclosingName(node),
+                    primitive,
+                    modelRun: billed > 0,
+                });
             }
             ts.forEachChild(node, visit);
             if (isUsageTracking) billed -= 1;
@@ -725,10 +798,11 @@ export function fixtureProviderCallSites(files: Record<string, string>): Provide
 /**
  * The containment rule, applied to sources written to defeat it.
  *
- * The repository contains no alias binding, no direct `child_process` creation on a paid path and
- * no second primitive inside the executor module — which is exactly why the previous inventory
- * could advertise a guarantee it did not have and still come up green. These fixtures write each
- * bypass by hand, so the rule is shown REJECTING it rather than merely not encountering it.
+ * The repository contains no alias binding, no direct `child_process` creation on a paid path, no
+ * second primitive inside the executor module and no namespace `require` of `child_process` —
+ * which is exactly why an inventory can advertise a guarantee it does not have and still come up
+ * green. These fixtures write each bypass by hand, so the rule is shown REJECTING it rather than
+ * merely not encountering it.
  */
 export function fixtureProcessCreationSites(files: Record<string, string>): ProcessCreationSite[] {
     return analyzeProcessCreationSites(fixtureProgram(files), FIXTURE_ROOT);

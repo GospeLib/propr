@@ -15,6 +15,7 @@ import knex, { type Knex } from 'knex';
 import { up as createExecutionLeases } from '../src/db/migrations/20260922000000_create_task_execution_leases.js';
 import { up as createStopProofs } from '../src/db/migrations/20260923000000_create_execution_lease_stop_proofs.js';
 import { up as addReconciliation } from '../src/db/migrations/20260924000000_add_execution_lease_reconciliation.js';
+import { up as addSpendReconciliation } from '../src/db/migrations/20260925000000_add_execution_lease_spend_reconciliation.js';
 
 const database: Knex = knex({
     client: 'better-sqlite3',
@@ -24,8 +25,9 @@ const database: Knex = knex({
 await mock.module('../src/db/connection.js', { namedExports: { db: database } });
 const {
     acquireExecutionLease, databaseNow, lapsedExecutionLeases, markProviderInvocationStarted,
-    recordExecutorStopProof, recordVerifiedExecutorStop, releaseExecutionLease,
-    renewExecutionLease, retainLeaseForReconciliation, settleExecutionLease,
+    recordExecutorStopProof, recordVerifiedExecutorStop, reconcileProviderInvocationSpend,
+    releaseExecutionLease, renewExecutionLease, retainLeaseForReconciliation, settleExecutionLease,
+    PROVIDER_SPEND_RECONCILED_STATE,
 } = await import('../src/utils/executionLease.js');
 
 const TTL_MS = 60_000;
@@ -35,6 +37,7 @@ before(async () => {
     await createExecutionLeases(database);
     await createStopProofs(database);
     await addReconciliation(database);
+    await addSpendReconciliation(database);
 });
 after(async () => { await database.destroy(); });
 
@@ -327,7 +330,16 @@ describe('a lease is handed back only by an attempt that never reached the provi
         assert.equal(lapsed.reconciliationReason, 'the provider was invoked and nothing came back');
         assert.equal(lapsed.stopProof, undefined);
 
-        await stopProof(key, stranded);
+        // This attempt REACHED the provider, so an ordinary stop proof is refused: it would say
+        // the executor stopped and say nothing about the money, and it would be spent on the spot
+        // to admit a successor. Only the deliberate spend decision moves it.
+        assert.equal(await recordExecutorStopProof({ leaseKey: key, generation: stranded,
+            proof: 'operator confirmed the provider container is gone', recordedBy: 'operator:test' }),
+        'provider_invocation_started');
+        assert.deepEqual(await reconcileProviderInvocationSpend({ leaseKey: key, generation: stranded,
+            confirmGeneration: stranded, disposition: 'authorise-another-paid-run',
+            spendFinding: 'the transcript was lost and the work is worth paying for again',
+            recordedBy: 'operator:test' }), { recorded: true });
         const listed = (await lapsedExecutionLeases()).find(candidate => candidate.leaseKey === key);
         assert.equal(listed?.stopProof?.recordedBy, 'operator:test');
         assert.equal(listed?.stopProof?.consumedAt, undefined,
@@ -337,6 +349,7 @@ describe('a lease is handed back only by an attempt that never reached the provi
         assert.equal(Boolean(row.provider_invocation_started), false,
             'the successor inherits the term, never the previous holder\'s spending');
         assert.equal(row.reconciliation_reason, null);
+        assert.equal(row.reconciliation_recorded_by, null);
     });
 });
 
@@ -544,5 +557,208 @@ describe('a stop proof and the holder\'s own liveness fence each other', () => {
             consumed_at: null, consumed_by_generation: null,
         });
         assert.equal(await renewExecutionLease({ leaseKey: key, generation: holder, expiresAt: '' }, TTL_MS), true);
+    });
+});
+
+/**
+ * THE INVERSE ORDERING: THE MARKER LANDS FIRST, AND THE PROOF COMES AFTER IT.
+ *
+ * The proof-first ordering was fenced when the provider-start gate learned the unconsumed-proof
+ * predicate. This is the other way round, and nothing in that predicate touches it: a lapsed
+ * holder with no proof against it still holds the row, so it may legitimately mark
+ * `provider_invocation_started` and walk into `agent.analyze`. A stop proof recorded afterwards
+ * was then written by a condition that asked about the generation, the settlement and the term —
+ * and never about the money — and a successor spent it and was told to pay again. Every one of
+ * those three statements won legitimately and in order, so serialization prevented nothing.
+ *
+ * What stops it is the flag being a BARRIER rather than a release rule: past it there is no
+ * ordinary proof to write and no takeover to grant, and the operation moves only on a settlement
+ * or on a deliberate decision about the spend.
+ */
+describe('a provider invocation is a barrier no ordinary stop proof crosses', () => {
+    test('marker, then lapse, then stop proof: no successor reaches the provider', async () => {
+        const key = leaseKey();
+        const spender = randomUUID();
+        await acquireExecutionLease(request(key, spender));
+        const spenderLease = { leaseKey: key, generation: spender, expiresAt: '' };
+        // 1. Nothing has been recorded against this generation, so the gate opens and the attempt
+        //    is inside the paid call. This is the ordering the round-10 predicate cannot see.
+        assert.equal(await markProviderInvocationStarted(spenderLease), true);
+        // 2. Its term lapses — a stalled write, a paused container, a skewed clock. Silence.
+        await lapseTerm(key);
+        // 3. An operator, or a reconciler, records that the executor stopped. It did stop; the
+        //    record is simply not the whole fact, and the database refuses to hold it as if it
+        //    were. Nothing goes on file, so there is nothing for anyone to spend.
+        assert.equal(await recordExecutorStopProof({ leaseKey: key, generation: spender,
+            proof: 'operator confirmed the provider container is gone', recordedBy: 'operator:test' }),
+        'provider_invocation_started');
+        assert.equal(await database('task_execution_lease_stop_proofs')
+            .where({ lease_key: key, lease_generation: spender }).first(), undefined);
+        // 4. So the successor is refused, and refused as UNRECONCILED — an operation waiting on a
+        //    decision, not on a term that will lapse. It never reaches the provider.
+        const successor = randomUUID();
+        const takeover = await acquireExecutionLease(request(key, successor));
+        assert.deepEqual({ outcome: takeover.outcome,
+            holder: takeover.outcome === 'unreconciled' ? takeover.holderGeneration : undefined },
+        { outcome: 'unreconciled', holder: spender });
+        assert.equal(await markProviderInvocationStarted({ leaseKey: key, generation: successor, expiresAt: '' }), false,
+            'and with the lease still naming the first attempt, there is no second paid run to make');
+        const row = await database('task_execution_leases').where({ lease_key: key }).first();
+        assert.equal(row.lease_generation, spender);
+        assert.equal(Boolean(row.provider_invocation_started), true);
+    });
+
+    test('the checked reconciliation refuses a spent attempt rather than writing the wrong record', async () => {
+        const key = leaseKey();
+        const spender = randomUUID();
+        await acquireExecutionLease(request(key, spender));
+        await markProviderInvocationStarted({ leaseKey: key, generation: spender, expiresAt: '' });
+        await lapseTerm(key);
+        assert.deepEqual(await recordVerifiedExecutorStop({ leaseKey: key, generation: spender,
+            confirmGeneration: spender, proof: 'the operator confirmed the container has exited',
+            recordedBy: 'operator:test' }),
+        { recorded: false, refusal: 'that executor had already reached the provider, so its spend must be reconciled first' },
+        'the operator is right that it stopped, and that is not the fact this record may assert');
+    });
+
+    test('a proof already on file cannot be spent once the flag is up', async () => {
+        // The two statements make this ordering unreachable through the API, which is why it is
+        // built by hand: the takeover carries the barrier in its OWN statement, so a proof that
+        // somehow predates the flag is still not a licence to pay again.
+        const key = leaseKey();
+        const holder = randomUUID();
+        await acquireExecutionLease(request(key, holder));
+        await lapseTerm(key);
+        await stopProof(key, holder);
+        await database('task_execution_leases').where({ lease_key: key })
+            .update({ provider_invocation_started: true });
+        const takeover = await acquireExecutionLease(request(key, randomUUID()));
+        assert.equal(takeover.outcome, 'unreconciled');
+        assert.equal((await proofRow(key, holder)).consumed_at, null,
+            'and the proof is left unspent, so the deliberate decision still has something to act on');
+    });
+
+    test('an unspent lapsed lease is still taken over, so the barrier is the flag and not the lapse', async () => {
+        // The companion every one of the refusals above needs: a rule that refused all takeovers
+        // would pass them and prove nothing.
+        const key = leaseKey();
+        const holder = randomUUID();
+        await acquireExecutionLease(request(key, holder));
+        await lapseTerm(key);
+        await stopProof(key, holder);
+        const takeover = await acquireExecutionLease(request(key, randomUUID()));
+        assert.equal(takeover.outcome, 'acquired');
+    });
+});
+
+/**
+ * THE SEPARATE DECISION, AND WHY IT IS SEPARATE.
+ *
+ * An attempt that spent money and then went silent leaves one question: not whether it stopped —
+ * its term lapsed and that can be verified — but what the money bought. Two answers are lawful.
+ * Closing the operation on the spend costs nothing more and is terminal. Paying again is a
+ * decision to spend, and it is recorded as one: the proof it writes says, on its own row, that it
+ * came from a spend reconciliation, so no later reader can mistake it for "the executor stopped".
+ */
+describe('a spend that already happened is reconciled deliberately, and recorded as its own fact', () => {
+    async function lapsedSpender(): Promise<{ key: string; generation: string }> {
+        const key = leaseKey();
+        const generation = randomUUID();
+        await acquireExecutionLease(request(key, generation));
+        await markProviderInvocationStarted({ leaseKey: key, generation, expiresAt: '' });
+        await lapseTerm(key);
+        return { key, generation };
+    }
+    const finding = 'the container exited after the model call and its transcript was recovered';
+
+    test('closing the operation on the spend is terminal, and admits nobody', async () => {
+        const { key, generation } = await lapsedSpender();
+        assert.deepEqual(await reconcileProviderInvocationSpend({ leaseKey: key, generation,
+            confirmGeneration: generation, disposition: 'settle-without-rerun',
+            spendFinding: finding, recordedBy: 'operator:test' }), { recorded: true });
+        const row = await database('task_execution_leases').where({ lease_key: key }).first();
+        assert.equal(row.settled_state, PROVIDER_SPEND_RECONCILED_STATE);
+        assert.equal(row.reconciliation_recorded_by, 'operator:test');
+        assert.equal((await acquireExecutionLease(request(key, randomUUID()))).outcome, 'settled');
+        assert.equal(await database('task_execution_lease_stop_proofs')
+            .where({ lease_key: key, lease_generation: generation }).first(), undefined,
+        'and no stop proof exists, because nothing was admitted');
+    });
+
+    test('authorising another paid run lowers the barrier and admits exactly one successor', async () => {
+        const { key, generation } = await lapsedSpender();
+        assert.deepEqual(await reconcileProviderInvocationSpend({ leaseKey: key, generation,
+            confirmGeneration: generation, disposition: 'authorise-another-paid-run',
+            spendFinding: finding, recordedBy: 'operator:test' }), { recorded: true });
+        const proof = await proofRow(key, generation);
+        assert.equal(proof.provider_spend_disposition, 'authorise-another-paid-run',
+            'the record names the decision it came from, not merely that the executor stopped');
+        const successor = randomUUID();
+        const takeover = await acquireExecutionLease(request(key, successor));
+        assert.equal(takeover.outcome, 'acquired');
+        assert.equal(await markProviderInvocationStarted({ leaseKey: key, generation: successor, expiresAt: '' }), true);
+        assert.equal((await proofRow(key, generation)).consumed_at !== null, true);
+        await lapseTerm(key);
+        assert.equal((await acquireExecutionLease(request(key, randomUUID()))).outcome, 'unreconciled',
+            'and the successor raises the barrier again the moment it reaches the provider');
+    });
+
+    test('the same spend cannot be reconciled twice', async () => {
+        const { key, generation } = await lapsedSpender();
+        const again = () => reconcileProviderInvocationSpend({ leaseKey: key, generation,
+            confirmGeneration: generation, disposition: 'authorise-another-paid-run',
+            spendFinding: finding, recordedBy: 'operator:test' });
+        assert.deepEqual(await again(), { recorded: true });
+        assert.deepEqual(await again(),
+            { recorded: false, refusal: 'a proof for this generation is already on file' });
+    });
+
+    test('every way of being mistaken about a spend is refused before anything is written', async () => {
+        const { key, generation } = await lapsedSpender();
+        const attempt = (overrides: Record<string, unknown>) => reconcileProviderInvocationSpend({
+            leaseKey: key, generation, confirmGeneration: generation,
+            disposition: 'settle-without-rerun', spendFinding: finding,
+            recordedBy: 'operator:test', ...overrides,
+        } as Parameters<typeof reconcileProviderInvocationSpend>[0]);
+        assert.deepEqual(await attempt({ disposition: 'just-retry-it' }),
+            { recorded: false, refusal: 'the spend disposition must be one of the two decisions this reconciliation offers' });
+        assert.deepEqual(await attempt({ confirmGeneration: randomUUID() }),
+            { recorded: false, refusal: 'the confirmation did not match the generation being declared stopped' });
+        assert.deepEqual(await attempt({ spendFinding: 'gone' }),
+            { recorded: false, refusal: 'the proof must state what was verified, in the operator\'s own words' });
+        assert.deepEqual(await attempt({ leaseKey: leaseKey() }), { recorded: false, refusal: 'no such lease' });
+        assert.equal((await database('task_execution_leases').where({ lease_key: key }).first()).settled_at, null,
+            'not one of those refusals touched the row');
+
+        const unspent = leaseKey();
+        const holder = randomUUID();
+        await acquireExecutionLease(request(unspent, holder));
+        await lapseTerm(unspent);
+        assert.deepEqual(await reconcileProviderInvocationSpend({ leaseKey: unspent, generation: holder,
+            confirmGeneration: holder, disposition: 'authorise-another-paid-run',
+            spendFinding: finding, recordedBy: 'operator:test' }),
+        { recorded: false, refusal: 'that executor never reached the provider, so an ordinary stop proof is the record for it' },
+        'an attempt that spent nothing is an ordinary stop proof, and must not be dressed as a spend');
+
+        const live = leaseKey();
+        const liveHolder = randomUUID();
+        await acquireExecutionLease(request(live, liveHolder));
+        await markProviderInvocationStarted({ leaseKey: live, generation: liveHolder, expiresAt: '' });
+        assert.deepEqual(await reconcileProviderInvocationSpend({ leaseKey: live, generation: liveHolder,
+            confirmGeneration: liveHolder, disposition: 'settle-without-rerun',
+            spendFinding: finding, recordedBy: 'operator:test' }),
+        { recorded: false, refusal: 'the term has not lapsed, so the executor is still reporting itself alive' });
+    });
+
+    test('the reconciliation listing carries the decision, so an operator is not guessing', async () => {
+        const { key, generation } = await lapsedSpender();
+        await retainLeaseForReconciliation({ leaseKey: key, generation, expiresAt: '' },
+            'the provider was invoked and nothing came back');
+        await reconcileProviderInvocationSpend({ leaseKey: key, generation, confirmGeneration: generation,
+            disposition: 'authorise-another-paid-run', spendFinding: finding, recordedBy: 'operator:test' });
+        const listed = (await lapsedExecutionLeases()).find(candidate => candidate.leaseKey === key);
+        assert.deepEqual({ started: listed?.providerInvocationStarted, by: listed?.reconciliationRecordedBy,
+            disposition: listed?.stopProof?.providerSpendDisposition },
+        { started: false, by: 'operator:test', disposition: 'authorise-another-paid-run' });
     });
 });

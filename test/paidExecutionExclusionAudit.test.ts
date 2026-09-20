@@ -216,23 +216,34 @@ describe('the rule distinguishes a leased call from an unleased one in the same 
  * primitive added inside `dockerExecutor.ts`. No current path used any of them — which is exactly
  * why the gate could stay green while proving less than it claimed.
  *
- * WHAT IS PROVEN NOW. Every SYNTACTIC process creation in the production sources of the
- * repository's own `tsconfig.json` program is inventoried and frozen: any identifier that
- * resolves — through import aliases and through local `const` aliases — to `executeDockerCommand`
- * or to one of Node's process-creation APIs (`spawn`, `spawnSync`, `exec`, `execSync`, `execFile`,
- * `execFileSync`, `fork`). Value references count, not only direct calls, so `promisify(execFile)`
- * and `const run = executeDockerCommand` are inventoried where they are written. No module is
- * skipped, including the executor's own. A new one cannot be added without this list changing, and
- * the hostile fixtures below show each bypass form being caught rather than merely not occurring.
+ * WHAT IS PROVEN NOW, IN THE EXACT FORMS IT IS PROVEN FOR. The claim is not "every process
+ * creation": it is every process creation WRITTEN IN ONE OF THE FORMS BELOW, in the production
+ * sources of the repository's own `tsconfig.json` program, inventoried and frozen. The primitives
+ * are `executeDockerCommand` and Node's process-creation APIs (`spawn`, `spawnSync`, `exec`,
+ * `execSync`, `execFile`, `execFileSync`, `fork`), and the forms are:
  *
- * WHAT IS NOT PROVEN. This is static analysis over these sources. It does not see a process
- * created dynamically (`eval`, a string-indexed property, a native addon), a paid call made over
- * HTTP to a provider API rather than by spawning, or a dependency spawning on this repository's
- * behalf. It says nothing about `packages/cli` or `propr-ui`, which the program excludes. Read it
- * as "no new process creation can be written into these sources unnoticed", never as "no paid work
- * can happen by any other means".
+ * - a named import of one, or a destructuring of one out of a `require` or a dynamic `import`;
+ * - any local `const` alias chain ending at one, because `const run = executeDockerCommand`
+ *   produces a symbol a name test and a declaring-file test both miss;
+ * - a property of the `child_process` MODULE NAMESPACE, whether the namespace is a typed
+ *   `import * as cp`, an untyped `const cp = require('node:child_process')` — through any number
+ *   of `const` hops — or the module load read inline as `require('child_process').spawn(…)`;
+ * - the same property written with brackets and a STRING LITERAL name, `cp['spawn']`.
+ *
+ * Value references count, not only direct calls, so `promisify(execFile)` is inventoried where it
+ * is written. No module is skipped, including the executor's own. Nothing in any of those forms
+ * can be added without this list changing, and the hostile fixtures below show each one being
+ * caught rather than merely not occurring.
+ *
+ * WHAT IS NOT PROVEN. A property name that is not a literal (`cp[whichever]`), a namespace handed
+ * through a parameter or stored on an object and reached from there, a process created by `eval`
+ * or a native addon, a paid call made over HTTP to a provider API rather than by spawning, and a
+ * dependency spawning on this repository's behalf are all outside it. It says nothing about
+ * `packages/cli` or `propr-ui`, which the program excludes. Read it as "a process creation written
+ * in one of the forms above cannot enter these sources unnoticed", never as "no paid work can
+ * happen by any other means".
  */
-describe('every process creation in the production sources is inventoried and classified', () => {
+describe('every process creation written in a recognised form is inventoried and classified', () => {
     // Freezing ALL of them — not only the ones this analysis calls billable — is what makes a new
     // paid path fail here: it cannot be added without changing this list.
     test('the process-creation inventory is the one on file', () => {
@@ -343,12 +354,20 @@ describe('every process creation in the production sources is inventoried and cl
 });
 
 /**
- * THE THREE BYPASSES THE PREVIOUS GATE LET THROUGH, WRITTEN OUT AND CAUGHT.
+ * THE BYPASSES THE GATE LET THROUGH, WRITTEN OUT AND CAUGHT.
  *
- * Each fixture is a paid run that the old inventory would have recorded nothing about: the frozen
- * list would not have changed, and the containment test would have found no stray. Here each one
- * is inventoried, classified as a model run because it sits inside the billing wrapper, and lands
- * in a module that is not an enumerated provider primitive — which is what a stray is.
+ * Each fixture is a paid run that an earlier inventory recorded nothing about: the frozen list
+ * would not have changed, and the containment test would have found no stray. Here each one is
+ * inventoried, classified as a model run because it sits inside the billing wrapper, and lands in
+ * a module that is not an enumerated provider primitive — which is what a stray is.
+ *
+ * The three at the top are the ones the ORIGINAL gate missed — an alias binding, a direct
+ * `child_process` import, a second primitive inside the executor module. The namespace ones below
+ * them are the class the replacement still missed: it resolved a process-creation API only through
+ * a typed declaration or a binding destructured out of `require`, so `const cp = require('node:
+ * child_process'); cp.spawn(…)` and `require('node:child_process').spawn(…)` both produced an
+ * EMPTY inventory. Nothing about those is exotic — they are ordinary first-party CommonJS — so
+ * "the frozen list cannot be bypassed" was false as written until they were read too.
  */
 describe('the containment gate catches a process creation that avoids the wrapper', () => {
     /** The rule the repository-level containment test applies, pointed at fixture sources. */
@@ -409,6 +428,75 @@ describe('the containment gate catches a process creation that avoids the wrappe
         assert.deepEqual(found.filter(site => site.path === 'dynamic.ts').map(site =>
             `${site.primitive} modelRun=${site.modelRun}`), ['child_process.execFileSync modelRun=true'],
         'a late import is still an import of the process-creation surface');
+    });
+
+    test('a namespace CommonJS require of child_process is inventoried', () => {
+        // `cp` has no type: `require` is not declared in this program, so the checker resolves
+        // `cp.spawn` to nothing at all and every symbol-based test misses it. It is still
+        // first-party syntax creating a first-party process, so it is read as what it is.
+        const found = fixtureProcessCreationSites({
+            'namespaced.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const cp = require('node:child_process');
+                export async function namespaced(prompt: string) {
+                    return executeWithUsageTracking('run', async () => cp.spawn('docker', ['run', prompt]));
+                }
+            `,
+        });
+        assert.deepEqual(found.filter(site => site.path === 'namespaced.ts').map(site =>
+            `${site.primitive} ${site.enclosing} modelRun=${site.modelRun}`),
+        ['child_process.spawn namespaced modelRun=true']);
+        assert.deepEqual(strays(found).map(site => site.path), ['namespaced.ts']);
+    });
+
+    test('a process creation read straight off the require call is inventoried', () => {
+        const found = fixtureProcessCreationSites({
+            'inline.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                export async function inline(prompt: string) {
+                    return executeWithUsageTracking('run', async () =>
+                        require('child_process').execFile('docker', ['run', prompt]));
+                }
+            `,
+        });
+        assert.deepEqual(found.filter(site => site.path === 'inline.ts').map(site =>
+            `${site.primitive} ${site.enclosing} modelRun=${site.modelRun}`),
+        ['child_process.execFile inline modelRun=true']);
+        assert.deepEqual(strays(found).map(site => site.path), ['inline.ts']);
+    });
+
+    test('a bracketed literal property off the namespace is inventoried', () => {
+        const found = fixtureProcessCreationSites({
+            'bracketed.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                import * as childProcess from 'node:child_process';
+                export async function bracketed(prompt: string) {
+                    return executeWithUsageTracking('run', async () => childProcess['execSync']('docker ' + prompt));
+                }
+            `,
+        });
+        assert.deepEqual(found.filter(site => site.path === 'bracketed.ts').map(site =>
+            `${site.primitive} ${site.enclosing} modelRun=${site.modelRun}`),
+        ['child_process.execSync bracketed modelRun=true'],
+        'brackets and a literal name are the same process creation, written differently');
+        assert.deepEqual(strays(found).map(site => site.path), ['bracketed.ts']);
+    });
+
+    test('a namespace binding of some other module is not mistaken for one', () => {
+        // The companion to the two above: the rule is "this expression names child_process", not
+        // "this expression is a namespace", and a rule that flagged any `x.spawn` would pass them
+        // both while inventing sinks everywhere else.
+        const found = fixtureProcessCreationSites({
+            'other.ts': `
+                import { executeWithUsageTracking } from './usageTrackingWrapper.js';
+                const pool = require('./workerPool.js');
+                const later = pool;
+                export async function other(prompt: string) {
+                    return executeWithUsageTracking('run', async () => later.spawn(prompt));
+                }
+            `,
+        });
+        assert.deepEqual(found, [], 'the module the namespace names is what decides it');
     });
 
     test('a new primitive inside the executor module is inventoried, because that module is not skipped', () => {

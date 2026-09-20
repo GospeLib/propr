@@ -193,6 +193,9 @@ export async function publishTaskStateTransition(
             state: state.state,
             timestamp: state.updatedAt,
             reason,
+            // Same key on every retry of one logical transition: the unique index turns a retry of
+            // an already-committed insert into a rejection instead of a second row.
+            transition_id: metadata.transitionId ?? null,
             metadata: JSON.stringify({
                 ...(metadata.historyMetadata ?? {}),
                 previousState,

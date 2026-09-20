@@ -66,6 +66,8 @@ await mock.module('@propr/core', {
         generateCompletionComment,
         redactSecrets: (value: string) => value.replace('secret-token', '[REDACTED]'),
         validatePRCreation: mock.fn(),
+        // The completion durability barrier reads the task history back after an ambiguous write.
+        db: () => ({ where: () => ({ first: async () => undefined }) }),
     },
 });
 

@@ -116,6 +116,14 @@ export interface CancellationMetadata {
 export interface UpdateMetadata {
     /** Refuse execution/settlement when its authoritative database history was not persisted. */
     requireDurableHistory?: boolean;
+    /**
+     * Idempotency key for one logical terminal transition, unique in `task_history`.
+     *
+     * The writer keeps it identical across that transition's retries, so an INSERT that committed
+     * without acknowledging the client can be read back by key, and a blind retry is rejected by
+     * the constraint instead of duplicating the row.
+     */
+    transitionId?: string;
     isRetry?: boolean;
     error?: {
         message: string;

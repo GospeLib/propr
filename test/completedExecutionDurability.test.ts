@@ -11,7 +11,7 @@
  * be failed per state, so they assert what a reader holding only the durable history sees.
  */
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { beforeEach, describe, mock, test } from 'node:test';
 
 const TASK_STATES = {
@@ -80,6 +80,8 @@ interface HistoryRow {
     timestamp: string;
     reason?: string;
     metadata: string | null;
+    /** The idempotency key the unique index in task_history is built on. */
+    transition_id?: string | null;
 }
 
 const historyRows: HistoryRow[] = [];
@@ -88,6 +90,13 @@ let nextHistoryId = 1;
 const failedInsertStates = new Set<string>();
 /** Refuses the in-place rewrite of an existing history entry's metadata. */
 let failHistoryMetadataRewrite = false;
+/**
+ * History states whose insert COMMITS and then rejects, reproducing an ambiguous commit: the row
+ * is durable and the client is told the write failed.
+ */
+const ambiguousCommitStates = new Set<string>();
+/** Refuses the read-back, so whether a completion is durable cannot be established. */
+let failHistoryReadBack = false;
 
 function taskHistoryQuery() {
     let criteria: Record<string, unknown> = {};
@@ -97,14 +106,22 @@ function taskHistoryQuery() {
         Object.entries(criteria).every(([key, value]) => row[key as keyof HistoryRow] === value));
     const query = {
         insert: async (row: Omit<HistoryRow, 'history_id'>) => {
+            if (row.transition_id != null && historyRows.some(existing => existing.transition_id === row.transition_id)) {
+                throw new Error('UNIQUE constraint failed: task_history.transition_id');
+            }
             if (failedInsertStates.has(row.state)) throw new Error(`database refused a ${row.state} history row`);
             historyRows.push({ history_id: nextHistoryId++, ...row });
+            // Committed, then the acknowledgement is lost on the way back to the client.
+            if (ambiguousCommitStates.has(row.state)) {
+                throw new Error(`connection lost after committing a ${row.state} history row`);
+            }
             return [nextHistoryId - 1];
         },
         select: (..._columns: string[]) => query,
         where: (value: Record<string, unknown>) => { criteria = { ...criteria, ...value }; return query; },
         orderBy: (_column: string, direction?: string) => { descending = direction === 'desc'; return query; },
         first: async () => {
+            if (failHistoryReadBack) throw new Error('database refused the history read-back');
             const matched = [...select()].sort((a, b) => a.history_id - b.history_id);
             const row = descending ? matched.at(-1) : matched[0];
             return row ? { ...row } : undefined;
@@ -168,8 +185,10 @@ const { markTaskTerminalState } = await import('../src/jobs/terminalTaskState.js
 const {
     publishCompletedWithDurableExecutionEvidence,
     carriesTerminalExecutionEvidence,
+    terminalTransitionId,
     COMPLETION_WITHOUT_EXECUTION_EVIDENCE,
     COMPLETION_HISTORY_NOT_DURABLE,
+    COMPLETION_DURABILITY_UNVERIFIABLE,
 } = await import('../src/jobs/completedExecutionDurability.js');
 
 // ------------------------------------------------------------------- Fixtures
@@ -211,6 +230,10 @@ function seedProcessingTask(): void {
 
 function stateManager() {
     return new WorkerStateManager();
+}
+
+function rowsOf(state: string): HistoryRow[] {
+    return historyRows.filter(row => row.state === state);
 }
 
 function durableRows(state: string): Array<Record<string, unknown>> {
@@ -257,6 +280,8 @@ beforeEach(() => {
     historyRows.length = 0;
     nextHistoryId = 1;
     failedInsertStates.clear();
+    ambiguousCommitStates.clear();
+    failHistoryReadBack = false;
     failHistoryMetadataRewrite = false;
     seedProcessingTask();
 });
@@ -438,23 +463,188 @@ describe('completed is never published without durable execution evidence', () =
     });
 });
 
-describe('every path that publishes completed after a model execution goes through the barrier', () => {
-    const paths = [
-        ['../src/jobs/terminalTaskState.ts', 'issue job'],
-        ['../src/jobs/prCommentPostExecution.ts', 'PR comment'],
-        ['../src/jobs/mergeConflictAgentRunner.ts', 'merge conflict'],
-    ] as const;
+describe('an ambiguous commit is established, never assumed', () => {
+    test('a completed entry that commits and loses its acknowledgement is not overwritten by a failed fallback', async () => {
+        const manager = stateManager();
+        await startExecution(manager);
+        await recordFinalClaudeExecutionResult(manager as never, TASK_ID,
+            { success: true, sessionId: SESSION_ID, executionTime: EXECUTION_TIME_MS }, jobLogger);
+        // Every completed insert commits and then rejects; the failed fallback WOULD be acknowledged.
+        ambiguousCommitStates.add(TASK_STATES.COMPLETED);
 
-    for (const [path, label] of paths) {
-        test(`${label}: completed is published through the durability barrier, never directly`, async () => {
-            const source = await readFile(new URL(path, import.meta.url), 'utf8');
-            assert.match(source, /publishCompletedWithDurableExecutionEvidence\(/,
-                'the completed publication must carry the durability barrier');
-            assert.doesNotMatch(source, /updateTaskState\([^)]*TaskStates\.COMPLETED/,
-                'no path may publish completed directly, bypassing the barrier');
-            assert.match(source, /agentOutcome/, 'the completed entry must carry the terminal outcome');
+        await markTaskTerminalState({
+            stateManager: manager as never, taskId: TASK_ID, claudeResult: successfulClaudeResult(),
+            postProcessingResult: POST_PROCESSING_RESULT, commitResult: COMMIT_RESULT,
         });
+
+        const completed = rowsOf(TASK_STATES.COMPLETED);
+        assert.equal(completed.length, 1, 'the committed completion stands, and the key stops a duplicate landing');
+        assert.equal(durableRows(TASK_STATES.FAILED).length, 0,
+            'a durably completed task must never be settled as failed by a retry that could not see it');
+        assert.equal(agentOutcomeOf(durableRows(TASK_STATES.COMPLETED)[0])?.success, true);
+        assert.equal(redisState().state, TASK_STATES.COMPLETED,
+            'and the rolled-back projection is caught up with the durable history');
+        assert.ok(durableCompletionCarriesEvidence());
+        await manager.close();
+    });
+
+    test('a completion whose durability cannot be read back settles nothing terminal', async () => {
+        const manager = stateManager();
+        await startExecution(manager);
+        failedInsertStates.add(TASK_STATES.COMPLETED);
+        failHistoryReadBack = true;
+
+        await assert.rejects(() => publishCompletedWithDurableExecutionEvidence({
+            stateManager: manager as never, taskId: TASK_ID,
+            metadata: { reason: 'Task completed successfully', historyMetadata: { agentOutcome: { success: true } } },
+        }), new RegExp(COMPLETION_DURABILITY_UNVERIFIABLE));
+
+        assert.equal(durableRows(TASK_STATES.COMPLETED).length, 0);
+        assert.equal(durableRows(TASK_STATES.FAILED).length, 0,
+            'failed is written only after confirming the completion did not commit');
+        await manager.close();
+    });
+
+    test('the idempotency key is stable across retries and never collides across transitions', async () => {
+        assert.notEqual(terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED), terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED),
+            'two genuinely different terminal transitions of one task get different keys');
+        assert.notEqual(terminalTransitionId(TASK_ID, TASK_STATES.FAILED), terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED));
+
+        // At the database: a retry of ONE transition is rejected, two different ones both land.
+        const first = terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED);
+        const second = terminalTransitionId(TASK_ID, TASK_STATES.COMPLETED);
+        const row = (transitionId: string) => ({
+            task_id: TASK_ID, state: TASK_STATES.COMPLETED, timestamp: '2026-09-20T10:05:00.000Z',
+            reason: 'Task completed successfully', metadata: '{}', transition_id: transitionId,
+        });
+        await taskHistoryQuery().insert(row(first));
+        await assert.rejects(() => taskHistoryQuery().insert(row(first)), /UNIQUE constraint failed/);
+        await taskHistoryQuery().insert(row(second));
+        assert.equal(rowsOf(TASK_STATES.COMPLETED).length, 2,
+            'different transitions of the same task are not blocked by each other');
+    });
+
+    test('the failed settlement carries its own key, distinct from the completion it replaces', async () => {
+        const manager = stateManager();
+        await startExecution(manager);
+        failedInsertStates.add(TASK_STATES.COMPLETED);
+
+        await markTaskTerminalState({
+            stateManager: manager as never, taskId: TASK_ID, claudeResult: successfulClaudeResult(),
+            postProcessingResult: POST_PROCESSING_RESULT, commitResult: COMMIT_RESULT,
+        });
+
+        const failed = rowsOf(TASK_STATES.FAILED);
+        assert.equal(failed.length, 1);
+        assert.match(String(failed[0].transition_id), new RegExp(`^${TASK_STATES.FAILED}:${TASK_ID}:`),
+            'the settlement is its own transition, keyed as such');
+        await manager.close();
+    });
+});
+
+/**
+ * The publisher sweep.
+ *
+ * A hard-coded list of the paths known to publish `completed` can only ever check the paths
+ * someone remembered; the task-import job published a model-executed completion for years while
+ * such a list passed. These tests instead enumerate every source file, decide from the source
+ * itself which ones publish a completion or run a model execution, and hold the whole set to the
+ * invariant — so a new publisher fails this test the moment it is written, and can only pass by
+ * using the barrier or by being entered, with a reason, in the ledger below (which is re-verified,
+ * not trusted).
+ */
+const SOURCE_ROOT = new URL('../src/', import.meta.url);
+const BARRIER_MODULE = 'jobs/completedExecutionDurability.ts';
+
+/** Publishing a completion: the terminal helper, or a completed transition of the task state. */
+const PUBLISHES_COMPLETED = /markTaskCompleted\(|state:\s*TaskStates\.COMPLETED|updateTaskState\w*\([^;]{0,240}?TaskStates\.COMPLETED/;
+const USES_BARRIER = /publishCompletedWithDurableExecutionEvidence\(/;
+const RUNS_MODEL_EXECUTION = /\.executeTask\(/;
+
+/**
+ * Completion publishers that run no model execution, so they have no execution evidence to make
+ * durable. Each reason is re-checked below against the file it claims to describe.
+ */
+const NON_EXECUTING_COMPLETION_PATHS = new Map<string, string>([
+    ['jobs/prCommentNoAuthorizedFindings.ts',
+        'no authorized finding was selected, so no agent runs: the job posts a comment and completes'],
+    ['jobs/prCommentReviewJob.ts',
+        'the review workflow runs its own analysis, never the delivery placeholder path'],
+    ['jobs/prCommentTaskFinalizer.ts',
+        'reconciles a task from its BullMQ job outcome; it executes nothing itself'],
+]);
+
+async function sourceFiles(directory: URL = SOURCE_ROOT, prefix = ''): Promise<string[]> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    const files: string[] = [];
+    for (const entry of entries) {
+        if (entry.isDirectory()) files.push(...await sourceFiles(new URL(`${entry.name}/`, directory), `${prefix}${entry.name}/`));
+        else if (entry.name.endsWith('.ts')) files.push(`${prefix}${entry.name}`);
     }
+    return files;
+}
+
+async function classifiedSources(): Promise<Array<{ path: string; source: string }>> {
+    const paths = await sourceFiles();
+    return Promise.all(paths.map(async path => ({ path, source: await readFile(new URL(path, SOURCE_ROOT), 'utf8') })));
+}
+
+describe('every path that publishes completed after a model execution goes through the barrier', () => {
+    test('the sweep sees the sources it is meant to police', async () => {
+        const sources = await classifiedSources();
+        assert.ok(sources.length > 50, 'the enumeration must actually walk the source tree');
+        assert.ok(sources.some(({ path }) => path === BARRIER_MODULE), 'including the barrier itself');
+        const publishers = sources.filter(({ path, source }) => path !== BARRIER_MODULE && PUBLISHES_COMPLETED.test(source))
+            .map(({ path }) => path).sort();
+        assert.deepEqual(publishers, [...NON_EXECUTING_COMPLETION_PATHS.keys()].sort(),
+            'the publishers the sweep finds are exactly the documented non-executing ones');
+        assert.ok(sources.some(({ source }) => RUNS_MODEL_EXECUTION.test(source)), 'and the model-executing paths');
+    });
+
+    test('no source publishes completed outside the barrier except a documented non-executing path', async () => {
+        const sources = await classifiedSources();
+        // A direct publication bypasses the barrier even in a file that also uses it, so using the
+        // barrier is not an excuse here: publishing directly is allowed only for a ledger entry.
+        const unguarded = sources
+            .filter(({ path, source }) => path !== BARRIER_MODULE
+                && PUBLISHES_COMPLETED.test(source)
+                && !NON_EXECUTING_COMPLETION_PATHS.has(path))
+            .map(({ path }) => path);
+        assert.deepEqual(unguarded, [],
+            'a path publishing completed must go through publishCompletedWithDurableExecutionEvidence, '
+            + 'or be entered in NON_EXECUTING_COMPLETION_PATHS with a reason');
+    });
+
+    test('no documented exception runs a model execution, and none of them has gone stale', async () => {
+        const sources = new Map((await classifiedSources()).map(({ path, source }) => [path, source]));
+        for (const [path, reason] of NON_EXECUTING_COMPLETION_PATHS) {
+            const source = sources.get(path);
+            assert.ok(source, `${path} is listed as an exception but no longer exists: ${reason}`);
+            assert.ok(PUBLISHES_COMPLETED.test(source), `${path} no longer publishes completed; remove its exception`);
+            assert.doesNotMatch(source, RUNS_MODEL_EXECUTION,
+                `${path} now runs a model execution, so it must publish through the barrier`);
+        }
+    });
+
+    test('every model execution that completes its task completes through the barrier', async () => {
+        const sources = await classifiedSources();
+        const executing = sources.filter(({ source }) => RUNS_MODEL_EXECUTION.test(source));
+        assert.ok(executing.length > 0, 'the sweep must find the model-executing paths');
+        for (const { path, source } of executing) {
+            if (!PUBLISHES_COMPLETED.test(source)) continue;
+            assert.match(source, USES_BARRIER,
+                `${path} runs a model execution and publishes completed, so it must use the barrier`);
+        }
+    });
+
+    test('every barrier caller records the terminal agent outcome on the completion', async () => {
+        const callers = (await classifiedSources())
+            .filter(({ path, source }) => path !== BARRIER_MODULE && USES_BARRIER.test(source));
+        assert.ok(callers.length >= 4, 'the issue, PR-comment, merge-conflict and task-import paths all use it');
+        for (const { path, source } of callers) {
+            assert.match(source, /agentOutcome/, `${path} must carry the terminal outcome on its completion`);
+        }
+    });
 
     test("each path's completion metadata satisfies the barrier", () => {
         const claudeResult = successfulClaudeResult();

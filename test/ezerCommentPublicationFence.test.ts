@@ -20,12 +20,14 @@ await mock.module('@propr/core', {
         cleanupPreparedVisualPreviewEvidence: async () => undefined,
         commitChanges,
         AI_COMMIT_AUTHOR: { name: 'ProPR AI', email: 'ai@propr.dev' },
-        db: mock.fn(() => ({ where: mock.fn(() => ({ update: mock.fn(async () => undefined) })) })),
+        db: mock.fn(() => ({ where: mock.fn(() => ({ update: mock.fn(async () => undefined), first: mock.fn(async () => undefined) })) })),
         getRepoUrl: mock.fn(() => 'https://example.test/owner/repo.git'),
         getAuthenticatedOctokit: mock.fn(),
         pushBranch,
         resolveAgentTerminationReason: (result: { terminationReason?: string }) => result.terminationReason,
         TaskStates: { COMPLETED: 'completed' },
+        ErrorCategories: { POST_PROCESSING: 'post_processing' },
+        redactSecrets: (value: string) => value,
     },
 });
 

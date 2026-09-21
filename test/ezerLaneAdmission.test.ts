@@ -19,7 +19,7 @@ import type { StoryExecutionContract } from '../packages/core/src/admission/stor
 import { requireIssueRecordedCheckpoint } from '../src/jobs/recordedExecutionCheckpoint.js';
 
 const FIXTURE_BYTES = readFileSync(new URL('./fixtures/ezer-lane-admission.json', import.meta.url));
-const FIXTURE_SHA256 = 'f5e8cffabfdedb3f759a35ad405f638cc011d67501bb796ba46d58ec0bf034d6';
+const FIXTURE_SHA256 = '3f39a508ec3bc37cd4d61e782c2091ae2595db2b99aa64764dbdf57b0a1a2aef';
 const FIXTURE = JSON.parse(FIXTURE_BYTES.toString('utf8')) as { hmacSecret: string; token: string };
 const CLAIMS = JSON.parse(Buffer.from(FIXTURE.token.split('.')[0] ?? '', 'base64url').toString('utf8'));
 const STORY = 'EP-binding-fixture-S02';

@@ -12,7 +12,21 @@ export const EXECUTION_CHECKPOINT_REF_PREFIX = 'refs/propr/checkpoints/';
 const CHECKPOINT_REF_TAIL = /^[A-Za-z0-9_][A-Za-z0-9_./-]*[A-Za-z0-9_]$/;
 const UNSAFE_REF_SEQUENCE = /\/\/|\.\.|\/\.|\.lock(?:\/|$)/;
 const TASK_SEGMENT_UNSAFE = /[^A-Za-z0-9._-]+/g;
-const TASK_SEGMENT_EDGES = /^[.-]+|[.-]+$/g;
+/**
+ * The characters trimmed from both ends of a task segment. Trimmed by a linear scan, NOT a regex:
+ * `/^[.-]+|[.-]+$/g` is polynomial on library input — for `a` + many `-` + `b` the `[.-]+$`
+ * branch consumes each dash run, fails `$`, and backtracks from every start position (CodeQL
+ * js/polynomial-redos on GospeLib/propr#24).
+ */
+const TASK_SEGMENT_EDGE_CHARS = new Set(['.', '-']);
+
+function trimSegmentEdges(value: string): string {
+  let start = 0;
+  let end = value.length;
+  while (start < end && TASK_SEGMENT_EDGE_CHARS.has(value[start]!)) start++;
+  while (end > start && TASK_SEGMENT_EDGE_CHARS.has(value[end - 1]!)) end--;
+  return value.slice(start, end);
+}
 const TASK_SEGMENT_SEPARATOR = '-';
 
 /** Exact prior partial-work checkpoint a fresh attempt starts from; the ref and SHA both bind. */
@@ -38,7 +52,7 @@ export function requireExecutionCheckpointRef(value: unknown): string {
 
 /** The ref segment naming the ProPR task whose stopped attempt a checkpoint preserves. */
 export function executionCheckpointTaskSegment(taskId: string): string {
-  const segment = taskId.replace(TASK_SEGMENT_UNSAFE, TASK_SEGMENT_SEPARATOR).replace(TASK_SEGMENT_EDGES, '');
+  const segment = trimSegmentEdges(taskId.replace(TASK_SEGMENT_UNSAFE, TASK_SEGMENT_SEPARATOR));
   if (!segment) throw Error('EXECUTION_CHECKPOINT_TASK_INVALID');
   return segment;
 }

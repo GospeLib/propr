@@ -1,5 +1,6 @@
 import type { Socket } from 'socket.io';
 import type { SocketPrincipal } from '../auth.js';
+import type { EzerStreamingService } from '../ep-ezer-follow-ups-s02.js';
 import type { QueueBroadcaster } from './queueBroadcaster.js';
 import { revalidateSocketAuthentication } from './socketAuthentication.js';
 import type { QueueDependencies } from './socketService.js';
@@ -9,7 +10,7 @@ export const INSTANCE_OPERATIONAL_ROOM = 'instance:operational';
 const USER_ROOM_PREFIX = 'user:';
 const MAX_RESOURCE_ID_LENGTH = 512;
 const MAX_RESOURCE_ROOMS_PER_SOCKET = 100;
-const RESOURCE_ROOM_PREFIXES = ['task:', 'task:live:', 'draft:', 'indexing:'];
+const RESOURCE_ROOM_PREFIXES = ['task:', 'task:live:', 'draft:', 'indexing:', 'ezer:operation:'];
 export const SOCKET_SUBSCRIPTION_ERROR = 'subscription:error';
 
 export interface SocketSubscriptionErrorPayload {
@@ -21,6 +22,7 @@ interface SocketSubscriptionDependencies {
   getQueueDependencies: () => QueueDependencies | null;
   getQueueBroadcaster: () => QueueBroadcaster | null;
   taskWatcherManager: TaskWatcherManager;
+  getEzerStreaming?: () => EzerStreamingService | null;
 }
 
 interface PendingSubscriptionState {
@@ -60,6 +62,10 @@ export function taskRoom(taskId: string): string {
   return `task:${encodeURIComponent(taskId)}`;
 }
 
+export function ezerOperationRoom(operationId: string): string {
+  return `ezer:operation:${encodeURIComponent(operationId)}`;
+}
+
 export class SocketSubscriptionManager {
   private readonly pendingSubscriptions = new WeakMap<Socket, Map<string, PendingSubscriptionState>>();
 
@@ -73,6 +79,7 @@ export class SocketSubscriptionManager {
     this.setupDraftHandlers(socket);
     this.setupIndexingHandlers(socket);
     this.setupQueueStatsHandlers(socket);
+    this.setupEzerStreamHandlers(socket);
     this.setupDisconnectHandler(socket);
   }
 
@@ -334,6 +341,53 @@ export class SocketSubscriptionManager {
     });
   }
 
+  /**
+   * EP-ezer-follow-ups-S02: subscribe to an Ezer operation's incremental
+   * progress stream. The payload carries the operation ID and, on reconnect,
+   * the last acknowledged cursor so replay resumes without redelivery.
+   */
+  private setupEzerStreamHandlers(socket: Socket): void {
+    socket.on('subscribe:ezer:operation', async (raw: unknown) => {
+      const request: Record<string, unknown> = typeof raw === 'string'
+        ? { operationId: raw }
+        : typeof raw === 'object' && raw !== null ? raw as Record<string, unknown> : {};
+      const operationId = normalizeSocketResourceId(request.operationId);
+      if (!operationId) return this.reject(socket, 'subscribe:ezer:operation', 'INVALID_RESOURCE');
+      let afterCursor: string | undefined;
+      if (request.afterCursor !== undefined && request.afterCursor !== null) {
+        const normalizedCursor = normalizeSocketResourceId(request.afterCursor);
+        if (!normalizedCursor) return this.reject(socket, 'subscribe:ezer:operation', 'INVALID_RESOURCE');
+        afterCursor = normalizedCursor;
+      }
+      const streaming = this.dependencies.getEzerStreaming?.() ?? null;
+      if (!streaming) return this.reject(socket, 'subscribe:ezer:operation', 'FORBIDDEN');
+      try {
+        await this.join(socket, {
+          event: 'subscribe:ezer:operation',
+          room: ezerOperationRoom(operationId),
+          authorize: () => streaming.authorizeSubscription(operationId, this.getPrincipal(socket)),
+          onJoined: () => streaming.resume(operationId, {
+            id: socket.id,
+            send: (event, payload) => socket.emit(event, payload),
+          }, afterCursor),
+        });
+      } catch (error) {
+        console.error(`[SocketService] Failed to start Ezer stream subscription for ${operationId}:`, error);
+      }
+    });
+
+    socket.on('unsubscribe:ezer:operation', async (raw: unknown) => {
+      const operationId = normalizeSocketResourceId(
+        typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>).operationId : raw,
+      );
+      if (!operationId) return;
+      const room = ezerOperationRoom(operationId);
+      this.cancelPendingSubscription(socket, room);
+      await socket.leave(room);
+      this.dependencies.getEzerStreaming?.()?.detach(operationId, socket.id);
+    });
+  }
+
   private setupDisconnectHandler(socket: Socket): void {
     let liveTaskIds: string[] = [];
     socket.on('disconnecting', () => {
@@ -343,6 +397,7 @@ export class SocketSubscriptionManager {
     });
     socket.on('disconnect', (reason: string) => {
       console.log(`[SocketService] Client disconnected: ${socket.id}, reason: ${reason}`);
+      this.dependencies.getEzerStreaming?.()?.detachSubscriber(socket.id);
       for (const taskId of liveTaskIds) {
         void this.dependencies.taskWatcherManager.stopTaskWatcherIfEmpty(taskId).catch(error => {
           console.error(`[SocketService] Failed to stop disconnected live task watcher ${taskId}:`, error);

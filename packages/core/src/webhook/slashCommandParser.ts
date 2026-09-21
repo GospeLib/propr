@@ -3,6 +3,15 @@
  *
  * Recognizes `/review`, `/fix`, `/merge`, `/switch`, `/use`, and `/ultrafix` commands from PR comments.
  * Splits the comment into command name, arguments, and trailing multiline instructions.
+ *
+ * THIS PARSER KNOWS NOTHING ABOUT `/ezer`, DELIBERATELY. `/ezer` is a publicly reachable
+ * namespace — any GitHub user can post it on any watched pull request or issue — so the address
+ * must never resolve to a command for anyone who has not passed authorization. It is resolved to
+ * `/fix` in exactly one place, `resolveOwnerEzerCommandBody` in ../intake/routingOwnerEvent.ts,
+ * which is reached only after `claimEzerAddressedComment` has established that the configured
+ * owner (by stable numeric GitHub user id) wrote the comment. Reintroducing an alias table here
+ * would hand the address back to every consumer of this generally-exported function, authorized
+ * or not — which is the bypass shape found three times. See test/ezerDispatcherChokepoint.test.ts.
  */
 
 export type SlashCommandName = 'review' | 'fix' | 'merge' | 'switch' | 'use' | 'ultrafix';

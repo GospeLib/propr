@@ -1,4 +1,5 @@
 import type { Job } from 'bullmq';
+import { isCompletionDurabilityUnverifiable } from './completionDurabilityOutcome.js';
 import type { Logger } from 'pino';
 import {
     safeRemoveLabel,
@@ -255,6 +256,13 @@ export async function handleGenericError(
     options: GenericErrorOptions
 ): Promise<void> {
     const { octokit, claudeResult, worktreeInfo, correlatedLogger, stateManager, taskId, AI_PROCESSING_TAG } = options;
+    // The completion may have committed and could not be read back. Writing any terminal state
+    // now is the re-dispatch defect itself, so this handler declines the job entirely.
+    if (isCompletionDurabilityUnverifiable(error)) {
+        correlatedLogger.error({ taskId, error: error.message },
+            'Issue job completion durability is unverifiable; leaving the task unsettled');
+        throw error;
+    }
     const errorCategory = categorizeError(error.message);
     const isUserCancelled = error.message?.includes('aborted by user');
 
@@ -304,7 +312,10 @@ export async function handleGenericError(
             await stateManager.markTaskCancelled(taskId, 'user', { historyMetadata: { originalError: error.message } });
             correlatedLogger.info({ taskId }, 'Task marked as cancelled due to user abort');
         } else {
-            await stateManager.markTaskFailed(taskId, error, { errorCategory });
+            // A stopped admitted execution may already have preserved partial work before this failure.
+            const executionCheckpoint = (error as Error & { executionCheckpoint?: unknown }).executionCheckpoint;
+            await stateManager.markTaskFailed(taskId, error, { errorCategory,
+                ...(executionCheckpoint ? { historyMetadata: { executionCheckpoint } } : {}) });
         }
     } catch (stateError) {
         correlatedLogger.warn({ error: (stateError as Error).message }, 'Failed to update task state');

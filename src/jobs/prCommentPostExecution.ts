@@ -14,7 +14,6 @@ import {
     renderVisualPreviewSection,
     renderVisualPreviewUploadFailureSection,
     resolveAgentTerminationReason,
-    TaskStates,
     VISUAL_PREVIEW_SLOT,
 } from '@propr/core';
 import type {
@@ -30,6 +29,10 @@ import { buildCommitMessage } from './prCommentJobUtils.js';
 import { markReviewFindingsProcessed } from './reviewCommentGatherer.js';
 import type { AIReviewComment } from './reviewCommentGatherer.js';
 import { resolveUltrafixHistoryMeta } from './ultrafixJobHelpers.js';
+import { finalClaudeExecutionResult } from './claudeExecutionResult.js';
+import { publishCompletedWithDurableExecutionEvidence } from './completedExecutionDurability.js';
+import { durableOperationIdentity } from '@propr/core';
+import { buildAgentOutcome } from './executionOutcome.js';
 import type { GitHubToken } from './githubTypes.js';
 import {
     isVisualPreviewUploadAuthenticationError,
@@ -37,6 +40,7 @@ import {
 } from '../github/visualPreviewAttachments.js';
 
 interface PostExecutionState {
+    artifactCorrection?: import('@propr/core').TypedArtifactCorrection;
     octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>> | null;
     worktreeInfo: WorktreeInfo | undefined;
     claudeResult: ClaudeCodeResponse | null;
@@ -70,6 +74,7 @@ interface PostExecutionParams {
     redisClient: Redis;
     prProcessingLockKey: string;
     prProcessingLockToken: string;
+    ezerAdmissionVerified?: boolean;
 }
 
 interface UndoContextParams {
@@ -146,11 +151,12 @@ interface CompletionCommentPublicationOptions {
     llm: string | null | undefined;
     taskUrl: string;
     unprocessedReviewComments: AIReviewComment[];
-    visualPreviewEvidence: Awaited<ReturnType<typeof prepareVisualPreviewEvidence>>['evidence'];
+    visualPreviewEvidence?: Awaited<ReturnType<typeof prepareVisualPreviewEvidence>>['evidence'];
 }
 
 async function publishCompletionComment(options: CompletionCommentPublicationOptions): Promise<{ data: { html_url: string; body?: string } }> {
-    const { state, context, commitResult, changesSummary, commitMessage, llm, taskUrl, unprocessedReviewComments, visualPreviewEvidence } = options;
+    const { state, context, commitResult, changesSummary, commitMessage, llm, taskUrl, unprocessedReviewComments } = options;
+    const visualPreviewEvidence = options.visualPreviewEvidence ?? { assets: [], toolSuggestions: [] };
     const { repoOwner, repoName, pullRequestNumber, correlatedLogger } = context;
     const hasVisualPreviewContent = visualPreviewEvidence.assets.length > 0
         || visualPreviewEvidence.toolSuggestions.length > 0;
@@ -206,7 +212,16 @@ async function publishCompletionComment(options: CompletionCommentPublicationOpt
     }
 }
 
-export async function handlePostExecution(params: PostExecutionParams, taskUrl: string): Promise<{ commitHash?: string; partial: boolean }> {
+export async function handlePostExecution(params: PostExecutionParams, taskUrl: string): Promise<{
+    commitHash?: string;
+    partial: boolean;
+    /**
+     * The identity the barrier claimed for this completion, present only when the completed row
+     * is durable under it. The job result carries it onward so the BullMQ finalizer can verify
+     * that exact row rather than mint a second, evidence-free completion of its own.
+     */
+    terminalTransitionId?: string;
+}> {
     const {
         state,
         job,
@@ -222,8 +237,12 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
     const { repoOwner, repoName, pullRequestNumber, correlatedLogger } = context;
 
     requirePostExecutionState(state);
-    const disposition = getPostExecutionDisposition(state.claudeResult);
     const terminationReason = resolveAgentTerminationReason(state.claudeResult);
+    if (params.ezerAdmissionVerified === true &&
+        (state.claudeResult.success !== true || terminationReason !== undefined)) {
+        throw new Error('ezer-comment-refused:incomplete-execution');
+    }
+    const disposition = getPostExecutionDisposition(state.claudeResult);
     const partial = disposition === 'partial';
     if (disposition === 'failed') {
         throw new Error(`Agent execution failed: ${state.claudeResult.error || 'Unknown error'}`);
@@ -231,7 +250,7 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
 
     let preparedVisualPreview: Awaited<ReturnType<typeof prepareVisualPreviewEvidence>> | undefined;
     try {
-        preparedVisualPreview = await prepareVisualPreviewEvidence({
+        if (!state.artifactCorrection) preparedVisualPreview = await prepareVisualPreviewEvidence({
             worktreePath: state.worktreeInfo.worktreePath,
             settings: await loadRepositoryVisualPreviewSettings(`${repoOwner}/${repoName}`),
             taskId
@@ -251,7 +270,7 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
             llm,
             taskUrl,
             unprocessedReviewComments,
-            visualPreviewEvidence: preparedVisualPreview.evidence
+            visualPreviewEvidence: preparedVisualPreview?.evidence
         });
         correlatedLogger.info({ pullRequestNumber, commitHash: commitResult?.commitHash, commentUrl: completionComment.data.html_url, partial, terminationReason }, partial ? 'Published partial follow-up changes after interrupted execution' : 'Successfully applied follow-up changes');
 
@@ -269,20 +288,35 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
 
         const ultrafixHistoryMeta = await resolveUltrafixHistoryMeta(job, { repoOwner, repoName, pullRequestNumber }, redisClient);
 
-        await stateManager.updateTaskState(taskId, TaskStates.COMPLETED, {
-            reason: partial ? 'PR comment processing published partial work after interrupted execution' : 'PR comment processing completed successfully',
-            commitHash: commitResult?.commitHash,
-            historyMetadata: {
-                commandMode: job.data.commandMode || 'default',
-                githubComment: { url: completionComment.data.html_url, body: completionComment.data.body },
-                ...(unprocessedReviewComments.length > 0 && { consumedReviewCommentIds: unprocessedReviewComments.map(c => c.id) }),
-                ...(partial && { incompleteExecution: { reason: terminationReason } }),
-                ...ultrafixHistoryMeta,
-            }
+        // `completed` is published only once the final execution evidence is durable; the
+        // evidence rides on the completed entry itself. See completedExecutionDurability.ts.
+        const completion = await publishCompletedWithDurableExecutionEvidence({
+            stateManager, taskId, correlatedLogger,
+            // The queue job owns this attempt; its id is unchanged across every redelivery.
+            operationId: durableOperationIdentity('pr-comment-job', job.id ?? taskId),
+            metadata: {
+                reason: partial ? 'PR comment processing published partial work after interrupted execution' : 'PR comment processing completed successfully',
+                commitHash: commitResult?.commitHash,
+                claudeResult: finalClaudeExecutionResult({
+                    success: state.claudeResult.success,
+                    sessionId: state.claudeResult.sessionId,
+                    conversationId: state.claudeResult.conversationId,
+                    executionTime: state.claudeResult.executionTime,
+                }),
+                historyMetadata: {
+                    commandMode: job.data.commandMode || 'default',
+                    githubComment: { url: completionComment.data.html_url, body: completionComment.data.body },
+                    ...(unprocessedReviewComments.length > 0 && { consumedReviewCommentIds: unprocessedReviewComments.map(c => c.id) }),
+                    ...(partial && { incompleteExecution: { reason: terminationReason } }),
+                    ...ultrafixHistoryMeta,
+                    agentOutcome: buildAgentOutcome(state.claudeResult),
+                }
+            },
         });
 
         await persistCommitHash(taskId, commitResult?.commitHash, correlatedLogger);
-        return { commitHash: commitResult?.commitHash, partial };
+        return { commitHash: commitResult?.commitHash, partial,
+            ...(completion.outcome === 'published' ? { terminalTransitionId: completion.transitionId } : {}) };
     } finally {
         try {
             await cleanupPreparedVisualPreviewEvidence(preparedVisualPreview);

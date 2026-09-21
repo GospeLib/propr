@@ -9,6 +9,7 @@ import { filterCommentByAuthor } from '@propr/core';
 import type { UnprocessedComment, CommentJobData } from '@propr/core';
 import { isReasoningLevelLabel, parseReasoningLevelFromLabels } from '@propr/shared';
 import type { ReasoningLevel, ReasoningLevelLabel } from '@propr/shared';
+import { provisionalClaudeExecutionResult } from './claudeExecutionResult.js';
 
 interface ValidationComment {
     id: number;
@@ -44,6 +45,7 @@ interface FetchLinkedIssueOptions {
 }
 
 interface SessionIdOptions {
+    verifiedExecutionCorrelation?: { admissionId: string; operationId: string };
     llm: string;
     stateManager: WorkerStateManager;
     correlatedLogger: Logger;
@@ -347,14 +349,14 @@ export function createSessionIdCallbackForPR(
             if (currentState?.state === TaskStates.CLAUDE_EXECUTION) {
                 // Already in claude_execution, just update the history metadata with session info
                 await stateManager.updateHistoryMetadata(taskId, 'claude_execution', {
-                    sessionId, conversationId, model: llm
+                    sessionId, conversationId, model: llm, ...options.verifiedExecutionCorrelation
                 });
             } else {
                 // Transition to claude_execution state
                 await stateManager.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, {
                     reason: 'Claude execution started',
-                    claudeResult: { success: false, sessionId, conversationId },
-                    historyMetadata: { sessionId, conversationId, model: llm }
+                    claudeResult: provisionalClaudeExecutionResult(sessionId, conversationId),
+                    historyMetadata: { sessionId, conversationId, model: llm, ...options.verifiedExecutionCorrelation }
                 });
             }
 

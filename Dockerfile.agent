@@ -4,9 +4,9 @@
 # own stage so changing one version preserves the build cache for every other
 # agent. Only this final image is published.
 
-# The managed agent image is currently linux/amd64. Debian package pins below
-# include amd64 binNMU suffixes, so do not build this Dockerfile for arm64
-# until those pins are split per architecture.
+# The full managed bundle includes an amd64-only Antigravity binary. The
+# claude-runtime and codex-runtime targets reuse their CLI stages on native arm64; apt
+# resolves package revisions from each architecture using the prefixes below.
 ARG AGENT_PLATFORM=linux/amd64
 ARG UV_VERSION=0.8.17
 FROM --platform=${AGENT_PLATFORM} ghcr.io/astral-sh/uv:${UV_VERSION} AS uv-bin
@@ -113,6 +113,18 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}" \
     && claude --version
 
 
+# Native Claude runtime for hosts that cannot execute the full amd64 bundle.
+# It retains the same dispatcher, admission marker and unprivileged entrypoint.
+FROM claude-cli AS claude-runtime
+COPY --chmod=755 scripts/agent-entrypoint.sh scripts/claude-entrypoint.sh /home/node/
+USER node
+RUN git config --global user.name "ProPR Agent Bot" \
+    && git config --global user.email "agent-bot@propr.dev" \
+    && git config --global --add safe.directory '*'
+WORKDIR /home/node/workspace
+ENTRYPOINT ["/usr/bin/tini", "--", "/home/node/agent-entrypoint.sh"]
+
+
 FROM agent-base AS codex-cli
 ARG CODEX_CLI_VERSION=0.151.0
 USER root
@@ -120,6 +132,17 @@ RUN npm install -g "@openai/codex@${CODEX_CLI_VERSION}" \
     && npm cache clean --force \
     && rm -rf /root/.npm \
     && codex --version
+
+# Native Codex retains the same admission dispatcher, authenticated config mount,
+# and owner-safe entrypoint as the managed bundle; only the CPU architecture differs.
+FROM codex-cli AS codex-runtime
+COPY --chmod=755 scripts/agent-entrypoint.sh scripts/codex-entrypoint.sh /home/node/
+USER node
+RUN git config --global user.name "ProPR Agent Bot" \
+    && git config --global user.email "agent-bot@propr.dev" \
+    && git config --global --add safe.directory '*'
+WORKDIR /home/node/workspace
+ENTRYPOINT ["/usr/bin/tini", "--", "/home/node/agent-entrypoint.sh"]
 
 
 FROM agent-base AS opencode-cli

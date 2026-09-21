@@ -22,6 +22,15 @@ for (const dockerfilePath of appDockerfiles) {
   });
 }
 
+test('native Codex runtime reuses the pinned CLI, admission dispatcher and owner-safe entrypoint', () => {
+  const runtime=dockerfile.split('FROM codex-cli AS codex-runtime')[1]?.split('\nFROM ')[0];
+  assert.ok(runtime,'Native arm64 hosts need the existing Codex runtime without the amd64-only bundle');
+  assert.match(runtime,/scripts\/agent-entrypoint.sh scripts\/codex-entrypoint.sh/);
+  assert.match(runtime,/USER node/);
+  assert.match(runtime,/ENTRYPOINT \["\/usr\/bin\/tini", "--", "\/home\/node\/agent-entrypoint.sh"\]/);
+  assert.doesNotMatch(runtime,/npm install|auth.json|ANTHROPIC_API_KEY|COPY --from=antigravity/);
+});
+
 test('Antigravity agent build uses a versioned artifact with a pinned checksum', () => {
   assert.match(dockerfile, /ARG ANTIGRAVITY_CLI_VERSION=\d+\.\d+\.\d+/);
   assert.doesNotMatch(dockerfile, /ANTIGRAVITY_CLI_VERSION=latest/);

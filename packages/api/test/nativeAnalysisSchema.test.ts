@@ -1,0 +1,77 @@
+import assert from 'node:assert/strict';
+import { createHash, randomUUID } from 'node:crypto';
+import { after, test } from 'node:test';
+import { closeConnection, SyntheticAgent, type Agent, type AnalyzeOptions } from '@propr/core';
+import { nativeAnalysis, type NativeAnalysisBinding } from '../routes/nativeAnalysis.js';
+
+const PROMPT = 'exact original planning input';
+const SCHEMA = { type: 'object', additionalProperties: false, required: ['artifacts'],
+  properties: { artifacts: { type: 'array', items: { type: 'string' } } } };
+const digest = (text: string) => `sha256:${createHash('sha256').update(text).digest('hex')}`;
+// Each test is a DIFFERENT admitted operation, so each gets its own durable operation identity:
+// one identity means one execution, which is the invariant under test elsewhere, not a fixture
+// detail to be shared between unrelated scenarios.
+const binding = () => ({ requestId: 'request', operationId: `operation-${randomUUID()}`, repository: 'fixture/planning',
+  inputDigest: digest('logical input'), providerInputDigest: digest(PROMPT), responseSchemaDigest: digest(JSON.stringify(SCHEMA)) });
+after(closeConnection);
+
+test('native admission refuses a synthetic facade before routing or recording physical execution', async () => {
+  let admitted = false;
+  let routed = false;
+  const synthetic = new SyntheticAgent({ id: 'synthetic', alias: 'pool', enabled: true,
+    defaultModel: 'balanced', models: [] }, {
+    begin() { routed = true; return { async analyze() { return { success: true, response: '{}' }; } }; },
+  } as unknown as ConstructorParameters<typeof SyntheticAgent>[1]);
+  assert.equal(synthetic.config.type, 'claude');
+  await assert.rejects(nativeAnalysis(synthetic, PROMPT, {
+    options: { analysisProfile: 'planning-artifact', responseSchema: SCHEMA }, binding: binding(),
+    signal: new AbortController().signal, dependencies: { stateManager: {
+      async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() { admitted = true; }, async updateTaskState() {}, async updateHistoryMetadata() {},
+    } },
+  }), /authenticated Claude CLI executor/);
+  assert.equal(admitted, false);
+  assert.equal(routed, false);
+});
+
+for (const scenario of ['missing digest', 'foreign digest', 'missing schema', 'malformed schema']) {
+  test(`native schema admission refuses ${scenario} before creating task or calling author`, async () => {
+    let admitted = false, authored = false;
+    const execution: NativeAnalysisBinding = binding();
+    let responseSchema: unknown = SCHEMA;
+    if (scenario === 'missing digest') delete execution.responseSchemaDigest;
+    if (scenario === 'foreign digest') execution.responseSchemaDigest = digest('foreign');
+    if (scenario === 'missing schema') responseSchema = undefined;
+    if (scenario === 'malformed schema') responseSchema = [];
+    await assert.rejects(nativeAnalysis({ config: { type: 'claude' }, async analyze() { authored = true; } } as unknown as Agent,
+      PROMPT, { options: { analysisProfile: 'planning-artifact', responseSchema: responseSchema as AnalyzeOptions['responseSchema'] }, binding: execution,
+        signal: new AbortController().signal, dependencies: { stateManager: {
+          async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() { admitted = true; }, async updateTaskState() {}, async updateHistoryMetadata() {},
+        } } }), /response schema/);
+    assert.equal(admitted, false);
+    assert.equal(authored, false);
+  });
+}
+
+for (const scenario of ['matching', 'omitted CLI schema', 'changed CLI schema', 'missing input checkpoint']) {
+  test(`schema receipt derives from the persisted actual CLI input: ${scenario}`, async () => {
+    const checkpoints: Record<string, unknown>[] = [];
+    const agent = { config: { type: 'claude', id: 'fixture', alias: 'fixture' },
+      async analyze(prompt: string, options: AnalyzeOptions) {
+        if (scenario !== 'missing input checkpoint') await options.executionCallbacks!.onInputPrepared!({ prompt, systemPrompt: 'fixture',
+          ...(scenario === 'omitted CLI schema' ? {} : { responseSchema: scenario === 'changed CLI schema' ? { type: 'object' } : SCHEMA }) });
+        return { success: true, response: '{"artifacts":[]}', modelUsed: 'fixture' };
+      },
+    } as unknown as Agent;
+    const pending = nativeAnalysis(agent, PROMPT, { options: { analysisProfile: 'planning-artifact', responseSchema: SCHEMA },
+      binding: binding(), signal: new AbortController().signal, dependencies: { stateManager: {
+        async getTaskState() { return null; }, async markTaskFailed() { return {}; }, async createTaskState() {}, async updateTaskState() {},
+        async updateHistoryMetadata(_task, _state, metadata) { checkpoints.push(metadata); },
+      } } });
+    if (scenario.includes('CLI schema')) await assert.rejects(pending, /CLI response schema binding changed/);
+    else {
+      const result = await pending;
+      assert.equal(result.execution.responseSchemaDigest, scenario === 'matching' ? binding().responseSchemaDigest : undefined);
+      assert.equal(checkpoints.some(value => value.providerCliInput !== undefined), scenario === 'matching');
+    }
+  });
+}

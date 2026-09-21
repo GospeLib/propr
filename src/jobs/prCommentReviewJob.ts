@@ -27,8 +27,7 @@ import {
 } from './prTaskTitleHelpers.js';
 import type { Redis } from 'ioredis';
 import { buildWorkEvidenceMarker, filterRealComments } from '../shared/workEvidenceMarker.js';
-
-export type { ReviewAssignment, ReviewResult } from './prReviewRunner.js';
+import { publishReviewCompletion } from './reviewExecutionOutcome.js';
 
 export interface PRJobContext {
     pullRequestNumber: number;
@@ -269,7 +268,10 @@ export async function executeReviewProcessing(params: ExecuteReviewParams): Prom
     const validation = await validatePRAndComments(state.octokit, { ...context, llm });
     if (validation.skip) {
         correlatedLogger.info({ pullRequestNumber, reason: validation.reason }, 'Skipping review processing');
-        return { status: 'skipped', reason: validation.reason, pullRequestNumber };
+        // Nothing has executed at this point, and the finalizer may only settle a skip that
+        // says so: a completion with no execution evidence is otherwise indistinguishable from
+        // an executed run whose evidence never landed.
+        return { status: 'skipped', reason: validation.reason, pullRequestNumber, preExecutionSkip: true };
     }
 
     const { prData, unprocessedComments: validUnprocessed, llm: resolvedLlm } = validation;
@@ -427,21 +429,16 @@ export async function executeReviewProcessing(params: ExecuteReviewParams): Prom
 
     const ultrafixHistoryMeta = await resolveUltrafixHistoryMeta(job, redisClient, { repoOwner, repoName, pullRequestNumber });
 
-    await stateManager.updateTaskState(taskId, TaskStates.COMPLETED, {
-        reason: 'Review processing completed successfully',
-        historyMetadata: {
-            commandMode: 'review',
-            reviewResults: reviewResults.map(r => ({
-                model: r.assignment.model, label: r.assignment.label,
-                success: r.analysisResult.success, commentId: r.commentId, commentUrl: r.commentUrl, error: r.error,
-            })),
-            ...ultrafixHistoryMeta,
-        },
-    });
+    // The review workflow runs a model execution per assignment, so its completion goes through
+    // the durability barrier carrying that run's terminal outcome. See reviewExecutionOutcome.ts.
+    const reviewCompletion = await publishReviewCompletion({ stateManager, taskId, job, reviewResults, ultrafixHistoryMeta, correlatedLogger });
 
     correlatedLogger.info({ pullRequestNumber, successCount, failCount, totalReviews: assignments.length }, 'Review processing completed');
     const currentReviewCommentIds = reviewResults.flatMap(result => result.commentId === undefined ? [] : [result.commentId]);
     await handleUltrafixContinuation('review', { job, stateManager, taskId, redisClient, repoOwner, repoName, pullRequestNumber, correlatedLogger, correlationId, currentReviewCommentIds, currentReviewResultCount: reviewResults.length });
 
-    return { status: 'complete', pullRequestNumber, reviewsPosted: successCount, reviewsFailed: failCount };
+    return { status: 'complete', pullRequestNumber, reviewsPosted: successCount, reviewsFailed: failCount,
+        // The identity the barrier claimed for this completion, so the finalizer can verify the
+        // durable row instead of asserting a completion it did not run.
+        ...(reviewCompletion.outcome === 'published' ? { terminalTransitionId: reviewCompletion.transitionId } : {}) };
 }

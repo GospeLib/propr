@@ -8,64 +8,15 @@ import {
   findPlanIssueByRepoAndNumber,
   PlanIssueStatus,
   triggerNextPendingIssue,
-  updatePlanIssueStatus,
-  resolveAgentTerminationReason,
-  ErrorCategories
+  updatePlanIssueStatus
 } from '@propr/core';
-import type { CommitResult, ClaudeCodeResponse } from '@propr/core';
+import type { CommitResult } from '@propr/core';
 import type { PostProcessingResult } from '../issueJobHelpers.js';
 import type { TaskCompletionParams } from './types.js';
+import { markTaskTerminalState } from '../terminalTaskState.js';
+import { isCompletionDurabilityUnverifiable } from '../completionDurabilityOutcome.js';
 
-export function getTaskCompletionStatus(claudeResult: ClaudeCodeResponse | null, postProcessingResult: PostProcessingResult | null): string {
-  if (postProcessingResult?.pr && claudeResult && resolveAgentTerminationReason(claudeResult)) {
-    return 'partial_with_pr';
-  }
-  if (!claudeResult?.success) {
-    return 'claude_processing_failed';
-  }
-  return postProcessingResult?.pr ? 'complete_with_pr' : 'claude_success_no_changes';
-}
-
-type TerminalStateParams = Pick<
-  TaskCompletionParams,
-  'stateManager' | 'taskId' | 'claudeResult' | 'postProcessingResult' | 'commitResult'
->;
-
-export async function markTaskTerminalState(params: TerminalStateParams): Promise<void> {
-  const { stateManager, taskId, claudeResult, postProcessingResult, commitResult } = params;
-  const status = getTaskCompletionStatus(claudeResult, postProcessingResult);
-  const commitResultData = commitResult
-    ? { commitHash: commitResult.commitHash, commitMessage: commitResult.commitMessage }
-    : null;
-  const taskResult = {
-    status,
-    claudeSuccess: claudeResult?.success || false,
-    prCreated: !!postProcessingResult?.pr,
-    prNumber: postProcessingResult?.pr?.number ?? undefined,
-    prUrl: postProcessingResult?.pr?.url ?? undefined,
-    commitResult: commitResultData
-  };
-
-  if (status === 'claude_processing_failed') {
-    await stateManager.markTaskFailed(
-      taskId,
-      new Error(claudeResult?.error || 'Agent processing failed'),
-      {
-        errorCategory: ErrorCategories.CLAUDE_EXECUTION,
-        prResult: taskResult,
-        historyMetadata: {
-          pr: (taskResult.prUrl && taskResult.prNumber)
-            ? { number: taskResult.prNumber, url: taskResult.prUrl }
-            : null,
-          commitResult: commitResultData
-        }
-      }
-    );
-    return;
-  }
-
-  await stateManager.markTaskCompleted(taskId, taskResult);
-}
+export { getTaskCompletionStatus, markTaskTerminalState } from '../terminalTaskState.js';
 
 function buildTaskUpdateFields(
   commitResult: CommitResult | null,
@@ -124,12 +75,21 @@ async function closeFailedPlanIssueAndContinue(taskCompletionParams: TaskComplet
 export async function markTaskComplete(taskCompletionParams: TaskCompletionParams): Promise<void> {
   const { taskId, postProcessingResult, commitResult, correlatedLogger } = taskCompletionParams;
   try {
-    await markTaskTerminalState(taskCompletionParams);
+    // A stopped admitted execution already wrote its durable terminal record before cleanup.
+    if (!postProcessingResult?.terminalStateRecorded) await markTaskTerminalState(taskCompletionParams);
 
     const updateFields = buildTaskUpdateFields(commitResult, postProcessingResult);
     await persistTaskUpdateFields(taskId, updateFields, correlatedLogger);
     await closeFailedPlanIssueAndContinue(taskCompletionParams);
   } catch (stateError) {
+    // A completion that may have committed but could not be read back must not be swallowed:
+    // swallowing it leaves the job to finish "successfully" with no terminal record, and the
+    // outer handler would otherwise settle `failed` over a possibly delivered success.
+    if (isCompletionDurabilityUnverifiable(stateError)) {
+      correlatedLogger.error({ taskId, error: (stateError as Error).message },
+        'Completion durability is unverifiable; refusing to settle this task in any terminal state');
+      throw stateError;
+    }
     correlatedLogger.warn({ error: (stateError as Error).message }, 'Failed to update terminal task state');
   }
 }

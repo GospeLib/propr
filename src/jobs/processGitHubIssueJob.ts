@@ -8,6 +8,8 @@ import {
   logger, TaskStates, ensureRepoCloned, getRepoUrl, safeAddLabel, safeRemoveLabel, ensureGitRepository,
   UsageLimitError, validateRepositoryInfo, addModelSpecificDelay, withRetry, retryConfigs, updatePlanIssueTaskId
 } from '@propr/core';
+import { inspectConfiguredEzerAdmission } from './ezerExecutionAdmission.js';
+import { durableOperationIdentity } from '@propr/core';
 import type { IssueJobData, JobResult, WorktreeInfo, ClaudeCodeResponse, CommitResult, RepoValidationResult } from '@propr/core';
 import { handleDispatch } from './issueJobDispatcher.js';
 import { handleUsageLimitError, handleGenericError, updateTaskTitleInStorage, buildFinalResult } from './issueJobHelpers.js';
@@ -30,13 +32,38 @@ export async function processGitHubIssueJob(job: Job<IssueJobData>): Promise<Job
   const context = await initializeJobContext(job);
   const { jobId, issueRef, correlationId, correlatedLogger, stateManager, modelName, taskId, AI_PROCESSING_TAG, AI_DONE_TAG, AI_WAITING_TAG } = context;
 
-  await addModelSpecificDelay(modelName);
+
+  // A stopped task keeps its identity across BullMQ redelivery. Never recreate it.
+  if (await stateManager.getTaskCancellation(taskId)) {
+    job.discard();
+    return { status: 'cancelled', reason: 'user_request' };
+  }
 
   try {
     await stateManager.createTaskState(taskId, { number: issueRef.number, repoOwner: issueRef.repoOwner, repoName: issueRef.repoName, modelName } as import('@propr/core').IssueRef, correlationId);
   } catch (stateError) {
     correlatedLogger.warn({ taskId, error: (stateError as Error).message }, 'Failed to create task state, continuing anyway');
   }
+
+  try {
+    context.ezerAdmissionPrepared = await inspectConfiguredEzerAdmission(job.data,
+        typed => { context.typedInvestigation = typed; },
+        execution => { context.storyExecution = execution; },
+        deadline => { context.executionDeadline = deadline; });
+    // Only an explicitly admitted attempt may execute. BullMQ must not invent another attempt.
+    if (context.ezerAdmissionPrepared) job.discard();
+  } catch (error) {
+    job.discard();
+    await stateManager.updateTaskState(taskId, TaskStates.FAILED, {
+      reason: error instanceof Error ? error.message : String(error),
+      historyMetadata: {
+        admissionId: issueRef.executionAdmissionReceipt?.admissionId,
+        operationId: issueRef.executionAdmissionReceipt?.operationId,
+      },
+    });
+    throw error;
+  }
+  await addModelSpecificDelay(modelName);
 
   // Update plan issue with task_id for progress tracking
   const repository = `${issueRef.repoOwner}/${issueRef.repoName}`;
@@ -118,6 +145,11 @@ export async function processGitHubIssueJob(job: Job<IssueJobData>): Promise<Job
     await markTaskComplete({
       stateManager,
       taskId,
+      // The signed admission owns this attempt where there is one; otherwise the queue job does.
+      // Both are durable and unchanged across a crash and a redelivery, which is what the
+      // terminal transition's idempotency key needs in order to mean anything.
+      operationId: durableOperationIdentity('issue-job',
+        issueRef.executionAdmissionReceipt?.operationId ?? jobId ?? correlationId),
       issueRef,
       currentIssueLabels: currentLabels,
       claudeResult,
@@ -128,7 +160,11 @@ export async function processGitHubIssueJob(job: Job<IssueJobData>): Promise<Job
     return buildFinalResult(issueRef, localRepoPath || '', { worktreeInfo, claudeResult, postProcessingResult, commitResult });
 
   } catch (error) {
-    if (error instanceof UsageLimitError) {
+    if (await stateManager.getTaskCancellation(taskId)) {
+      job.discard();
+      return { status: 'cancelled', reason: 'user_request' };
+    }
+    if (error instanceof UsageLimitError && !context.ezerAdmissionPrepared) {
       await handleUsageLimitError(error, job, issueRef, {
         octokit, correlatedLogger, stateManager, taskId,
         AI_PROCESSING_TAG, AI_WAITING_TAG

@@ -13,9 +13,10 @@ import {
 import { AGENT_DEFAULT_VERSIONS } from '../version/types.js';
 import { DEFAULT_AGENT_EXECUTION_TIMEOUT_MS } from '../constants.js';
 import { persistLlmLog, createLlmLogFromAnalysis, buildTaskWorkRef, buildAnalysisWorkRef } from '../../utils/llmLogger.js';
-import { buildAnalysisSafetySuffix, executeWithUsageTracking } from './utils/index.js';
+import { buildAnalysisSafetySuffix, resolveAgentRuntimeOwner, executeWithUsageTracking } from './utils/index.js';
 import type { ExecutionType } from '../../utils/llmMetrics.types.js';
 import { resolveAgentTerminationReason } from '../termination.js';
+import { countAgentTurns } from '../turnCount.js';
 import { buildCodexDockerArgs, type CodexDockerArgsParams } from './utils/codexDockerArgsBuilder.js';
 
 // Re-export UsageLimitError for convenience
@@ -57,19 +58,20 @@ export class CodexAgent implements Agent {
                 customPrompt, issueRef, branchName, modelName: effectiveModel,
                 issueDetails, isRetry, retryReason, systemPrompt
             });
-            await setWorktreeOwnership(worktreePath, issueRef.number);
+            await setWorktreeOwnership(worktreePath, issueRef.number, resolveAgentRuntimeOwner(this.config.configPath));
             const worktreeGitContent = verifyWorktreeStructure(worktreePath, issueRef.number);
             const effectiveReasoningLevel = await this.resolveEffectiveReasoningLevel(reasoningLevel, effectiveModel);
             const dockerArgs = this.buildDockerArgs({
                 worktreePath, githubToken, modelName: effectiveModel,
                 issueNumber: issueRef.number, environment, taskId,
-                reasoningLevel: effectiveReasoningLevel
+                reasoningLevel: effectiveReasoningLevel,
+                disableOptionalStorybookMcp: options.disableOptionalStorybookMcp,
             });
 
             const { result, usageMetrics } = await executeWithUsageTracking(
                 'codex',
                 async () => executeDockerCommand('docker', dockerArgs, {
-                    timeout: this.timeoutMs,
+                    timeout: options.timeoutMs === undefined ? this.timeoutMs : Math.min(this.timeoutMs, options.timeoutMs),
                     cwd: worktreePath,
                     onSessionId,
                     onContainerId,
@@ -133,6 +135,7 @@ export class CodexAgent implements Agent {
             error: parsedOutput.error || (result.exitCode === 0 ? undefined : result.stderr?.trim() || undefined),
             terminationReason,
             tokenUsage: parsedOutput.tokenUsage,
+            numTurns: countAgentTurns('codex', { events: parsedOutput.conversationLog }),
             usageMetrics: usageMetrics ?? undefined
         };
     }
@@ -229,7 +232,8 @@ export class CodexAgent implements Agent {
             const { result, usageMetrics } = await executeWithUsageTracking(
                 'codex',
                 async () => executeDockerCommand('docker', dockerArgs, {
-                    timeout: timeoutMs ?? 1800000, stdinData: analysisPrompt, taskId
+                    timeout: timeoutMs ?? 1800000, stdinData: analysisPrompt, taskId,
+                    streamToRedis: true, streamStderrToRedis: true, preserveOutputOnTimeout: true
                 }),
                 ANALYSIS_AGENT_TANK_TIMEOUT_MS
             );

@@ -1,19 +1,12 @@
 import type { Logger } from 'pino';
 import {
-    generateCompletionComment,
     db,
     getModelShortName,
-    withRetry,
-    retryConfigs,
     MODEL_INFO_MAP,
     buildAgentModelLlmLabel,
     getAgentTypeFromModel,
     isEpicBranch,
-    appendVisualPreviewSection,
-    renderVisualPreviewSection,
-    renderVisualPreviewUploadFailureSection,
     resolveAgentTerminationReason,
-    type VisualPreviewEvidence
 } from '@propr/core';
 export { localizeContentImages, cleanupIssueAssets, type LocalizeContentImagesOptions } from './contentUtils.js';
 export {
@@ -25,12 +18,10 @@ export {
     type GenericErrorOptions
 } from './errorHandlers.js';
 import type { ClaudeCodeResponse, IssueJobData, JobResult, WorkerStateManager, WorktreeInfo, CommitResult, RepoValidationResult } from '@propr/core';
-import {
-    isVisualPreviewUploadAuthenticationError,
-    publishPullRequestVisualPreviews,
-} from '../github/visualPreviewAttachments.js';
 
 export type RepoValidation = RepoValidationResult;
+
+export { createPullRequest } from './issueJobPRCreation.js';
 
 export const REQUEUE_BUFFER_MS = parseInt(process.env.REQUEUE_BUFFER_MS || String(5 * 60 * 1000), 10);
 export const REQUEUE_JITTER_MS = parseInt(process.env.REQUEUE_JITTER_MS || String(2 * 60 * 1000), 10);
@@ -47,25 +38,21 @@ export interface PostProcessingResult {
     } | null;
     updatedLabels: string[];
     error?: string;
+    /** Admitted execution stopped before success: its partial work, never a publication. */
+    executionCheckpoint?: import('@propr/core').ExecutionCheckpointRecord;
+    /** The failed terminal task record (with any checkpoint) is already durably persisted. */
+    terminalStateRecorded?: boolean;
+    /**
+     * Set when the checkpoint push failed: the local worktree holds the only surviving
+     * copy of the partial work, so cleanup must retain it rather than delete it. Recorded
+     * on the terminal task entry so a later recovery can find it.
+     */
+    retainedWorktreePath?: string;
 }
 
-type Octokit = {
+export type Octokit = {
     request: <T = unknown>(endpoint: string, options: Record<string, unknown>) => Promise<T>;
 };
-
-interface CreatePROptions {
-    commitResult: CommitResult | null;
-    claudeResult: ClaudeCodeResponse | null;
-    modelName: string;
-    repoValidation: RepoValidation;
-    PR_LABEL: string;
-    correlatedLogger: Logger;
-    issueTitle: string;
-    visualPreview?: {
-        evidence: VisualPreviewEvidence;
-        worktreePath: string;
-    };
-}
 
 export function buildIssueReference(
     issueNumber: number,
@@ -175,191 +162,6 @@ export async function ensureEpicBaseBranchExists(
         }
         throw error;
     }
-}
-
-export async function createPullRequest(
-    octokit: Octokit,
-    issueRef: IssueJobData,
-    worktreeInfo: WorktreeInfo,
-    options: CreatePROptions
-): Promise<PostProcessingResult> {
-    const { commitResult, claudeResult, modelName, repoValidation, PR_LABEL, correlatedLogger, issueTitle, visualPreview } = options;
-    const jobId = `${issueRef.repoOwner}-${issueRef.repoName}-${issueRef.number}`;
-
-    const modelShortName = getModelShortName(modelName);
-    const prTitle = '[' + issueRef.number + ' by ' + modelShortName + '] ' + issueTitle;
-
-    const completionComment = await generateCompletionComment(claudeResult, { number: issueRef.number, repoOwner: issueRef.repoOwner, repoName: issueRef.repoName });
-    const basePrBody = `## AI Implementation Summary
-
-${buildIssueReference(issueRef.number, commitResult !== null, claudeResult)}
-
-**Branch:** \`${worktreeInfo.branchName}\`
-**Commits:** ${commitResult ? `✅ Changes committed (${commitResult.commitHash.substring(0, 7)})` : '❌ No changes made'}
-
----
-
-${completionComment}
-
----
-
-### 💡 Need changes?
-
-Comment on this PR to request refinements — the AI agent monitors comments and will update the implementation based on your feedback. Keep iterating until you're satisfied!`;
-    const visualPreviewSection = visualPreview && commitResult
-        ? renderVisualPreviewSection({
-            assets: [],
-            toolSuggestions: visualPreview.evidence.toolSuggestions
-        }, {})
-        : '';
-    const prBody = appendVisualPreviewSection(basePrBody, visualPreviewSection);
-
-    try {
-        const prResponse = await octokit.request<{ data: { number: number; html_url: string; title: string } }>('POST /repos/{owner}/{repo}/pulls', {
-            owner: issueRef.repoOwner,
-            repo: issueRef.repoName,
-            title: prTitle,
-            head: worktreeInfo.branchName,
-            base: issueRef.baseBranch || repoValidation.repoData?.defaultBranch || 'main',
-            body: prBody,
-            draft: false
-        });
-
-        correlatedLogger.info({
-            jobId,
-            issueNumber: issueRef.number,
-            prNumber: prResponse.data.number,
-            prUrl: prResponse.data.html_url
-        }, 'PR created successfully');
-
-        // Add PR label and model label (for followup comments to use the same model)
-        const modelLabel = getPullRequestModelLabel(issueRef, modelName);
-        const labelsToAdd = modelLabel ? [PR_LABEL, modelLabel] : [PR_LABEL];
-        try {
-            await withRetry(
-                () => octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/labels', {
-                    owner: issueRef.repoOwner,
-                    repo: issueRef.repoName,
-                    issue_number: prResponse.data.number,
-                    labels: labelsToAdd
-                }),
-                retryConfigs.githubApi,
-                `add_pr_label_${prResponse.data.number}`
-            );
-            correlatedLogger.info({ prNumber: prResponse.data.number, labels: labelsToAdd }, 'Added PR labels to new PR');
-        } catch (labelError) {
-            correlatedLogger.warn({ prNumber: prResponse.data.number, labels: labelsToAdd, error: (labelError as Error).message }, 'Failed to add PR labels to new PR after retries');
-        }
-
-        if (visualPreview && commitResult && visualPreview.evidence.assets.length > 0) {
-            try {
-                await publishPullRequestVisualPreviews({
-                    owner: issueRef.repoOwner,
-                    repo: issueRef.repoName,
-                    pullRequestNumber: prResponse.data.number,
-                    body: basePrBody,
-                    evidence: visualPreview.evidence,
-                    worktreePath: visualPreview.worktreePath,
-                    octokit
-                });
-                correlatedLogger.info({ prNumber: prResponse.data.number, previewCount: visualPreview.evidence.assets.length }, 'Uploaded visual previews to pull request');
-            } catch (previewError) {
-                correlatedLogger.warn({ prNumber: prResponse.data.number, error: (previewError as Error).message }, 'Could not upload visual previews; publishing a text-only explanation');
-                try {
-                    await octokit.request('PATCH /repos/{owner}/{repo}/pulls/{pull_number}', {
-                        owner: issueRef.repoOwner,
-                        repo: issueRef.repoName,
-                        pull_number: prResponse.data.number,
-                        body: appendVisualPreviewSection(basePrBody, renderVisualPreviewUploadFailureSection(
-                            visualPreview.evidence,
-                            { authenticationFailure: isVisualPreviewUploadAuthenticationError(previewError) }
-                        ))
-                    });
-                } catch (fallbackError) {
-                    correlatedLogger.warn({ prNumber: prResponse.data.number, error: (fallbackError as Error).message }, 'Could not publish the text-only visual preview upload explanation');
-                }
-            }
-        }
-
-        return {
-            success: true,
-            pr: {
-                number: prResponse.data.number,
-                url: prResponse.data.html_url,
-                title: prResponse.data.title
-            },
-            updatedLabels: []
-        };
-
-    } catch (prError) {
-        correlatedLogger.warn({
-            jobId,
-            issueNumber: issueRef.number,
-            branchName: worktreeInfo.branchName,
-            error: (prError as Error).message
-        }, 'Direct PR creation failed, checking if PR already exists...');
-
-        return await findExistingPR({ octokit, issueRef, worktreeInfo, prError: prError as Error, correlatedLogger, PR_LABEL, modelName });
-    }
-}
-
-interface FindExistingPROptions {
-    octokit: Octokit;
-    issueRef: IssueJobData;
-    worktreeInfo: WorktreeInfo;
-    prError: Error;
-    correlatedLogger: Logger;
-    PR_LABEL: string;
-    modelName: string;
-}
-
-async function findExistingPR(options: FindExistingPROptions): Promise<PostProcessingResult> {
-    const { octokit, issueRef, worktreeInfo, prError, correlatedLogger, PR_LABEL, modelName } = options;
-    try {
-        const existingPRs = await octokit.request<{ data: Array<{ number: number; html_url: string; title: string; base: { ref: string } }> }>('GET /repos/{owner}/{repo}/pulls', { owner: issueRef.repoOwner, repo: issueRef.repoName, head: `${issueRef.repoOwner}:${worktreeInfo.branchName}`, state: 'open' });
-        if (existingPRs.data.length > 0) {
-            const existingPR = existingPRs.data[0];
-            correlatedLogger.info({ issueNumber: issueRef.number, prNumber: existingPR.number, prUrl: existingPR.html_url, currentBase: existingPR.base.ref }, 'Found existing PR for branch');
-
-            const expectedBase = issueRef.baseBranch;
-            if (expectedBase && existingPR.base.ref !== expectedBase) {
-                correlatedLogger.info({ prNumber: existingPR.number, currentBase: existingPR.base.ref, expectedBase }, 'PR has wrong base branch, updating...');
-                try {
-                    await octokit.request('PATCH /repos/{owner}/{repo}/pulls/{pull_number}', {
-                        owner: issueRef.repoOwner,
-                        repo: issueRef.repoName,
-                        pull_number: existingPR.number,
-                        base: expectedBase
-                    });
-                    correlatedLogger.info({ prNumber: existingPR.number, newBase: expectedBase }, 'Updated PR base branch');
-                } catch (updateError) {
-                    correlatedLogger.warn({ prNumber: existingPR.number, error: (updateError as Error).message }, 'Failed to update PR base branch');
-                }
-            }
-
-            // Add PR label and model label (for followup comments to use the same model)
-            const modelLabel = getPullRequestModelLabel(issueRef, modelName);
-            const labelsToAdd = modelLabel ? [PR_LABEL, modelLabel] : [PR_LABEL];
-            try {
-                await withRetry(
-                    () => octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/labels', {
-                        owner: issueRef.repoOwner,
-                        repo: issueRef.repoName,
-                        issue_number: existingPR.number,
-                        labels: labelsToAdd
-                    }),
-                    retryConfigs.githubApi,
-                    `add_pr_label_existing_${existingPR.number}`
-                );
-                correlatedLogger.info({ prNumber: existingPR.number, labels: labelsToAdd }, 'Added PR labels to existing PR');
-            } catch (labelError) {
-                correlatedLogger.warn({ prNumber: existingPR.number, labels: labelsToAdd, error: (labelError as Error).message }, 'Failed to add PR labels to existing PR after retries');
-            }
-
-            return { success: true, pr: { number: existingPR.number, url: existingPR.html_url, title: existingPR.title }, updatedLabels: [] };
-        }
-        throw prError;
-    } catch { throw prError; }
 }
 
 interface FinalResultResults {

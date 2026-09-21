@@ -12,6 +12,7 @@ export interface SpawnedExecutionState {
     aborted: { value: boolean };
     containerId: { value: string | null };
     teardownPromise: Promise<void> | null;
+    preserveTerminalEvidence?: boolean;
 }
 
 export interface DockerExecutionState extends SpawnedExecutionState {
@@ -44,6 +45,7 @@ export function getExecutionAbortError(signal?: AbortSignal): Error | null {
 }
 
 interface AbortSpawnedExecutionOptions {
+    preserveTerminalEvidence?: boolean;
     namedContainer: string | null;
     scheduleForceKill: (child: ChildProcess) => void;
     taskId?: string;
@@ -78,7 +80,9 @@ export function abortSpawnedExecution(
 ): Promise<void> {
     if (state.aborted.value) return state.teardownPromise ?? Promise.resolve();
     state.aborted.value = true;
+    const retentionPolicy = state.preserveTerminalEvidence ?? options.preserveTerminalEvidence;
     const teardownOptions = {
+        ...(retentionPolicy === undefined ? {} : { preserveTerminalEvidence: retentionPolicy }),
         taskId: options.taskId,
         attemptGeneration: options.attemptGeneration,
         containerId: state.containerId.value,

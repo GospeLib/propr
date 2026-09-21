@@ -1,4 +1,4 @@
-import { after, before, beforeEach, test } from 'node:test';
+import { after, before, beforeEach, mock, test } from 'node:test';
 import assert from 'node:assert';
 import fs from 'fs';
 import os from 'os';
@@ -8,6 +8,11 @@ import type { AgentConfig } from '../packages/core/src/agents/types.js';
 process.env.NODE_ENV = 'test';
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'propr-agent-registry-'));
 process.env.DATA_DIR = testDataDir;
+
+const dockerExecutor = await import('../packages/core/src/claude/docker/dockerExecutor.js');
+await mock.module('../packages/core/src/claude/docker/dockerExecutor.js', {
+    namedExports: { ...dockerExecutor, executeDockerCommand: async () => ({ exitCode: 1, stdout: '', stderr: 'Fixture image absent' }) },
+});
 
 const opencodeConfig: AgentConfig = {
     id: 'opencode-1',

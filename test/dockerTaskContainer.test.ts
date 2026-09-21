@@ -1,6 +1,7 @@
-import { describe, test } from 'node:test';
+import { describe, test, mock } from 'node:test';
 import assert from 'node:assert';
 import {
+    detectContainerId,
     addTaskAttemptLabelsToDockerArgs,
     findTaskContainer,
     inspectLegacyDockerContainerLivenessForTask,
@@ -127,5 +128,41 @@ describe('running Docker task container lookup', () => {
             '--format', '{{.ID}}:{{.Names}}',
         ]);
         assert.ok(!receivedArgs.includes('rm'));
+    });
+});
+
+
+describe('delayed Docker startup observation', () => {
+    test('observes only the exact container after slow startup and stops polling', () => {
+        mock.timers.enable({ apis: ['setInterval'] });
+        const state = { containerIdDetected: false, containerId: { value: null as string | null } };
+        let probes = 0;
+        const starts: string[] = [];
+        const timer = detectContainerId('/worktree', state, (id) => { starts.push(id); }, callback => { void callback(); }, 'exact-task', (() => {
+            probes++;
+            return probes < 3 ? '' : 'other:exact-task-longer\nactual:exact-task';
+        }) as never);
+        try {
+            mock.timers.tick(4000);
+            assert.equal(state.containerIdDetected, false);
+            mock.timers.tick(2000);
+            assert.deepEqual(starts, ['actual']);
+            mock.timers.tick(10000);
+            assert.equal(probes, 3);
+        } finally { clearInterval(timer); mock.timers.reset(); }
+    });
+
+    test('parent execution cancellation stops pending detection without an invented start', () => {
+        mock.timers.enable({ apis: ['setInterval'] });
+        let probes = 0;
+        const state = { containerIdDetected: false, containerId: { value: null as string | null } };
+        const timer = detectContainerId('/worktree', state, () => { assert.fail('unexpected start'); }, callback => { void callback(); }, 'exact-task', (() => { probes++; return ''; }) as never);
+        try {
+            mock.timers.tick(2000);
+            clearInterval(timer);
+            mock.timers.tick(10000);
+            assert.equal(probes, 1);
+            assert.equal(state.containerIdDetected, false);
+        } finally { clearInterval(timer); mock.timers.reset(); }
     });
 });

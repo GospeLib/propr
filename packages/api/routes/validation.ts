@@ -364,9 +364,9 @@ export function validateStringLength(
 export function validatePositiveInteger(
   value: unknown,
   fieldName: string,
-  options: { required?: boolean; max?: number } = {}
+  options: { required?: boolean; max?: number; min?: number } = {}
 ): ValidationResult & { value?: number } {
-  const { required = false, max } = options;
+  const { required = false, max, min = 0 } = options;
 
   if (value === undefined || value === null || value === '') {
     if (required) {
@@ -381,7 +381,7 @@ export function validatePositiveInteger(
     return { valid: false, error: `${fieldName} must be a valid integer` };
   }
 
-  if (parsed < 0) {
+  if (parsed < min) {
     return { valid: false, error: `${fieldName} must be a positive integer` };
   }
 

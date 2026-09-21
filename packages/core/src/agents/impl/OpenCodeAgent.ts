@@ -13,6 +13,7 @@ import type { ExecutionType } from '../../utils/llmMetrics.types.js';
 import { DEFAULT_AGENT_EXECUTION_TIMEOUT_MS } from '../constants.js';
 import { isManagedAgentConfigPath } from '@propr/shared';
 import { resolveAgentTerminationReason } from '../termination.js';
+import { countAgentTurns } from '../turnCount.js';
 
 export { UsageLimitError };
 
@@ -111,6 +112,7 @@ export class OpenCodeAgent implements Agent {
                 error: errorText,
                 terminationReason,
                 tokenUsage: parsedOutput.tokenUsage,
+                numTurns: countAgentTurns('opencode', { events: parsedOutput.conversationLog }),
                 usageMetrics: usageMetrics ?? undefined
             };
 

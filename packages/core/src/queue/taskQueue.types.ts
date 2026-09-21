@@ -4,6 +4,7 @@ import type { ConversationStep, TokenUsage } from '../utils/llmMetrics.types.js'
 import type { SubscriptionUsageMetrics } from '../utils/github/formatSubscriptionUsage.js';
 import type { CommandMeta, UltrafixCommandMeta } from '../webhook/slashCommandParser.js';
 import type { ReasoningLevel } from '@propr/shared';
+import type { CommentAdmissionBinding, WorkerAdmissionReceipt } from '../admission/ezerExecutionAdmission.js';
 
 export interface IssueJobData {
     repoOwner: string;
@@ -26,6 +27,8 @@ export interface IssueJobData {
     subtitle?: string;
     issueNumber?: number;
     isRetryFromRateLimit?: boolean;  // Set when job is retried after rate limit
+    /** Server-issued proof that Ezer's signed, single-use admission was consumed. */
+    executionAdmissionReceipt?: WorkerAdmissionReceipt;
 }
 
 export type SystemAction = 'auto_resolve_merge_conflicts';
@@ -39,6 +42,9 @@ export interface AutoResolveContext {
 }
 
 export interface CommentJobData {
+    executionAdmissionReceipt?: WorkerAdmissionReceipt;
+    executionAdmissionComment?: CommentAdmissionBinding;
+    executionAdmissionTarget?: string;
     pullRequestNumber: number;
     commentId?: number;
     commentBody?: string;
@@ -151,7 +157,7 @@ export interface MergeConflictJobData {
     systemGenerated: true;    // Distinguishes from user-authored follow-up comments
 }
 
-export type JobData = IssueJobData | CommentJobData | TaskImportJobData | AnalysisJobData | SystemTaskJobData | IndexingJobData | MergeConflictJobData;
+export type JobData = IssueJobData | CommentJobData | TaskImportJobData | AnalysisJobData | SystemTaskJobData | IndexingJobData | MergeConflictJobData | import('../admission/integrationPayload.js').IntegrationJobData;
 
 export interface ClaudeOutputResult {
     type?: string;
@@ -197,7 +203,8 @@ export interface AiMetrics {
     timestamp: number;
     cost: number;
     model: string;
-    turns: number;
+    /** Absent when no provider evidence exists for the turn count. Never a guessed 0. */
+    turns?: number;
     executionTimeMs: number;
     issueNumber?: number;
     repo: string | null;

@@ -1,3 +1,4 @@
+import {forwardRoutingOwnerEvent} from './routingOwnerEvent.js';
 /**
  * Routing WebSocket intake service (daemon side).
  *
@@ -112,6 +113,7 @@ export class RoutingWebSocketIntakeService {
     private readonly initialReconnectDelayMs: number;
     private readonly maxReconnectDelayMs: number;
     private readonly pullTimeoutMs: number;
+    private readonly ownerRelayInstallationId: string|number|undefined;
     private readonly shutdownDrainTimeoutMs: number;
     private readonly webSocketFactory?: WebSocketCtor;
     private readonly fetchImpl?: FetchLike;
@@ -164,6 +166,7 @@ export class RoutingWebSocketIntakeService {
         this.relayToken = (options.relayToken ?? process.env.PROPR_GH_RELAY_TOKEN ?? '').trim();
         this.accountStatus = new ConnectAccountStatusTracker(options.installationId ?? process.env.GH_INSTALLATION_ID,
             () => this.notifyStatusChange());
+        this.ownerRelayInstallationId = options.installationId ?? process.env.GH_INSTALLATION_ID;
         this.dispatch = options.dispatch ?? processWebhookEvent;
         this.initialReconnectDelayMs = options.reconnectDelayMs ?? 1_000;
         this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 30_000;
@@ -433,7 +436,7 @@ export class RoutingWebSocketIntakeService {
         }
 
         if (!isSupportedEventType(rawEventType)) {
-            log.debug({ eventType: rawEventType, deliveryId, sequence }, 'Ignoring unsupported routing event type');
+            log.info({ eventType: rawEventType, deliveryId, sequence }, 'Ignoring unsupported routing event type');
             this.deliveries.accept(deliveryId, IGNORED_UNSUPPORTED_DISPOSITION);
             this.sendAck(sequence, deliveryId, socket, IGNORED_UNSUPPORTED_DISPOSITION);
             return;
@@ -464,12 +467,19 @@ export class RoutingWebSocketIntakeService {
 
         let disposition: DeliveryDisposition;
         try {
-            log.debug({ eventType: rawEventType, deliveryId, sequence }, 'Dispatching routing event');
+            log.info({ eventType: rawEventType, deliveryId, sequence }, 'Dispatching routing event');
             // The dispatcher is the authority on the delivery's disposition: it may
             // report accepted/blocked/ignored (with reason/billing); a void return
             // means a plain `accepted`. A thrown error is handled below and withholds
             // the ACK so the relay redelivers.
-            disposition = normalizeDisposition(await this.dispatch(payload, rawEventType, correlationId));
+            // The owner-event path owns every `/ezer`-addressed comment outright: `true` means it
+            // handled the delivery, an explicit disposition means it refused the delivery
+            // terminally (unauthorized author, or a command it can neither admit nor answer) and
+            // that disposition is ACKed verbatim. Only a falsy result — a delivery that is not
+            // addressed to Ezer at all — reaches the ordinary webhook dispatcher.
+            const owned = await forwardRoutingOwnerEvent(payload, rawEventType, deliveryId, delivery.installationId ?? this.ownerRelayInstallationId);
+            disposition = owned === true ? ACCEPTED_DISPOSITION
+                : owned || normalizeDisposition(await this.dispatch(payload, rawEventType, correlationId));
         } catch (error) {
             this.deliveries.fail(deliveryId);
             log.error(

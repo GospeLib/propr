@@ -21,9 +21,22 @@ const GIT_IDENTITIES: Record<AgentType, { name: string; email: string }> = {
 
 const WORKSPACE_PATH = '/home/node/workspace';
 const DEFAULT_CACHE_ROOT = '/tmp/git-processor/propr-cache';
+export const CODEX_SKILLS_RUNTIME_PATH = '/home/node/.codex/skills';
+export const CODEX_SKILLS_SOURCE_PATH = '/tmp/propr-codex-skills-source';
+export const CODEX_SKILLS_TMPFS_OPTIONS = `${CODEX_SKILLS_RUNTIME_PATH}:rw,exec,nosuid,nodev,size=64m`;
 
-const REPO_SETUP_WRAPPER_SCRIPT = `
+const CODEX_SKILLS_SEED_SCRIPT = `
+if [ ! -d "${CODEX_SKILLS_SOURCE_PATH}" ]; then
+    echo "Codex skills snapshot source is missing" >&2
+    exit 1
+fi
+cp -a "${CODEX_SKILLS_SOURCE_PATH}/." "${CODEX_SKILLS_RUNTIME_PATH}/"
+`.trim();
+
+function repoSetupWrapperScript(seedCodexSkills: boolean): string {
+    return `
 set -e
+${seedCodexSkills ? CODEX_SKILLS_SEED_SCRIPT : ''}
 
 entrypoint="$0"
 setup_script="\${PROPR_WORKSPACE:-/home/node/workspace}/.propr/setup.sh"
@@ -60,12 +73,25 @@ fi
 
 exec "$entrypoint" "$@"
 `.trim();
+}
 
 export function wrapDockerRunArgsWithRepoSetup(
     dockerArgs: string[],
     dockerImage: string,
-    agentType: AgentType
+    agentType: AgentType,
+    seedCodexSkills = false
 ): string[] {
+    if (seedCodexSkills && agentType !== 'codex') {
+        throw new Error('Only Codex supports the execution-local skills snapshot');
+    }
+    if (seedCodexSkills && (
+        !dockerArgs.some((value, index) => dockerArgs[index - 1] === '--tmpfs' && value === CODEX_SKILLS_TMPFS_OPTIONS)
+        || !dockerArgs.some((value, index) => dockerArgs[index - 1] === '--mount'
+            && value.startsWith('type=bind,source=')
+            && value.endsWith(`,target=${CODEX_SKILLS_SOURCE_PATH},readonly`))
+    )) {
+        throw new Error('Codex skills seeding requires the read-only source and execution-local tmpfs mounts');
+    }
     const imageIndex = dockerArgs.indexOf(dockerImage);
     if (imageIndex === -1) {
         throw new Error(`Cannot enable repo setup hook: Docker image '${dockerImage}' was not found in docker run arguments`);
@@ -94,7 +120,7 @@ export function wrapDockerRunArgsWithRepoSetup(
         '--entrypoint', '/bin/bash',
         dockerImage,
         '-lc',
-        REPO_SETUP_WRAPPER_SCRIPT,
+        repoSetupWrapperScript(seedCodexSkills),
         ENTRYPOINT_PATHS[agentType],
         ...afterImage
     ];

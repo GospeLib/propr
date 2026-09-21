@@ -93,7 +93,8 @@ export interface ExtractedMetrics {
     success: boolean;
     executionTimeMs: number;
     executionTimeSec: number;
-    numTurns: number;
+    /** Model turns, in the provider's own unit; absent when there is no evidence. Never a guessed 0. */
+    numTurns?: number;
     sessionId: string;
     conversationId: string | null;
 }
@@ -102,7 +103,8 @@ export interface AggregatedMetrics {
     model: string;
     success: boolean;
     costUsd: number;
-    numTurns: number;
+    /** Absent when there is no evidence for the turn count. Never a guessed 0. */
+    numTurns?: number;
     executionTimeMs: number;
     dateKey: string;
 }
@@ -112,7 +114,8 @@ export interface CostCheckMetrics {
     correlationId?: string;
     costUsd: number;
     model: string;
-    numTurns: number;
+    /** Absent when there is no evidence for the turn count. Never a guessed 0. */
+    numTurns?: number;
 }
 
 export interface PersistMetrics {
@@ -121,7 +124,8 @@ export interface PersistMetrics {
     executionTimeMs: number;
     model: string;
     success: boolean;
-    numTurns: number;
+    /** Absent when there is no evidence for the turn count. Never a guessed 0. */
+    numTurns?: number;
     costUsd: number;
     tokenUsage?: TokenUsage;
     correlationId?: string;
@@ -194,7 +198,8 @@ export interface HighCostAlert {
     costUsd: number;
     threshold: number;
     model: string;
-    numTurns: number;
+    /** Absent when there is no evidence for the turn count. Never a guessed 0. */
+    numTurns?: number;
 }
 
 export interface LLMMetricsSummaryResult {
@@ -215,7 +220,8 @@ export interface LLMMetricsData {
     success: boolean;
     executionTimeMs: number;
     executionTimeSec: number;
-    numTurns: number;
+    /** Absent when there is no evidence for the turn count. Never a guessed 0. */
+    numTurns?: number;
     costUsd: number;
     sessionId: string;
     conversationId: string | null;

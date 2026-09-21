@@ -1,7 +1,7 @@
 import { after, test, describe } from 'node:test';
 import assert from 'node:assert';
 
-const { buildReviewComment } = await import('../src/jobs/reviewCommentFormatter.js');
+const { buildReviewComment, reviewAnalysisWithPublicOutcome } = await import('../src/jobs/reviewCommentFormatter.js');
 const { getNextActionableFindingNumber, parseStructuredReview } = await import('../src/jobs/reviewOutputParser.js');
 const { closeConnection } = await import('@propr/core');
 
@@ -10,6 +10,104 @@ after(async () => {
 });
 
 describe('buildReviewComment', () => {
+    test('invalid public review is a failed outcome while preserving raw provider evidence and usage', () => {
+        const analysis = { response: '## Overall Evaluation\n### F1: Missing required section', modelUsed: 'gpt-5.6-sol', executionTimeMs: 1000, success: true };
+        const body = buildReviewComment({ agentAlias: 'codex', model: 'gpt-5.6-sol', label: 'Codex' }, analysis);
+        assert.strictEqual(parseStructuredReview(body).status, 'invalid');
+        assert.deepStrictEqual(reviewAnalysisWithPublicOutcome(analysis, body), { ...analysis, success: false, error: 'REVIEW_OUTPUT_INVALID' });
+        assert.strictEqual(analysis.success, true);
+    });
+    test('preserves the Ezer pre-development integrity payload outside ordinary suggestions', () => {
+        const response = [
+            '## Overall Evaluation',
+            'The stories were reviewed.',
+            '## Actionable Findings',
+            'No actionable findings.',
+            '## Suggestions and Follow-ups',
+            '### S1: Improve presentation',
+            'Fence the literal payloads.',
+            '### Pre-development integrity',
+            '```json',
+            '{"briefs":[{"briefId":"EP-fixture-S01","findings":[]}]}',
+            '```',
+            '## Score',
+            'Score: 9/10',
+        ].join('\n');
+        const analysis = { response, modelUsed: 'gpt-5.6-sol', executionTimeMs: 1000, success: true };
+
+        const formatted = buildReviewComment(
+            { agentAlias: 'codex', model: 'gpt-5.6-sol', label: 'Codex' },
+            analysis,
+        );
+
+        assert.match(formatted, /## Suggestions\n[\s\S]*### S1: 🟢 Improve presentation/);
+        assert.match(formatted, /## Pre-development integrity\n\n```json\n\{"briefs":\[/);
+        assert.strictEqual(parseStructuredReview(formatted).status, 'valid_clean');
+        assert.strictEqual(reviewAnalysisWithPublicOutcome(analysis, formatted), analysis);
+    });
+
+    test('fails closed on a malformed Ezer pre-development integrity payload', () => {
+        const response = [
+            '## Overall Evaluation',
+            'The stories were reviewed.',
+            '## Actionable Findings',
+            'No actionable findings.',
+            '## Suggestions and Follow-ups',
+            '### Pre-development integrity',
+            '```json',
+            '{"briefs":not-json}',
+            '```',
+            '## Score',
+            'Score: 9/10',
+        ].join('\n');
+
+        const formatted = buildReviewComment(
+            { agentAlias: 'codex', model: 'gpt-5.6-sol', label: 'Codex' },
+            { response, modelUsed: 'gpt-5.6-sol', executionTimeMs: 1000, success: true },
+        );
+
+        assert.match(formatted, /Review output was invalid/);
+        assert.strictEqual(parseStructuredReview(formatted).status, 'invalid');
+    });
+
+    test('normalizes an integrity-only suggestion section and rejects duplicate integrity sections', () => {
+        const base = [
+            '## Overall Evaluation',
+            'The stories were reviewed.',
+            '## Actionable Findings',
+            'No actionable findings.',
+            '## Suggestions and Follow-ups',
+            '### Pre-development integrity',
+            '```json',
+            '{"briefs":[{"briefId":"EP-fixture-S01","findings":[]}]}',
+            '```',
+            'No additional suggestions.',
+            '## Score',
+            'Score: 9/10',
+        ].join('\n');
+        const assignment = { agentAlias: 'codex', model: 'gpt-5.6-sol', label: 'Codex' };
+
+        const formatted = buildReviewComment(assignment, {
+            response: base,
+            modelUsed: 'gpt-5.6-sol',
+            executionTimeMs: 1000,
+            success: true,
+        });
+        assert.match(formatted, /## Suggestions\n\nThese are optional[\s\S]*No suggestions\./);
+        assert.strictEqual(parseStructuredReview(formatted).status, 'valid_clean');
+
+        const duplicate = base.replace(
+            '## Score',
+            '## Pre-development integrity\n```json\n{"briefs":[]}\n```\n## Score',
+        );
+        const rejected = buildReviewComment(assignment, {
+            response: duplicate,
+            modelUsed: 'gpt-5.6-sol',
+            executionTimeMs: 1000,
+            success: true,
+        });
+        assert.match(rejected, /Review output was invalid/);
+    });
     test('explains that explicit finding IDs are permanent within the PR', () => {
         const comment = buildReviewComment(
             { agentAlias: 'claude', model: 'claude-sonnet', label: 'Claude Sonnet' },
@@ -60,6 +158,8 @@ describe('buildReviewComment', () => {
         assert.ok(!formatted.includes('autoFix:'));
         const reparsed = parseStructuredReview(formatted);
         assert.strictEqual(reparsed.status, 'valid_clean');
+        const successfulAnalysis = { response, modelUsed: 'claude-sonnet', executionTimeMs: 1000, success: true };
+        assert.strictEqual(reviewAnalysisWithPublicOutcome(successfulAnalysis, formatted), successfulAnalysis);
         assert.strictEqual(reparsed.suggestions[0].description, 'Optional hardening');
     });
 
@@ -107,6 +207,8 @@ describe('buildReviewComment', () => {
 
         const reparsed = parseStructuredReview(formatted);
         assert.strictEqual(reparsed.status, 'valid_with_blockers');
+        const successfulAnalysis = { response, modelUsed: 'claude-sonnet', executionTimeMs: 1000, success: true };
+        assert.strictEqual(reviewAnalysisWithPublicOutcome(successfulAnalysis, formatted), successfulAnalysis);
         assert.strictEqual(reparsed.actionableFindings[0].id, 'F1');
         assert.strictEqual(reparsed.actionableFindings[0].introducedByPR, true);
         assert.strictEqual(reparsed.actionableFindings[0].requiredForMerge, true);

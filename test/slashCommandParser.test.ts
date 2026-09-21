@@ -62,6 +62,23 @@ describe('parseSlashCommand', () => {
         assert.deepStrictEqual(result, { command: 'merge', args: [], instructions: '' });
     });
 
+    // `/ezer` is a PUBLICLY REACHABLE address: anyone can post it on a watched PR or issue. This
+    // generally-exported parser must therefore give it NO command meaning at all, for anybody.
+    // The address is resolved to `/fix` only by resolveOwnerEzerCommandBody, behind the owner
+    // authorization chokepoint — see test/ezerDispatcherChokepoint.test.ts.
+    test('the shared parser gives /ezer no command, in any shape', () => {
+        for (const body of [
+            '/ezer',
+            '/ezer address the linting errors',
+            '/ezer\nPlease fix the failing test in utils.test.ts',
+            '/ezer take over this pull request',
+            '/ezersomething do a thing',
+            '/EZER address the linting errors',
+        ]) {
+            assert.strictEqual(parseSlashCommand(body), null, `parser must not resolve ${JSON.stringify(body)}`);
+        }
+    });
+
     test('trims whitespace around body', () => {
         const result = parseSlashCommand('  /review  claude  \n');
         assert.ok(result);

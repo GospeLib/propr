@@ -7,9 +7,13 @@ import {
     type UnprocessedComment,
     type WorkerStateManager,
     getAuthenticatedOctokit,
+    nonExecutingCompletionGuard,
 } from '@propr/core';
 import { buildWorkEvidenceMarker, filterRealComments } from '../shared/workEvidenceMarker.js';
 import { handleUltrafixContinuation } from './ultrafixJobHelpers.js';
+
+/** No authorized finding was selected, so no agent runs: this job posts a comment and completes. */
+const NO_FINDINGS_COMPLETION_REASON = 'no authorized finding was selected, so no agent runs: the job posts a comment and completes';
 
 interface NoAuthorizedFindingsParams {
     job: Job<CommentJobData>;
@@ -42,6 +46,7 @@ export async function handleNoAuthorizedFindings(params: NoAuthorizedFindingsPar
         await stateManager.updateTaskState(taskId, TaskStates.COMPLETED, {
             reason: 'Ultrafix fix skipped because no authorized review findings remained',
             historyMetadata: { commandMode: 'fix', ultrafixCycle: true, ultrafixNoAuthorizedFindings: true },
+            completionGuard: nonExecutingCompletionGuard(NO_FINDINGS_COMPLETION_REASON),
         });
         await handleUltrafixContinuation('fix', {
             job, stateManager, taskId, redisClient, repoOwner, repoName,
@@ -66,5 +71,6 @@ export async function handleNoAuthorizedFindings(params: NoAuthorizedFindingsPar
             noAuthorizedReviewFindings: true,
             githubComment: { url: completionComment.data.html_url, body: completionComment.data.body ?? body },
         },
+        completionGuard: nonExecutingCompletionGuard(NO_FINDINGS_COMPLETION_REASON),
     });
 }

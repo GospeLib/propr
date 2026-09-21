@@ -11,6 +11,7 @@ import { parseStreamJsonOutput } from '../../../claude/claudeHelpers.js';
 import { getCorrectedTokenUsage, ensurePromptInConversationLog } from './tokenUtils.js';
 import { getClaudeAnalysisText } from './claudeOutputHelpers.js';
 import { describeAgentTermination, resolveAgentTerminationReason } from '../../termination.js';
+import { countAgentTurns } from '../../turnCount.js';
 
 /**
  * Extracts a commit message from Claude's summary.
@@ -137,7 +138,8 @@ export function processDockerResult(
         terminationReason,
         prompt,
         conversationLog: fullConversationLog,
-        tokenUsage: correctedTokenUsage
+        tokenUsage: correctedTokenUsage,
+        numTurns: countAgentTurns('claude', { reportedTurns: claudeOutput.finalResult?.num_turns, events: claudeOutput.conversationLog })
     };
 
     return {

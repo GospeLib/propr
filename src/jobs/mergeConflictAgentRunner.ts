@@ -12,6 +12,9 @@ import {
 } from '@propr/core';
 import type { ClaudeCodeResponse, JobResult, WorkerStateManager, WorktreeInfo } from '@propr/core';
 import { createContainerIdCallbackForPR, createSessionIdCallbackForPR } from './prCommentJobHelpers.js';
+import { recordFinalClaudeExecutionResult } from './claudeExecutionResult.js';
+import { publishCompletedWithDurableExecutionEvidence } from './completedExecutionDurability.js';
+import { buildAgentOutcome } from './executionOutcome.js';
 import { AI_COMMIT_AUTHOR } from './commitAuthor.js';
 import { agentResultToClaudeResponse, toClaudeResult } from './prCommentJobUtils.js';
 import {
@@ -123,13 +126,15 @@ export async function handleMergeWithAgent(options: {
     startingCommentId: number;
     stateManager: WorkerStateManager;
     taskId: string;
+    /** Durable identity of the queue job owning this attempt; see the durability barrier. */
+    operationId: string;
     correlationId: string;
     correlatedLogger: Logger;
     redisClient: Redis;
 }): Promise<JobResult> {
     const { conflictedFiles, worktreeInfo, branchName, baseBranch, pullRequestNumber, repoUrl,
         repoOwner, repoName, githubToken, octokit, startingCommentId,
-        stateManager, taskId, correlationId, correlatedLogger, redisClient } = options;
+        stateManager, taskId, operationId, correlationId, correlatedLogger, redisClient } = options;
 
     const prompt = buildConflictResolutionPrompt({
         pullRequestNumber, baseBranch, headBranch: branchName, conflictedFiles, worktreeInfo, repoOwner, repoName,
@@ -161,9 +166,14 @@ export async function handleMergeWithAgent(options: {
     const claudeResult: ClaudeCodeResponse = agentResultToClaudeResponse(agentResult);
     await recordLLMMetrics(toClaudeResult(claudeResult), { number: pullRequestNumber, repoOwner, repoName }, { jobType: 'merge_conflict', correlationId, taskId });
     await createLogFiles(claudeResult as unknown, { number: pullRequestNumber, repoOwner, repoName });
+    // Supersede the start-time provisional record before appending the completed entry, so the
+    // history entry that describes this execution carries its real outcome.
+    const executionSummary = await recordFinalClaudeExecutionResult(stateManager, taskId,
+        { success: claudeResult.success, sessionId: claudeResult.sessionId, conversationId: claudeResult.conversationId, executionTime: claudeResult.executionTime },
+        correlatedLogger);
     await stateManager.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, {
         reason: `${agent.config.type} agent execution completed for merge conflict resolution`,
-        claudeResult: { success: claudeResult.success, sessionId: claudeResult.sessionId, conversationId: claudeResult.conversationId, executionTime: claudeResult.executionTime },
+        claudeResult: executionSummary,
         historyMetadata: { sessionId: claudeResult.sessionId, conversationId: claudeResult.conversationId, model: claudeResult.model },
     });
     if (!claudeResult.success) {
@@ -191,12 +201,21 @@ export async function handleMergeWithAgent(options: {
     await octokit.request('PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}', {
         owner: repoOwner, repo: repoName, comment_id: startingCommentId, body: comment,
     });
-    await stateManager.updateTaskState(taskId, TaskStates.COMPLETED, {
-        reason: 'Merge conflict resolution completed successfully', commitHash: finalCommitHash,
-        historyMetadata: await buildMergeCompletionHistoryMetadata({
-            stateManager, taskId, pullRequestNumber, baseBranch, headBranch: branchName,
-            model: claudeResult.model || resolvedModel, commitHash: finalCommitHash, correlatedLogger,
-        }),
+    // `completed` is published only once the final execution evidence is durable; the evidence
+    // rides on the completed entry itself. See completedExecutionDurability.ts.
+    await publishCompletedWithDurableExecutionEvidence({
+        stateManager, taskId, correlatedLogger, operationId,
+        metadata: {
+            reason: 'Merge conflict resolution completed successfully', commitHash: finalCommitHash,
+            claudeResult: executionSummary,
+            historyMetadata: {
+                ...await buildMergeCompletionHistoryMetadata({
+                    stateManager, taskId, pullRequestNumber, baseBranch, headBranch: branchName,
+                    model: claudeResult.model || resolvedModel, commitHash: finalCommitHash, correlatedLogger,
+                }),
+                agentOutcome: buildAgentOutcome(claudeResult),
+            },
+        },
     });
     try {
         await db('tasks').where({ task_id: taskId }).update({ commit_hash: finalCommitHash });

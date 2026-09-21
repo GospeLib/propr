@@ -1,0 +1,21 @@
+import assert from 'node:assert/strict';
+import {test,mock} from 'node:test';
+let consumed=0;
+const issue={id:1,number:77,repoOwner:'fixture',repoName:'repo',labels:['ezer-approved'],triggeredBy:'owner'};
+const queued={name:'processGitHubIssue',data:{number:77,repoOwner:'fixture',repoName:'repo'}};
+const log={info(){},warn(){},debug(){},error(){}};
+mock.module('../src/utils/logger.js',{defaultExport:{withCorrelation:()=>log},namedExports:{generateCorrelationId:()=> 'fixture-correlation'}});
+mock.module('../src/utils/errorHandler.js',{namedExports:{handleError(){}}});
+mock.module('../src/utils/retryHandler.js',{namedExports:{withRetry:async(fn:any)=>fn(),retryConfigs:{redis:{}}}});
+mock.module('../src/queue/taskQueue.js',{namedExports:{getIssueQueue:async()=>({getActive:async()=>[queued],getWaiting:async()=>[]})}});
+mock.module('../src/daemon/configLoader.js',{namedExports:{getPrimaryProcessingLabels:()=>['ezer-approved'],loadPrimaryProcessingLabelsFromConfig:async()=>{}}});
+mock.module('../src/utils/userWhitelist.js',{namedExports:{getGithubUserWhitelist:()=>[]}});
+mock.module('../src/daemon/issueTriggerAuthorization.js',{namedExports:{isAuthorizedIssueTriggerActor:()=>true}});
+mock.module('../src/admission/ezerExecutionAdmission.js',{namedExports:{requiresEzerExecutionAdmission:()=>true,pendingExecutionAdmissionKey:()=> 'pending',createRedisAdmissionStore:()=>({get:async()=> 'signed-fixture'}),consumeExecutionAdmission:async()=>{consumed++;return{receipt:'receipt',claims:{target:'stage'}};}}});
+const {processDetectedIssue}=await import('../src/daemon/issueDetection.js');
+test('an existing parent job preserves the unconsumed next admission',async()=>{
+ process.env.EZER_ADMISSION_HMAC_SECRET='test-only-secret';
+ const result=await processDetectedIssue(issue as any,'fixture-correlation',{set:async()=> 'OK'} as any);
+ assert.deepEqual(result,{status:'ignored',reason:'job_already_queued'});
+ assert.equal(consumed,0);
+});

@@ -1367,3 +1367,155 @@ test('getStatus() does not record an ACK time when the socket cannot send', asyn
 
     await service.stop();
 });
+
+
+test('owner relay accepts one actual created delivery before ACK and never dispatches product execution', async()=>{
+ const names=['EZER_OWNER_RELAY_ENABLED','EZER_OWNER_RELAY_BASE_URL','EZER_INTERNAL_API_SECRET','EZER_OWNER_GITHUB_USER_ID'];
+ const saved=Object.fromEntries(names.map(name=>[name,process.env[name]]));
+ process.env.EZER_OWNER_RELAY_ENABLED='true';process.env.EZER_OWNER_RELAY_BASE_URL='http://ezer:8791';process.env.EZER_INTERNAL_API_SECRET='test-relay-secret-at-least-32-bytes';process.env.EZER_OWNER_GITHUB_USER_ID=EZER_OWNER_USER_ID;
+ let complete!:()=>void;const gate=new Promise<void>(resolve=>{complete=resolve;});let sent=0;
+ const intercepted=mock.method(globalThis,'fetch',async(_url:any,init:any)=>{sent++;const envelope=JSON.parse(init.body);assert.equal(envelope.deliveryId,'actual-owner-delivery-123456');assert.equal(envelope.installationId,'161226896');await gate;return new Response(JSON.stringify({accepted:true}));});
+ const {service,dispatched}=makeService({installationId:161226896});
+ try{
+  await service.start();const socket=FakeWebSocket.instances[0];socket.emit('open');
+  const payload={action:'created',installation:{id:161226896},repository:{full_name:'GospeLib/product-hub'},comment:{body:`/ezer accept-review-stop stop:abcd ${'a'.repeat(40)} sha256:${'b'.repeat(64)} 55`,user:{...EZER_OWNER_AUTHOR}}};
+  const frame=eventFrame({sequence:100,deliveryId:'actual-owner-delivery-123456',eventType:'issue_comment',rawPayload:payload});socket.emit('message',frame);await flush();
+  assert.equal(sent,1);assert.equal(dispatched.length,0);assert.equal(socket.sentFrames().filter(f=>f.type==='ack').length,0);
+  complete();await flush();assert.equal(socket.sentFrames().filter(f=>f.type==='ack').length,1);socket.emit('message',frame);await flush();assert.equal(sent,1);assert.equal(dispatched.length,0);
+ }finally{complete();await service.stop();intercepted.mock.restore();for(const name of names){if(saved[name]===undefined)delete process.env[name];else process.env[name]=saved[name];}}
+});
+
+/**
+ * Owner identity for the `/ezer` intake path: the stable numeric GitHub user ID, never a login.
+ */
+const EZER_OWNER_USER_ID = '7';
+const EZER_OWNER_AUTHOR = { id: 7, type: 'User', login: 'ezer-owner' };
+
+/** Run `body` with the named env vars set, restoring whatever was there before. */
+async function withEnv(vars: Record<string, string>, body: () => Promise<void>): Promise<void> {
+    const saved = Object.fromEntries(Object.keys(vars).map(name => [name, process.env[name]]));
+    Object.assign(process.env, vars);
+    try {
+        await body();
+    } finally {
+        for (const [name, value] of Object.entries(saved)) {
+            if (value === undefined) delete process.env[name];
+            else process.env[name] = value;
+        }
+    }
+}
+
+// The reviewer's finding: the helper's own unit tests said an unauthorized `/ezer` comment "costs
+// nothing", but the CALLER read that as permission to run the ordinary webhook dispatcher — which
+// on a pull request accepts ordinary human authors and, with the DEFAULT admission configuration
+// (no EZER_ADMISSION_PROTECTED_REPOSITORIES, comment triggers accepted), performs GitHub reads and
+// can enqueue a comment job. So this goes through the real service with the real defaults.
+for (const [who, body] of [
+    ['free prose', '/ezer please ship S02'],
+    ['an exact stop command', '/ezer stop typed-work:actual-item'],
+    ['an exact read command', '/ezer help'],
+] as const) {
+    test(`a non-owner ${who} /ezer comment is ACKed and never reaches the ordinary dispatcher (default config)`, async () => {
+        // Deliberately DEFAULT admission configuration: every `/ezer` capability left unset.
+        await withEnv({ EZER_OWNER_GITHUB_USER_ID: EZER_OWNER_USER_ID }, async () => {
+            for (const name of ['EZER_OWNER_RELAY_ENABLED', 'EZER_OWNER_STOP_ENABLED', 'EZER_OWNER_READ_ENABLED', 'EZER_ADMISSION_PROTECTED_REPOSITORIES']) {
+                assert.equal(process.env[name], undefined, `${name} must be unset for the default-configuration test`);
+            }
+            const sent: unknown[] = [];
+            const intercepted = mock.method(globalThis, 'fetch', async () => { sent.push(1); throw new Error('a non-owner command must never reach the owner relay'); });
+            const { service, dispatched } = makeService({ installationId: 161226896 });
+            try {
+                await service.start();
+                const socket = FakeWebSocket.instances[0];
+                socket.emit('open');
+                const payload = {
+                    action: 'created',
+                    installation: { id: 161226896 },
+                    repository: { full_name: 'GospeLib/main' },
+                    issue: { number: 2338, pull_request: { url: 'https://api.github.com/repos/GospeLib/main/pulls/2338' } },
+                    comment: { id: 66, body, user: { id: 8, type: 'User', login: 'stranger' } },
+                };
+                socket.emit('message', eventFrame({ sequence: 200, deliveryId: 'stranger-ezer-1', eventType: 'issue_comment', rawPayload: payload }));
+                await flush();
+
+                assert.deepEqual(dispatched, [], 'a non-owner /ezer comment must never reach the ordinary comment dispatcher');
+                assert.deepEqual(sent, [], 'a non-owner /ezer comment must never reach the owner relay');
+                // ACKed terminally: the relay records WHY, stops redelivering, and bills nothing.
+                assert.deepEqual(socket.sentFrames().filter(f => f.type === 'ack'), [
+                    { type: 'ack', sequence: 200, deliveryId: 'stranger-ezer-1', status: 'ignored', reason: 'user_not_allowed', billing: { seatConsumed: false } },
+                ]);
+            } finally {
+                await service.stop();
+                intercepted.mock.restore();
+            }
+        });
+    });
+}
+
+test('an ordinary (non-/ezer) comment from the same stranger still reaches the dispatcher', async () => {
+    // The control for the test above: the fail-closed gate is scoped to the `/ezer` namespace and
+    // does not quietly swallow ProPR's normal comment intake.
+    await withEnv({ EZER_OWNER_GITHUB_USER_ID: EZER_OWNER_USER_ID }, async () => {
+        const { service, dispatched } = makeService({ installationId: 161226896 });
+        try {
+            await service.start();
+            const socket = FakeWebSocket.instances[0];
+            socket.emit('open');
+            const payload = { action: 'created', repository: { full_name: 'GospeLib/main' }, issue: { number: 2338 }, comment: { id: 67, body: 'please take a look', user: { id: 8, type: 'User', login: 'stranger' } } };
+            socket.emit('message', eventFrame({ sequence: 201, deliveryId: 'stranger-ordinary-1', eventType: 'issue_comment', rawPayload: payload }));
+            await flush();
+            assert.equal(dispatched.length, 1);
+            assert.deepEqual(socket.sentFrames().filter(f => f.type === 'ack'), [{ type: 'ack', sequence: 201, deliveryId: 'stranger-ordinary-1', status: 'accepted' }]);
+        } finally {
+            await service.stop();
+        }
+    });
+});
+
+test('an EDITED owner read delivery is ACKed once instead of being redelivered forever', async () => {
+    // The reply helper refuses any comment whose `updated_at` has moved, so attempting a reply
+    // threw, withheld the ACK, and looped this exact delivery. No fetch/Octokit is stubbed here:
+    // the production reply helper and the production relay are both in place, so a passing ACK
+    // assertion proves neither was invoked.
+    await withEnv({
+        EZER_OWNER_GITHUB_USER_ID: EZER_OWNER_USER_ID,
+        EZER_OWNER_RELAY_ENABLED: 'true',
+        EZER_OWNER_READ_ENABLED: 'true',
+        EZER_OWNER_RELAY_BASE_URL: 'http://ezer:8791',
+        EZER_INTERNAL_API_SECRET: 'test-relay-secret-at-least-32-bytes',
+    }, async () => {
+        const intercepted = mock.method(globalThis, 'fetch', async () => { throw new Error('an unbindable read must never reach the owner relay'); });
+        const { service, dispatched } = makeService({ installationId: 161226896 });
+        try {
+            await service.start();
+            const socket = FakeWebSocket.instances[0];
+            socket.emit('open');
+            const payload = {
+                action: 'edited',
+                installation: { id: 161226896 },
+                repository: { id: 10, full_name: 'GospeLib/main' },
+                issue: { id: 20, number: 90 },
+                comment: { id: 66, body: '/ezer help', created_at: '2026-09-20T02:30:50Z', updated_at: '2026-09-20T03:11:00Z', user: { ...EZER_OWNER_AUTHOR } },
+            };
+            const frame = eventFrame({ sequence: 202, deliveryId: 'owner-edited-read-1', eventType: 'issue_comment', rawPayload: payload });
+            socket.emit('message', frame);
+            await flush();
+
+            assert.deepEqual(dispatched, []);
+            assert.deepEqual(socket.sentFrames().filter(f => f.type === 'ack'), [
+                { type: 'ack', sequence: 202, deliveryId: 'owner-edited-read-1', status: 'ignored', reason: 'ezer_command_not_admitted', billing: { seatConsumed: false } },
+            ]);
+
+            // Redelivery of the identical bytes is re-ACKed, not reprocessed: no loop.
+            socket.emit('message', frame);
+            await flush();
+            const acks = socket.sentFrames().filter(f => f.type === 'ack');
+            assert.equal(acks.length, 2);
+            assert.deepEqual(acks[1], acks[0]);
+            assert.deepEqual(dispatched, []);
+        } finally {
+            await service.stop();
+            intercepted.mock.restore();
+        }
+    });
+});

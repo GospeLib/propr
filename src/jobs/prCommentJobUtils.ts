@@ -1,4 +1,5 @@
 import type { Logger } from 'pino';
+import { isCompletionDurabilityUnverifiable } from './completionDurabilityOutcome.js';
 import type { Job } from 'bullmq';
 import type { Redis } from 'ioredis';
 import {
@@ -265,6 +266,14 @@ async function handleGenericError(error: Error, options: JobErrorOptions): Promi
 
 export async function handleJobError(error: Error, job: Job<CommentJobData>, options: JobErrorOptions): Promise<void> {
     const { repoOwner, repoName, octokit, startingWorkComment, correlatedLogger, stateManager, taskId } = options;
+
+    // The durability barrier could not establish whether `completed` committed. Nothing terminal
+    // may be written on a guess — a `failed` here is the production failure this exists to stop.
+    if (isCompletionDurabilityUnverifiable(error)) {
+        correlatedLogger.error({ taskId, error: error.message },
+            'PR comment completion durability is unverifiable; leaving the task unsettled');
+        throw error;
+    }
 
     const isUserCancelled = error.message?.includes('aborted by user');
     const isUsageLimit = error.name === 'UsageLimitError' || error.message?.includes('usage limit');

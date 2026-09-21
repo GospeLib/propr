@@ -33,6 +33,7 @@ export interface AbortRedisClient {
     del(key: string): Promise<unknown>;
     quit(): Promise<unknown>;
     disconnect(): void;
+    eval?(script: string, keyCount: number, ...args: string[]): Promise<unknown>;
 }
 
 export type AbortRedisFactory = () => AbortRedisClient;
@@ -40,6 +41,10 @@ export type AbortRedisFactory = () => AbortRedisClient;
 const plannerAbortContext = new AsyncLocalStorage<PlannerAbortContext>();
 const PLANNER_ABORT_LOOKUP_FAILURE_LIMIT = 2;
 const DEFAULT_ABORT_REDIS_TIMEOUT_MS = 5000;
+const CONSUME_EXACT_WORKER_ABORT = `
+if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end
+return redis.call('del', KEYS[1])
+`;
 
 export function buildPlannerAbortSignalKey(draftId: string, runId?: string): string {
     return runId ? `planner:abort:${draftId}:run:${runId}` : `planner:abort:${draftId}`;
@@ -60,15 +65,19 @@ export function plannerAbortSignalKeyForTask(taskId: string): string {
         : buildPlannerAbortSignalKey(taskId);
 }
 
-function createAbortRedis(): AbortRedisClient {
-    return new Redis({
+export function buildPlannerAbortRedisOptions() {
+    return {
         host: process.env.REDIS_HOST || 'redis',
         port: parseInt(process.env.REDIS_PORT || '6379', 10),
         connectTimeout: DEFAULT_ABORT_REDIS_TIMEOUT_MS,
         commandTimeout: DEFAULT_ABORT_REDIS_TIMEOUT_MS,
         maxRetriesPerRequest: 1,
-        retryStrategy: attempts => attempts <= 1 ? 100 : null,
-    });
+        retryStrategy: (attempts: number) => attempts <= 1 ? 100 : null,
+    };
+}
+
+function createAbortRedis(): AbortRedisClient {
+    return new Redis(buildPlannerAbortRedisOptions());
 }
 
 async function settlesWithin(operation: Promise<unknown>, timeoutMs: number): Promise<boolean> {
@@ -85,7 +94,7 @@ async function settlesWithin(operation: Promise<unknown>, timeoutMs: number): Pr
     }
 }
 
-async function closeAbortRedis(
+export async function closeAbortRedis(
     redis: AbortRedisClient,
     timeoutMs = DEFAULT_ABORT_REDIS_TIMEOUT_MS,
 ): Promise<void> {
@@ -97,12 +106,27 @@ async function readAbortSignal(
     redis: AbortRedisClient,
     taskId: string,
     plannerAbortKey: string,
+    containerId?: string | null,
 ): Promise<boolean> {
-    const [workerAbort, plannerAbort] = await Promise.all([
+    const [workerAbort, plannerAbort, containerAbort] = await Promise.all([
         redis.get(`worker:abort:${taskId}`),
-        redis.get(plannerAbortKey)
+        redis.get(plannerAbortKey),
+        containerId ? redis.get(buildPlannerAbortSignalKey(taskId, containerId)) : Promise.resolve(null),
     ]);
-    return workerAbort !== null || plannerAbort !== null;
+    return (workerAbort !== null && workerAbortTargetsContainer(workerAbort, containerId)) || plannerAbort !== null || containerAbort !== null;
+}
+
+/** Legacy worker markers stop the task; admitted markers stop only the named execution. */
+function workerAbortContainer(marker: string): string | undefined {
+    try {
+        const payload = JSON.parse(marker) as { containerId?: unknown };
+        return typeof payload?.containerId === 'string' ? payload.containerId : undefined;
+    } catch { return undefined; }
+}
+
+function workerAbortTargetsContainer(marker: string, containerId?: string | null): boolean {
+    const target = workerAbortContainer(marker);
+    return target === undefined || target === containerId;
 }
 
 export async function checkAbortSignal(
@@ -127,7 +151,7 @@ export async function clearWorkerAbortSignal(
 ): Promise<void> {
     const redis = factory();
     try {
-        await redis.del(`worker:abort:${taskId}`);
+        await clearWorkerAbortSignalWithClient(taskId, redis);
         logger.debug({ taskId }, 'Cleared worker abort signal from Redis');
     } catch (err) {
         logger.warn({ taskId, error: (err as Error).message }, 'Failed to clear worker abort signal from Redis');
@@ -136,9 +160,17 @@ export async function clearWorkerAbortSignal(
     }
 }
 
-async function clearWorkerAbortSignalWithClient(taskId: string, redis: AbortRedisClient): Promise<void> {
+export async function clearWorkerAbortSignalWithClient(taskId: string, redis: Pick<AbortRedisClient, 'get' | 'eval'>,
+    expectedMarker?: string): Promise<void> {
     try {
-        await redis.del(`worker:abort:${taskId}`);
+        const marker = await redis.get(`worker:abort:${taskId}`);
+        if (expectedMarker !== undefined && marker !== expectedMarker) return;
+        // Scoped markers expire naturally. Neither a stale executor nor an API stop
+        // may delete a newer execution's signal; they are not task-global mailboxes.
+        if (marker !== null && workerAbortContainer(marker) !== undefined) return;
+        if (marker === null) return;
+        if (!redis.eval) throw Error('Atomic worker abort consumption unavailable');
+        await redis.eval(CONSUME_EXACT_WORKER_ABORT, 1, `worker:abort:${taskId}`, marker);
         logger.debug({ taskId }, 'Cleared worker abort signal from Redis');
     } catch (err) {
         logger.warn({ taskId, error: (err as Error).message }, 'Failed to clear worker abort signal from Redis');
@@ -192,7 +224,7 @@ export function setupAbortChecker({
         if (pollInFlight) return;
         pollInFlight = true;
         pollPromise = (async () => {
-            const shouldAbort = await readAbortSignal(redis, taskId, plannerAbortKey);
+            const shouldAbort = await readAbortSignal(redis, taskId, plannerAbortKey, state.containerId.value);
             if (!active) return;
             consecutiveLookupFailures = 0;
             if (shouldAbort) await terminateExecution('Abort signal detected, terminating execution');

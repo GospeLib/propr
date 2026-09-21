@@ -2,6 +2,7 @@ import { IssueRef, IssueDetails } from '../claude/prompts/promptGenerator.js';
 import type { CliVersionType } from '../config/configManager.js';
 import type { UsageTrackingMetrics } from './impl/utils/usageTrackingWrapper.js';
 import type { AgentType as SharedAgentType, ReasoningLevel } from '@propr/shared';
+import type { DockerCommandOptions } from '../claude/docker/index.js';
 
 export { AGENT_TYPES } from '@propr/shared';
 
@@ -40,6 +41,10 @@ export interface AgentConfig {
 }
 
 export interface AgentTaskOptions {
+    /** Per-invocation restriction for an explicitly unavailable optional local Storybook MCP. */
+    disableOptionalStorybookMcp?: boolean;
+    /** Verified task deadline translated to a maximum runtime by ProPR. */
+    timeoutMs?: number;
     worktreePath: string;
     issueRef: IssueRef;
     issueDetails?: IssueDetails;
@@ -91,6 +96,7 @@ export interface TokenUsage {
  * Result from Agent.analyze() - includes response text and metadata for metrics.
  */
 export interface AnalysisResult {
+    execution?: Record<string, unknown>;
     /** The analysis response text */
     response: string;
     /** Model that was actually used */
@@ -108,6 +114,12 @@ export interface AnalysisResult {
 }
 
 export interface AnalyzeOptions {
+    /** Existing executor callbacks used by native callers to retain execution evidence. */
+    executionCallbacks?: Pick<DockerCommandOptions, 'onChildStarted' | 'onContainerId' | 'onSessionId' | 'onTerminal' | 'onTimeout' | 'onAbortRequested'> & {
+        onInputPrepared?: (input: { prompt: string; systemPrompt: string; responseSchema?: Readonly<Record<string, unknown>> }) => void | Promise<void>;
+    };
+    /** Closed semantic policy, never an unrestricted budget override. */
+    analysisProfile?: 'planning-artifact';
     context?: string;
     model?: string;
     taskId?: string;
@@ -127,6 +139,8 @@ export interface AnalyzeOptions {
     timeoutMs?: number;
     /** Expected response format. Defaults to plain text analysis. */
     responseFormat?: 'text' | 'json';
+    /** Caller-owned JSON schema delivered through native structured output, not prose escaping. */
+    responseSchema?: Readonly<Record<string, unknown>>;
     /** Optional per-analysis reasoning level override. */
     reasoningLevel?: ReasoningLevel;
     /**
@@ -168,6 +182,8 @@ export interface AgentExecutionResult {
 
     // Token usage metrics
     tokenUsage?: TokenUsage;
+    /** Model turns actually completed, including runs stopped at a turn limit or lease. */
+    numTurns?: number;
 
     // Agent Tank subscription usage metrics (for tracking session/weekly usage)
     usageMetrics?: UsageTrackingMetrics;

@@ -7,21 +7,29 @@ import {
   getAgentRegistry,
   loadAgents,
   resolveConfigPath,
+  ExecutionAbortedError,
+  PLANNING_ARTIFACT_PROFILE,
+  PLANNING_ARTIFACT_TIMEOUT_MS,
   toProprOpenCodeExternalModelId,
   toProprOpenCodeModelId,
   type Agent,
   type AgentRegistry,
   SyntheticAgent,
+  type AnalyzeOptions,
 } from '@propr/core';
 import { AGENT_DEFAULTS, isManagedAgentConfigPath } from '@propr/shared';
 import { requireManageAgents } from '../permissionGuards.js';
+import { nativeAnalysis, nativeAnalysisFailureExecution, type NativeAnalysisBinding, type NativeAnalysisDependencies } from './nativeAnalysis.js';
 
 const execFileAsync = promisify(execFile);
 
 interface AgentChatQuery {
+  responseSchema?: AnalyzeOptions['responseSchema'];
   agentId: string;
   syntheticConfigId?: string;
   model?: string;
+  analysisProfile?: typeof PLANNING_ARTIFACT_PROFILE;
+  execution?: NativeAnalysisBinding;
 }
 
 interface AgentChatRequest {
@@ -31,6 +39,7 @@ interface AgentChatRequest {
 }
 
 interface AgentChatResult {
+  execution?: Record<string, unknown>;
   agentId: string;
   agentAlias?: string;
   model: string;
@@ -156,15 +165,45 @@ function canonicalChatModel(agent: Agent, model: string | undefined): string {
     ? toProprOpenCodeModelId(fallbackModel)
     : fallbackModel;
 }
+function supportedAnalysisProfiles(queries: AgentChatQuery[]): boolean {
+  return queries.every(query => query.analysisProfile === undefined || query.analysisProfile === PLANNING_ARTIFACT_PROFILE);
+}
+function validQueries(queries: unknown): queries is AgentChatQuery[] {
+  return Array.isArray(queries) && queries.length > 0;
+}
+function validPrompt(prompt: unknown): prompt is string {
+  return typeof prompt === 'string' && Boolean(prompt);
+}
+function chatAnalysisOptions(query: AgentChatQuery, context?: string): AnalyzeOptions {
+  return {
+    context, model: query.model,
+    ...(query.analysisProfile === PLANNING_ARTIFACT_PROFILE ? {
+      analysisProfile: PLANNING_ARTIFACT_PROFILE, timeoutMs: PLANNING_ARTIFACT_TIMEOUT_MS,
+      reasoningLevel: 'low' as const, responseFormat: 'json' as const,
+      ...(query.responseSchema === undefined ? {} : { responseSchema: query.responseSchema }),
+    } : {}),
+  };
+}
+
+function chatQueryIdentity(agent: Agent, query: AgentChatQuery, routing: ChatRoutingMetadata, model?: string) {
+  return {
+    agentId: query.syntheticConfigId || query.agentId,
+    ...(query.syntheticConfigId ? { syntheticConfigId: query.syntheticConfigId } : {}),
+    agentAlias: agent.config.alias,
+    model: routing.virtualModel || canonicalChatModel(agent, model || query.model),
+    ...routing,
+  };
+}
 
 async function executeChatQuery(
   registry: AgentRegistry,
   query: AgentChatQuery,
   prompt: string,
-  context: string | undefined,
-): Promise<AgentChatResult> {
+  execution: { context?: string; signal: AbortSignal; canStart: () => boolean; nativeStarted: () => void; dependencies: NativeAnalysisDependencies },
+): Promise<AgentChatResult | undefined> {
   const requestedAgentId = query.syntheticConfigId || query.agentId;
   const agent = await resolveChatAgent(registry, requestedAgentId);
+  if (!execution.canStart()) return undefined;
 
   if (!agent) {
     return {
@@ -176,40 +215,47 @@ async function executeChatQuery(
   }
 
   const start = Date.now();
-  const routingSession = agent instanceof SyntheticAgent
+  const native = query.analysisProfile === PLANNING_ARTIFACT_PROFILE;
+  const routingSession = !native && agent instanceof SyntheticAgent
     ? agent.beginRoutingSession(query.model)
     : undefined;
 
   try {
-    const analysisResult = routingSession
-      ? await routingSession.analyze(prompt, { context, model: query.model })
-      : await agent.analyze(prompt, { context, model: query.model });
+    const analysisOptions = chatAnalysisOptions(query, execution.context);
+    if (native) execution.nativeStarted();
+    const analysisResult = native
+      ? await nativeAnalysis(agent, prompt, { options: analysisOptions, signal: execution.signal, binding: query.execution, dependencies: execution.dependencies })
+      : routingSession
+        ? await routingSession.analyze(prompt, analysisOptions)
+        : await agent.analyze(prompt, analysisOptions);
+    if (!execution.canStart()) return undefined;
     const routing = chatRoutingFields(routingSession?.routingMetadata);
     return {
-      agentId: requestedAgentId,
-      ...(query.syntheticConfigId ? { syntheticConfigId: query.syntheticConfigId } : {}),
-      agentAlias: agent.config.alias,
-      model: routing.virtualModel || canonicalChatModel(agent, analysisResult.modelUsed || query.model),
-      ...routing,
+      ...chatQueryIdentity(agent, query, routing, analysisResult.modelUsed),
       response: analysisResult.response,
       error: analysisResult.success === false ? (analysisResult.error || 'Analysis failed') : undefined,
       durationMs: Date.now() - start,
+      ...('execution' in analysisResult ? { execution: analysisResult.execution } : {}),
     };
   } catch (error) {
     const routing = chatRoutingFields(routingSession?.routingMetadata);
     return {
-      agentId: requestedAgentId,
-      ...(query.syntheticConfigId ? { syntheticConfigId: query.syntheticConfigId } : {}),
-      agentAlias: agent.config.alias,
-      model: routing.virtualModel || canonicalChatModel(agent, query.model),
-      ...routing,
+      ...chatQueryIdentity(agent, query, routing),
       error: (error as Error).message,
       durationMs: Date.now() - start,
+      ...nativeAnalysisFailureExecution(error),
     };
   }
 }
 
-export function createAgentRoutes() {
+function canStartChatAnalysis(signal: AbortSignal, disconnected: boolean): boolean {
+  return !signal.aborted && !disconnected;
+}
+function canPublishChatResult(signal: AbortSignal, disconnected: boolean, response: Response): boolean {
+  return canStartChatAnalysis(signal, disconnected) && !response.destroyed;
+}
+
+export function createAgentRoutes(options: NativeAnalysisDependencies = {}) {
   const router = Router();
 
   router.get('/opencode/models', requireManageAgents, async (req: Request, res: Response): Promise<void> => {
@@ -227,17 +273,32 @@ export function createAgentRoutes() {
   // Chat executes an already-configured agent; it does not mutate installation
   // agent configuration, so authenticated members may use it.
   router.post('/chat', async (req: Request, res: Response): Promise<void> => {
+    const execution = new AbortController();
+    let nativeRunning = false;
+    let clientDisconnected = false;
+    const disconnected = () => {
+      if (!res.writableEnded) {
+        clientDisconnected = true;
+        if (nativeRunning) execution.abort(new ExecutionAbortedError('Native analysis client disconnected'));
+      }
+    };
+    req.once('aborted', disconnected);
+    res.once('close', disconnected);
     try {
       const { queries, prompt, context } = req.body as AgentChatRequest;
 
       // Validate input
-      if (!queries || !Array.isArray(queries) || queries.length === 0) {
+      if (!validQueries(queries)) {
         res.status(400).json({ error: 'Invalid queries array' });
         return;
       }
 
-      if (!prompt || typeof prompt !== 'string') {
+      if (!validPrompt(prompt)) {
         res.status(400).json({ error: 'prompt is required and must be a string' });
+        return;
+      }
+      if (!supportedAnalysisProfiles(queries)) {
+        res.status(400).json({ error: 'Unsupported analysis profile' });
         return;
       }
 
@@ -250,13 +311,24 @@ export function createAgentRoutes() {
       // use the same agent credentials concurrently.
       const results: AgentChatResult[] = [];
       for (const query of queries) {
-        results.push(await executeChatQuery(registry, query, prompt, context));
+        if (!canStartChatAnalysis(execution.signal, clientDisconnected)) break;
+        const result = await executeChatQuery(registry, query, prompt, {
+          context,
+          signal: execution.signal,
+          canStart: () => canStartChatAnalysis(execution.signal, clientDisconnected),
+          nativeStarted: () => { nativeRunning = true; }, dependencies: options,
+        });
+        if (!result) break;
+        results.push(result);
       }
 
-      res.json({ results });
+      if (canPublishChatResult(execution.signal, clientDisconnected, res)) res.json({ results });
     } catch (error) {
       console.error('Error in /api/agents/chat:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      if (canPublishChatResult(execution.signal, clientDisconnected, res)) res.status(500).json({ error: 'Internal server error' });
+    } finally {
+      req.off('aborted', disconnected);
+      res.off('close', disconnected);
     }
   });
 

@@ -7,8 +7,19 @@ import type {
     UpdateMetadata,
 } from './workerStateManager.types.js';
 import { db } from '../db/connection.js';
+import { assertCompletionGuarded } from './completionGuard.js';
 import { getEventPublisher } from './eventPublisher.js';
 import logger from './logger.js';
+
+export const MAX_ATOMIC_UPDATE_ATTEMPTS = 8;
+const ATOMIC_RETRY_BASE_DELAY_MS = 5;
+const ATOMIC_RETRY_MAX_DELAY_MS = 100;
+const ATOMIC_RETRY_BACKOFF_FACTOR = 2;
+
+export async function waitForAtomicUpdateRetry(attempt: number): Promise<void> {
+    const delayMs = Math.min(ATOMIC_RETRY_BASE_DELAY_MS * (ATOMIC_RETRY_BACKOFF_FACTOR ** attempt), ATOMIC_RETRY_MAX_DELAY_MS);
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+}
 
 const COMPARE_AND_SET_TASK_STATE_SCRIPT = `
 if redis.call('get', KEYS[1]) ~= ARGV[1] then
@@ -22,6 +33,27 @@ export interface TaskStateTransition {
     state: TaskStateData;
     previousState: TaskState;
     reason: string;
+}
+
+export function cancellationMetadata(cancelledBy: string, metadata: UpdateMetadata): UpdateMetadata {
+    return { ...metadata, reason: metadata.reason ?? `Task cancelled by ${cancelledBy}`,
+        historyMetadata: { ...(metadata.historyMetadata ?? {}), cancelledBy, cancelledAt: new Date().toISOString() } };
+}
+
+/** Strict durability never publishes or leaves its own failed Redis projection behind. */
+export async function publishAndReconcileTaskTransition(redis: Redis, options: {
+    taskId: string; key: string; stateExpiry: number;
+    current: TaskStateData; transition: TaskStateTransition; metadata: UpdateMetadata;
+}): Promise<TaskStatePublicationResult> {
+    const { taskId, key, stateExpiry, current, transition, metadata } = options;
+    const publication = await publishTaskStateTransition(taskId, transition, metadata);
+    if (metadata.requireDurableHistory && !publication.historyPersisted) {
+        // Exact CAS prevents rollback of a concurrent ownership/cancellation transition.
+        await compareAndSetTaskStateData(redis, { key, stateExpiry,
+            currentJson: JSON.stringify(transition.state), state: current });
+        throw Error(`Task history was not persisted: ${publication.errors.join('; ')}`);
+    }
+    return publication;
 }
 
 export function taskStateExpectation(task: TaskStateData): TaskStateExpectation {
@@ -63,6 +95,8 @@ export function buildTaskStateTransition(
     newState: TaskState,
     metadata: UpdateMetadata,
 ): TaskStateTransition {
+    // The one boundary every completion must cross, whatever API or spelling reached it.
+    assertCompletionGuarded(newState, metadata);
     const previousState = current.state;
     const reason = metadata.reason ?? `State changed from ${previousState}`;
     const state = buildTaskStateMutation(current, (next, timestamp) => {
@@ -118,7 +152,7 @@ export async function compareAndSetTaskState(
         newState: TaskState;
         metadata: UpdateMetadata;
     },
-): Promise<TaskStateTransition | null> {
+): Promise<{ current: TaskStateData; transition: TaskStateTransition } | null> {
     const currentJson = await redis.get(options.key);
     if (!currentJson) return null;
     const current = JSON.parse(currentJson) as TaskStateData;
@@ -131,7 +165,7 @@ export async function compareAndSetTaskState(
         currentJson,
         state: transition.state,
     });
-    return updated ? transition : null;
+    return updated ? { current, transition } : null;
 }
 
 export async function publishTaskStateTransition(
@@ -157,11 +191,18 @@ export async function publishTaskStateTransition(
     };
 
     try {
-        await db('task_history').insert({
+        // A caller with a durable record of its own — the execution lease is the one that matters,
+        // because a terminal state whose lease is not settled re-admits paid work — commits it in
+        // THIS transaction. Without one, the insert runs exactly as it always has: a transaction
+        // held open around a write nobody needs to join buys nothing and blocks other writers.
+        const historyRow = {
             task_id: taskId,
             state: state.state,
             timestamp: state.updatedAt,
             reason,
+            // Same key on every retry of one logical transition: the unique index turns a retry of
+            // an already-committed insert into a rejection instead of a second row.
+            transition_id: metadata.transitionId ?? null,
             metadata: JSON.stringify({
                 ...(metadata.historyMetadata ?? {}),
                 previousState,
@@ -172,7 +213,16 @@ export async function publishTaskStateTransition(
                 prResult: metadata.prResult,
                 commitHash: metadata.commitHash,
             }),
-        });
+        };
+        if (metadata.durableCommit) {
+            const durableCommit = metadata.durableCommit;
+            await db.transaction(async transaction => {
+                await transaction('task_history').insert(historyRow);
+                await durableCommit(transaction);
+            });
+        } else {
+            await db('task_history').insert(historyRow);
+        }
         publication.historyPersisted = true;
         correlatedLogger.debug({ taskId, newState: state.state }, 'Task state update persisted to database');
     } catch (error) {
@@ -184,6 +234,39 @@ export async function publishTaskStateTransition(
         }, 'Failed to persist task state update to database');
     }
 
+    if (metadata.requireDurableHistory && !publication.historyPersisted) return publication;
+
+    await publishTaskTransitionEvent(taskId, transition, metadata, publication);
+
+    if (!publication.historyPersisted || !publication.eventPublished) {
+        correlatedLogger.error({
+            taskId,
+            version: state.version,
+            historyPersisted: publication.historyPersisted,
+            eventPublished: publication.eventPublished,
+            errors: publication.errors,
+        }, 'Task state changed in Redis but publication was only partially successful');
+    }
+    return publication;
+}
+
+/**
+ * Announces a transition that is already in Redis, WITHOUT writing history.
+ *
+ * The realtime event is a projection of the durable history, exactly like the Redis snapshot. A
+ * reconciliation that is catching both up to a history row that already exists must publish the
+ * event and append nothing — re-running the history insert would either duplicate the row or, if
+ * the unique index rejects it and the rejection is swallowed, leave the projection behind while
+ * the caller believes it was caught up.
+ */
+export async function publishTaskTransitionEvent(
+    taskId: string,
+    transition: TaskStateTransition,
+    metadata: UpdateMetadata,
+    publication: TaskStatePublicationResult,
+): Promise<TaskStatePublicationResult> {
+    const { state, previousState } = transition;
+    const correlatedLogger = logger.withCorrelation(state.correlationId);
     try {
         publication.eventPublished = await getEventPublisher().publishTaskUpdate({
             taskId,
@@ -203,16 +286,6 @@ export async function publishTaskStateTransition(
             taskId,
             version: state.version,
         }, 'Failed to publish task state update event');
-    }
-
-    if (!publication.historyPersisted || !publication.eventPublished) {
-        correlatedLogger.error({
-            taskId,
-            version: state.version,
-            historyPersisted: publication.historyPersisted,
-            eventPublished: publication.eventPublished,
-            errors: publication.errors,
-        }, 'Task state changed in Redis but publication was only partially successful');
     }
     return publication;
 }

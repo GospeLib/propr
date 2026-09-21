@@ -8,23 +8,23 @@ import { resolveConfigPath, loadSettings } from '../../config/configManager.js';
 import { persistLlmLog, createLlmLogFromAnalysis, buildTaskWorkRef, buildAnalysisWorkRef, formatUsageMetrics } from '../../utils/llmLogger.js';
 import { buildAnalysisSafetySuffix, executeWithUsageTracking } from './utils/index.js';
 import { parseVibeConversationLog, parseVibeOutput } from './utils/vibeOutputParser.js';
-import { getAnalysisSandboxArgs, getForwardedVibeEnvVars, isSuccessfulVibeResult, splitVibeCliArgs, getDefaultVibeCliArgs, buildPromptWithRetryContext, buildLogMetadata, buildVibeFailureMessage, writeVibePromptFile, writeVibeSecretEnvFile, cleanupTempFile, buildVibeContainerName, resolveHostBindPath, getMistralApiKeyFromSettings, readLatestVibeSessionMessages, readLatestVibeSessionTokenUsage, ensureAnalysisWorkspace, prepareRuntimeHome, cleanupRuntimeHome, hasUsableVibeConfigDir, hasStructuredOutputArg } from './utils/vibeAgentHelpers.js';
+import { getAnalysisSandboxArgs, isSuccessfulVibeResult, buildPromptWithRetryContext, buildLogMetadata, buildVibeFailureMessage, writeVibePromptFile, writeVibeSecretEnvFile, cleanupTempFile, buildVibeContainerName, resolveHostBindPath, getMistralApiKeyFromSettings, readLatestVibeSessionMessages, readLatestVibeSessionTokenUsage, ensureAnalysisWorkspace, prepareRuntimeHome, cleanupRuntimeHome, hasUsableVibeConfigDir } from './utils/vibeAgentHelpers.js';
 import type { ExecutionType } from '../../utils/llmMetrics.types.js';
 import { DEFAULT_AGENT_EXECUTION_TIMEOUT_MS } from '../constants.js';
 import { NoDefaultModelConfiguredError } from '../../config/modelAliases.js';
 import { resolveAgentTerminationReason } from '../termination.js';
+import { countAgentTurns } from '../turnCount.js';
 import {
-    buildVibeRepositoryScoutConfig,
     REPOSITORY_SCOUT_CONTAINER_ROOT,
     REPOSITORY_SCOUT_PREFIXED_MCP_TOOLS,
 } from './utils/repositoryScoutMcpServer.js';
+import { getVibeCliArgs, buildVibeDockerEnvVars, resolveVibeCredentialsAndConfig, buildVibePromptMountArgs } from './vibeAgentDockerArgsHelpers.js';
 
 export { UsageLimitError };
 export { parseVibeConversationLog, parseVibeOutput } from './utils/vibeOutputParser.js';
 export { getMistralApiKeyFromSettings, readLatestVibeSessionTokenUsage } from './utils/vibeAgentHelpers.js';
 
 const DEFAULT_VIBE_MAX_TURNS = 1000;
-const CONTAINER_CONFIG_PATH = '/home/node/.vibe';
 
 function buildFailedExecutionResult(error: Error & { stderr?: string }, executionTimeMs: number, model: string | undefined): AgentExecutionResult {
     return { success: false, error: error.message, executionTimeMs, logs: error.stderr || error.message, modifiedFiles: [], commitMessage: null, summary: undefined, modelUsed: model || 'unknown' };
@@ -114,6 +114,8 @@ export class VibeAgent implements Agent {
             const executionTimeMs = Date.now() - startTime;
             const parsedOutput = parseVibeOutput(result.stdout);
             const conversationLog = parseVibeConversationLog(result.stdout);
+            // A run killed at its lease emits no final JSON; its session log still holds the turns taken.
+            const turnEvents = conversationLog.length > 0 ? conversationLog : parseVibeConversationLog(readLatestVibeSessionMessages(runtimeHomePath));
             const tokenUsage = parsedOutput.tokenUsage || readLatestVibeSessionTokenUsage(runtimeHomePath);
             const modelUsed = parsedOutput.model || effectiveModel || 'unknown';
             const terminationReason = resolveAgentTerminationReason({ timedOut: result.timedOut, error: parsedOutput.error || result.stderr });
@@ -137,6 +139,7 @@ export class VibeAgent implements Agent {
                 error,
                 terminationReason,
                 tokenUsage,
+                numTurns: countAgentTurns('vibe', { events: turnEvents }),
                 usageMetrics: usageMetrics ?? undefined
             };
 
@@ -334,84 +337,25 @@ export class VibeAgent implements Agent {
         return undefined;
     }
 
-    private getCliArgs(): string[] {
-        const processArgs = process.env.VIBE_CLI_ARGS;
-        const configuredArgs = processArgs ?? this.config.envVars?.VIBE_CLI_ARGS;
-        const source = processArgs !== undefined ? 'process.env.VIBE_CLI_ARGS' : 'config.envVars.VIBE_CLI_ARGS';
-        let args: string[];
-        if (!configuredArgs?.trim()) {
-            args = getDefaultVibeCliArgs();
-        } else {
-            try { args = splitVibeCliArgs(configuredArgs); } catch (error) { throw new Error(`Invalid ${source}: ${(error as Error).message}`); }
-            if (args.length === 0) {
-                args = getDefaultVibeCliArgs();
-            } else if (!hasStructuredOutputArg(args)) {
-                const allowNoJson = process.env.VIBE_ALLOW_UNSTRUCTURED === '1' || this.config.envVars?.VIBE_ALLOW_UNSTRUCTURED === '1';
-                if (!allowNoJson) {
-                    throw new Error(`${source} does not include --output json. Structured output is required. Add --output json or set VIBE_ALLOW_UNSTRUCTURED=1 to override.`);
-                }
-                logger.warn({ source, args }, 'VIBE_CLI_ARGS override does not include --output json; structured output parsing may degrade');
-            }
-        }
-        return args;
-    }
-
-    private buildDockerEnvVars(params: { cleanModelName?: string; mode: 'execute' | 'analysis'; maxTurns: number; runtimeHomePath?: string; repositoryInspection?: boolean }): string[] {
-        const { cleanModelName, mode, maxTurns, runtimeHomePath, repositoryInspection = false } = params;
-        const forwardedEnvVars = getForwardedVibeEnvVars(this.config.envVars, repositoryInspection);
-        for (const envVar of forwardedEnvVars.skipped) logger.warn({ agentAlias: this.config.alias, envVar }, 'Skipping invalid Vibe Docker environment variable');
-        const envVars = forwardedEnvVars.dockerArgs;
-        envVars.push('-e', 'PROPR_AGENT_TYPE=vibe');
-        if (cleanModelName) envVars.push('-e', `VIBE_ACTIVE_MODEL=${cleanModelName}`);
-        envVars.push('-e', 'VIBE_SOURCE_HOME=/home/node/.vibe');
-        if (runtimeHomePath) envVars.push('-e', 'VIBE_RUNTIME_HOME=/tmp/propr-vibe-home', '-e', 'HOME=/tmp/propr-vibe-home');
-        if (mode === 'analysis') {
-            const analysisDirs = ['VIBE_READ_ONLY_CONFIG=1', 'XDG_CACHE_HOME=/tmp/propr-vibe-cache', 'XDG_CONFIG_HOME=/tmp/propr-vibe-config', 'XDG_DATA_HOME=/tmp/propr-vibe-data', 'UV_CACHE_DIR=/tmp/propr-uv-cache', 'HOME=/tmp/propr-vibe-home', 'VIBE_RUNTIME_HOME=/tmp/propr-vibe-home', 'XDG_STATE_HOME=/tmp/propr-vibe-state', 'PIP_CACHE_DIR=/tmp/propr-pip-cache', 'PYTHONPYCACHEPREFIX=/tmp/propr-python-cache'];
-            for (const dir of analysisDirs) envVars.push('-e', dir);
-        }
-        if (repositoryInspection) {
-            envVars.push('-e', 'PROPR_REPOSITORY_INSPECTION=1');
-            envVars.push('-e', `PROPR_REPOSITORY_SCOUT_VIBE_CONFIG=${buildVibeRepositoryScoutConfig()}`);
-        }
-        envVars.push('-e', `VIBE_MAX_TURNS=${maxTurns}`);
-        return envVars;
-    }
-
-    private resolveCredentialsAndConfig(mistralApiKey?: string): { configPath: string; resolvedApiKey: string | undefined; hasUsableConfig: boolean; configMountArgs: string[] } {
-        const configPath = resolveConfigPath(process.env.VIBE_CONFIG_PATH || this.config.configPath);
-        const resolvedApiKey = mistralApiKey || process.env.MISTRAL_API_KEY?.trim() || this.config.envVars?.MISTRAL_API_KEY?.trim();
-        const hasUsableConfig = hasUsableVibeConfigDir(configPath, resolvedApiKey);
-        if (!resolvedApiKey && !hasUsableConfig) throw new Error(`Vibe agent "${this.config.alias}" has no credentials. Set MISTRAL_API_KEY or ensure ${configPath} contains valid Vibe config files.`);
-        return { configPath, resolvedApiKey, hasUsableConfig, configMountArgs: hasUsableConfig ? ['-v', `${configPath}:${CONTAINER_CONFIG_PATH}:ro`] : [] };
-    }
-
-    private buildPromptMountArgs(promptFilePath: string | undefined, cliArgs: string[]): string[] {
-        if (!promptFilePath) return [];
-        const hostPromptPath = resolveHostBindPath(promptFilePath);
-        const containerPromptPath = '/home/node/propr-prompt.txt';
-        cliArgs.push('--prompt-file', containerPromptPath);
-        return ['-v', `${hostPromptPath}:${containerPromptPath}:ro`];
-    }
-
     private buildDockerArgs(params: VibeDockerArgsParams): string[] {
         const { worktreePath, modelName, mistralApiKey, issueNumber, taskId, executionType, maxTurns = this.maxTurns, mode = 'execute', promptFilePath, envFilePath, runtimeHomePath, repositoryInspection = false } = params;
         if (repositoryInspection && mode !== 'analysis') {
             throw new Error('Repository inspection requires analysis mode');
         }
-        const { configPath, hasUsableConfig, configMountArgs } = this.resolveCredentialsAndConfig(mistralApiKey);
+        const { configPath, hasUsableConfig, configMountArgs } = resolveVibeCredentialsAndConfig(this.config.alias, this.config.configPath, mistralApiKey, this.config.envVars);
         const cleanModelName = modelName?.includes(':') ? modelName.split(':').pop()! : modelName;
         const mistralEnvFileArgs = envFilePath ? ['--env-file', envFilePath] : [];
-        const envVars = this.buildDockerEnvVars({ cleanModelName, mode, maxTurns, runtimeHomePath, repositoryInspection });
+        const envVars = buildVibeDockerEnvVars(this.config.alias, { envVars: this.config.envVars, cleanModelName, mode, maxTurns, runtimeHomePath, repositoryInspection });
 
         const containerName = buildVibeContainerName(this.config.alias, executionType || (issueNumber === 0 ? 'analysis' : `issue-${issueNumber}`), taskId, modelName);
         const workspaceMountMode = mode === 'analysis' ? 'ro' : 'rw';
-        const cliArgs = this.getCliArgs();
+        const cliArgs = getVibeCliArgs(this.config.alias, this.config.envVars);
         if (repositoryInspection) {
             for (const tool of REPOSITORY_SCOUT_PREFIXED_MCP_TOOLS) {
                 cliArgs.push('--enabled-tools', tool);
             }
         }
-        const promptMountArgs = this.buildPromptMountArgs(promptFilePath, cliArgs);
+        const promptMountArgs = buildVibePromptMountArgs(promptFilePath, cliArgs);
         const runtimeHomeMountArgs = runtimeHomePath ? ['-v', `${resolveHostBindPath(runtimeHomePath)}:/tmp/propr-vibe-home:rw`] : [];
         const dockerArgs: string[] = [
             'run', '--rm', '--name', containerName, '--security-opt', 'no-new-privileges', '--network', 'bridge',

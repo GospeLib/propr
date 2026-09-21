@@ -16,7 +16,14 @@ import { AgentRegistry, UsageLimitError } from '@propr/core';
 import { generateTaskImportPrompt } from '@propr/core';
 import { handleError } from '@propr/core';
 import { handleSimpleUsageLimitError } from './issueJobHelpers.js';
-import type { TaskImportJobData, JobResult } from '@propr/core';
+import type { AgentExecutionResult, TaskImportJobData, JobResult, UpdateMetadata } from '@propr/core';
+import { ErrorCategories } from '@propr/core';
+import { agentResultToClaudeResponse } from './prFileUtils.js';
+import { buildAgentOutcome } from './executionOutcome.js';
+import { finalClaudeExecutionResult } from './claudeExecutionResult.js';
+import { publishCompletedWithDurableExecutionEvidence } from './completedExecutionDurability.js';
+import { isCompletionDurabilityUnverifiable } from './completionDurabilityOutcome.js';
+import { durableOperationIdentity } from '@propr/core';
 import type { GitHubToken } from './githubTypes.js';
 import { resolveDefaultAgentAndModel } from './prCommentAgentUtils.js';
 
@@ -29,6 +36,40 @@ interface TaskImportResult extends JobResult {
         conversationTurns?: number;
         stdout?: string;
     };
+}
+
+/** A task-import run whose agent execution did not succeed; it fails, it never completes. */
+export const TASK_IMPORT_EXECUTION_FAILED = 'TASK_IMPORT_EXECUTION_FAILED';
+
+function logTaskImportExecution(
+    correlatedLogger: Logger,
+    agentResult: AgentExecutionResult,
+    repository: string,
+    user: string | undefined,
+): void {
+    if (agentResult.success) {
+        correlatedLogger.info({ repository, user, stdout: agentResult.rawOutput || agentResult.logs },
+            'Task import job completed successfully - agent executed gh commands');
+        return;
+    }
+    correlatedLogger.error({ repository, user, error: agentResult.error }, 'Task import job failed');
+}
+
+/** The terminal evidence this run leaves on whichever terminal entry it reaches. */
+function taskImportExecutionEvidence(agentResult: AgentExecutionResult): UpdateMetadata {
+    return {
+        claudeResult: finalClaudeExecutionResult({
+            success: agentResult.success,
+            sessionId: agentResult.sessionId,
+            conversationId: agentResult.conversationId,
+            executionTime: agentResult.executionTimeMs,
+        }),
+        historyMetadata: { agentOutcome: buildAgentOutcome(agentResultToClaudeResponse(agentResult)) },
+    };
+}
+
+function taskImportExecutionFailure(agentResult: AgentExecutionResult): Error {
+    return new Error(`${TASK_IMPORT_EXECUTION_FAILED}: ${agentResult.error ?? 'the agent reported no result'}`);
 }
 
 export async function processTaskImportJob(job: Job<TaskImportJobData>): Promise<TaskImportResult> {
@@ -52,6 +93,8 @@ export async function processTaskImportJob(job: Job<TaskImportJobData>): Promise
     }, 'Processing task import job...');
 
     let octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>>;
+    /** The run's terminal evidence, recorded on whichever terminal entry this job reaches. */
+    let terminalExecutionEvidence: UpdateMetadata | undefined;
     let localRepoPath: string | undefined;
     let worktreeInfo: WorktreeInfo | undefined;
     const [repoOwner, repoName] = repository.split('/');
@@ -124,22 +167,30 @@ export async function processTaskImportJob(job: Job<TaskImportJobData>): Promise
             conversationTurns: agentResult.conversationLog?.length || 0
         }, 'Task import analysis completed');
 
-        if (agentResult.success) {
-            correlatedLogger.info({
-                repository,
-                user,
-                stdout: agentResult.rawOutput || agentResult.logs
-            }, 'Task import job completed successfully - agent executed gh commands');
-        } else {
-            correlatedLogger.error({
-                repository,
-                user,
-                error: agentResult.error
-            }, 'Task import job failed');
-        }
+        logTaskImportExecution(correlatedLogger, agentResult, repository, user);
+
+        // This job runs a model execution, so its terminal record carries the same evidence every
+        // other executed path records: the final (phase-labelled) result and the agent outcome.
+        terminalExecutionEvidence = taskImportExecutionEvidence(agentResult);
+        // An unsuccessful execution is a failure, never a completion: it settles terminally as
+        // failed in the catch below rather than publishing `completed` over a run that did not
+        // deliver.
+        if (!agentResult.success) throw taskImportExecutionFailure(agentResult);
 
         await stateManager.updateTaskState(taskId, TaskStates.POST_PROCESSING, { reason: 'Cleaning up worktree' });
-        await stateManager.markTaskCompleted(taskId, { status: 'complete', repository });
+        // `completed` is published only once its execution evidence is durable, and the evidence
+        // rides on the completed entry itself. See completedExecutionDurability.ts.
+        await publishCompletedWithDurableExecutionEvidence({
+            stateManager, taskId, correlatedLogger,
+            // The queue job owns this attempt and keeps its id across every redelivery.
+            operationId: durableOperationIdentity('task-import-job', jobId ?? correlationId),
+            metadata: {
+                reason: 'Task completed successfully',
+                prResult: { status: 'complete', repository },
+                claudeResult: terminalExecutionEvidence.claudeResult,
+                historyMetadata: { repository, ...terminalExecutionEvidence.historyMetadata },
+            },
+        });
 
         return {
             status: 'complete',
@@ -159,7 +210,17 @@ export async function processTaskImportJob(job: Job<TaskImportJobData>): Promise
             return handleSimpleUsageLimitError(error, job as unknown as Job<{ repoOwner: string; repoName: string; number: number; modelName?: string; correlationId?: string }>, correlatedLogger, repository);
         }
         correlatedLogger.error({ error: (error as Error).message, stack: (error as Error).stack }, 'Task import job failed');
-        await stateManager.markTaskFailed(taskId, error as Error);
+        // The barrier could not establish whether `completed` committed. Settling `failed` here is
+        // exactly the production failure this remediation exists to prevent, so the error leaves
+        // without any terminal record and the task stays unsettled until it can be established.
+        if (isCompletionDurabilityUnverifiable(error)) {
+            handleError(error, 'Task import job completion durability is unverifiable', { correlationId });
+            throw error;
+        }
+        await stateManager.markTaskFailed(taskId, error as Error, {
+            errorCategory: ErrorCategories.CLAUDE_EXECUTION,
+            ...(terminalExecutionEvidence ?? {}),
+        });
         handleError(error, 'Failed to process task import job', { correlationId });
         throw error;
     } finally {

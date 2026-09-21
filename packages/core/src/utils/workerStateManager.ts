@@ -4,7 +4,7 @@ import { db } from '../db/connection.js';
 import type { Logger } from 'pino';
 import {
     TaskStates, type TaskState, type IssueRef, type TaskStateData, type UpdateMetadata,
-    type TaskResult, type ResumableTaskInfo, type TaskStateExpectation,
+    type ResumableTaskInfo, type TaskStateExpectation,
     type NonTerminalTaskScanResult,
     type TaskStateUpdateResult,
     type WorkerStateManagerOptions
@@ -15,21 +15,22 @@ import {
     buildTaskStateMutation,
     compareAndSetTaskStateData,
     compareAndSetTaskState,
-    publishTaskStateTransition,
+    publishAndReconcileTaskTransition,
+    publishTaskTransitionEvent,
+    cancellationMetadata,
+    MAX_ATOMIC_UPDATE_ATTEMPTS,
+    waitForAtomicUpdateRetry,
 } from './workerStateTransition.js';
 import { scanNonTerminalTaskStates } from './workerStateScan.js';
+import { persistHistoryMetadata } from './workerStateHistoryMetadata.js';
+import { persistTaskAdmission } from './workerStateAdmission.js';
+import { certifyDurableCompletion } from './durableCompletionBarrier.js';
 
-const MAX_ATOMIC_UPDATE_ATTEMPTS = 8;
 const TERMINAL_TASK_STATES = new Set<TaskState>([
     TaskStates.COMPLETED,
     TaskStates.FAILED,
     TaskStates.CANCELLED,
 ]);
-
-async function waitForAtomicUpdateRetry(attempt: number): Promise<void> {
-    const delayMs = Math.min(5 * (2 ** attempt), 100);
-    await new Promise(resolve => setTimeout(resolve, delayMs));
-}
 
 export { TaskStates, type TaskState, type IssueRef };
 
@@ -63,7 +64,8 @@ export class WorkerStateManager {
      * @param correlationId - Correlation ID for tracking
      * @returns Task state data
      */
-    async createTaskState(taskId: string, issueRef: IssueRef, correlationId: string | null = null): Promise<TaskStateData> {
+    async createTaskState(taskId: string, issueRef: IssueRef, correlationId: string | null = null,
+        policy: Pick<UpdateMetadata, 'requireDurableHistory'> = {}): Promise<TaskStateData> {
         const timestamp = new Date().toISOString();
         const state: TaskStateData = {
             taskId, issueRef, correlationId: correlationId ?? generateCorrelationId(),
@@ -72,31 +74,19 @@ export class WorkerStateManager {
             history: [{ state: TaskStates.PENDING, timestamp, reason: 'Task created' }]
         };
         const key = this.getTaskKey(taskId);
-        await this.redis.setex(key, this.stateExpiry, JSON.stringify(state));
+        if (!policy.requireDurableHistory)
+            await this.redis.setex(key, this.stateExpiry, JSON.stringify(state));
         const correlatedLogger: Logger = logger.withCorrelation(state.correlationId);
         correlatedLogger.info({
             taskId, issueNumber: issueRef.number,
             repository: `${issueRef.repoOwner}/${issueRef.repoName}`, state: TaskStates.PENDING
         }, 'Task state created');
 
+        let databasePersisted = false;
         try {
-            // Validate repository name components before storing
-            const repoOwner = issueRef.repoOwner ?? 'unknown';
-            const repoName = issueRef.repoName ?? 'unknown';
-            const repository = `${repoOwner}/${repoName}`;
-            const taskData = {
-                task_id: taskId, job_id: null, correlation_id: state.correlationId,
-                repository,
-                issue_number: issueRef.number, task_type: issueRef.type ?? 'issue',
-                model_name: issueRef.modelName ?? null, created_at: state.createdAt,
-                initial_job_data: JSON.stringify(issueRef)
-            };
-            await db('tasks').insert(taskData).onConflict('task_id').ignore();
-            const historyData = {
-                task_id: taskId, state: TaskStates.PENDING,
-                timestamp: state.createdAt, reason: 'Task created', metadata: JSON.stringify({})
-            };
-            await db('task_history').insert(historyData);
+            const repository = await persistTaskAdmission(state, policy.requireDurableHistory
+                ? () => this.redis.setex(key, this.stateExpiry, JSON.stringify(state)) : undefined);
+            databasePersisted = true;
             correlatedLogger.debug({ taskId }, 'Task state persisted to database');
 
             // Publish real-time event for task creation
@@ -111,6 +101,7 @@ export class WorkerStateManager {
             });
         } catch (error) {
             correlatedLogger.error({ error: (error as Error).message, taskId }, 'Failed to persist task state to database');
+            if (policy.requireDurableHistory && !databasePersisted) throw error;
         }
         return state;
     }
@@ -137,6 +128,7 @@ export class WorkerStateManager {
                 && !isExplicitFailedRetry) {
                 logger.warn({ taskId, currentState: current.state, requestedState: newState },
                     'Ignored state transition from a terminal task');
+                if (metadata.requireDurableHistory) throw Error('Durable transition from terminal task refused');
                 return current;
             }
 
@@ -148,7 +140,9 @@ export class WorkerStateManager {
                 state: transition.state,
             });
             if (updated) {
-                await publishTaskStateTransition(taskId, transition, metadata);
+                await publishAndReconcileTaskTransition(this.redis, {
+                    taskId, key, stateExpiry: this.stateExpiry, current, transition, metadata,
+                });
                 return transition.state;
             }
             await waitForAtomicUpdateRetry(attempt);
@@ -184,16 +178,71 @@ export class WorkerStateManager {
         newState: TaskState,
         metadata: UpdateMetadata = {},
     ): Promise<TaskStateUpdateResult | null> {
-        const transition = await compareAndSetTaskState(this.redis, {
+        const mutation = await compareAndSetTaskState(this.redis, {
             key: this.getTaskKey(taskId),
             stateExpiry: this.stateExpiry,
             expectation,
             newState,
             metadata,
         });
-        if (!transition) return null;
-        const publication = await publishTaskStateTransition(taskId, transition, metadata);
+        if (!mutation) return null;
+        const { current, transition } = mutation;
+        const publication = await publishAndReconcileTaskTransition(this.redis, {
+            taskId, key: this.getTaskKey(taskId), stateExpiry: this.stateExpiry, current, transition, metadata,
+        });
         return { state: transition.state, publication };
+    }
+
+    /**
+     * Catches the projection up to a completion the durable history ALREADY proves.
+     *
+     * This publishes no completion of its own: it re-reads the completed row for the caller's
+     * exact transition identity and can only proceed with the capability that read mints, so a
+     * caller that did not run the execution — a reconciliation, a queue-event finalizer — can
+     * relay a completion but never assert one. Nothing is appended to `task_history`; only the
+     * Redis snapshot and the realtime event are brought into line.
+     *
+     * An evidence-free completion appended here is the exact defect this replaces: the barrier's
+     * re-published transition was rejected by the unique index, the rejection was swallowed,
+     * Redis stayed nonterminal, and the next finalizer read that as "unsettled" and wrote a
+     * second, unkeyed completed row whose metadata carried no execution evidence at all.
+     */
+    async projectDurableCompletion(taskId: string, options: {
+        transitionId: string;
+        reason?: string;
+        historyMetadata?: Record<string, unknown>;
+    }): Promise<'projected' | 'already_completed' | 'terminal_conflict' | 'task_missing'> {
+        const completionGuard = await certifyDurableCompletion(taskId, options.transitionId);
+        const key = this.getTaskKey(taskId);
+        for (let attempt = 0; attempt < MAX_ATOMIC_UPDATE_ATTEMPTS; attempt++) {
+            const stateJson = await this.redis.get(key);
+            if (!stateJson) return 'task_missing';
+            const current = JSON.parse(stateJson) as TaskStateData;
+            if (current.state === TaskStates.COMPLETED) return 'already_completed';
+            if (TERMINAL_TASK_STATES.has(current.state)) {
+                logger.error({ taskId, currentState: current.state, transitionId: options.transitionId },
+                    'A durable completion cannot be projected over a different terminal state');
+                return 'terminal_conflict';
+            }
+            const metadata: UpdateMetadata = {
+                completionGuard,
+                transitionId: options.transitionId,
+                reason: options.reason,
+                historyMetadata: options.historyMetadata,
+            };
+            const transition = buildTaskStateTransition(current, TaskStates.COMPLETED, metadata);
+            const updated = await compareAndSetTaskStateData(this.redis, {
+                key, stateExpiry: this.stateExpiry, currentJson: stateJson, state: transition.state,
+            });
+            if (!updated) {
+                await waitForAtomicUpdateRetry(attempt);
+                continue;
+            }
+            await publishTaskTransitionEvent(taskId, transition, metadata,
+                { historyPersisted: true, eventPublished: false, errors: [] });
+            return 'projected';
+        }
+        throw new Error(`Durable completion projection conflicted ${MAX_ATOMIC_UPDATE_ATTEMPTS} times for taskId: ${taskId}`);
     }
 
     /**
@@ -206,6 +255,16 @@ export class WorkerStateManager {
         const stateJson = await this.redis.get(key);
         if (!stateJson) return null;
         return JSON.parse(stateJson) as TaskStateData;
+    }
+
+    /** Retained cancellation is authoritative for this exact task, including late job redelivery. */
+    async getTaskCancellation(taskId: string): Promise<Record<string, unknown> | null> {
+        const current = await this.getTaskState(taskId);
+        if (current?.state === TaskStates.CANCELLED) return { ...current.history.at(-1) };
+        const recorded = await db('task_history').where({ task_id: taskId, state: TaskStates.CANCELLED })
+            .orderBy('timestamp', 'desc').first();
+        if (!recorded) return null;
+        return { ...recorded, metadata: typeof recorded.metadata === 'string' ? JSON.parse(recorded.metadata) : recorded.metadata };
     }
 
     /**
@@ -298,7 +357,8 @@ export class WorkerStateManager {
      * @param metadata - Metadata to merge
      * @returns Updated state
      */
-    async updateHistoryMetadata(taskId: string, historyState: TaskState, metadata: Record<string, unknown> = {}): Promise<TaskStateData> {
+    async updateHistoryMetadata(taskId: string, historyState: TaskState, metadata: Record<string, unknown> = {},
+        policy: Pick<UpdateMetadata, 'requireDurableHistory'> = {}): Promise<TaskStateData> {
         const key = this.getTaskKey(taskId);
         for (let attempt = 0; attempt < MAX_ATOMIC_UPDATE_ATTEMPTS; attempt++) {
             const stateJson = await this.redis.get(key);
@@ -307,6 +367,7 @@ export class WorkerStateManager {
             const current = JSON.parse(stateJson) as TaskStateData;
             const historyIndex = current.history.findLastIndex(h => h.state === historyState);
             if (historyIndex < 0) {
+                if (policy.requireDurableHistory) throw Error('Durable history entry required for metadata checkpoint');
                 logger.warn({ taskId, historyState }, 'Could not find history entry to update metadata');
                 return current;
             }
@@ -330,6 +391,28 @@ export class WorkerStateManager {
 
             const correlatedLogger: Logger = logger.withCorrelation(state.correlationId);
             correlatedLogger.debug({ taskId, historyState, metadata, version: state.version }, 'Updated history metadata');
+
+            try {
+                const persisted = await persistHistoryMetadata(
+                    {
+                        taskId,
+                        historyState,
+                        historyTimestamp: state.history[historyIndex].timestamp,
+                        metadata,
+                    },
+                    {
+                        maxAttempts: MAX_ATOMIC_UPDATE_ATTEMPTS,
+                        waitForRetry: waitForAtomicUpdateRetry,
+                    },
+                );
+                if (!persisted) {
+                    if (policy.requireDurableHistory) throw Error('Durable database history entry required for metadata checkpoint');
+                    correlatedLogger.warn({ taskId, historyState }, 'Could not find database history entry to update metadata');
+                }
+            } catch (error) {
+                correlatedLogger.warn({ error: (error as Error).message, taskId, historyState }, 'Failed to persist history metadata update');
+                if (policy.requireDurableHistory) throw error;
+            }
 
             // Publish real-time event for metadata update so UI can refresh
             try {
@@ -377,34 +460,27 @@ export class WorkerStateManager {
      * @returns Updated state
      */
     async markTaskCancelled(taskId: string, cancelledBy: string = 'user', metadata: UpdateMetadata = {}): Promise<TaskStateData> {
-        const cancelMetadata: UpdateMetadata = {
-            ...metadata,
-            reason: metadata.reason ?? `Task cancelled by ${cancelledBy}`,
-            historyMetadata: {
-                ...(metadata.historyMetadata ?? {}),
-                cancelledBy,
-                cancelledAt: new Date().toISOString()
-            }
-        };
-        return await this.updateTaskState(taskId, TaskStates.CANCELLED, cancelMetadata);
+        return await this.updateTaskState(taskId, TaskStates.CANCELLED, cancellationMetadata(cancelledBy, metadata));
     }
 
-    /**
-     * Marks task as completed
-     * @param taskId - Task identifier
-     * @param result - Task result
-     * @returns Updated state
-     */
-    async markTaskCompleted(taskId: string, result: TaskResult = {}): Promise<TaskStateData> {
-        const metadata: UpdateMetadata = {
-            prResult: result, reason: 'Task completed successfully',
-            historyMetadata: {
-                pr: (result.prUrl && result.prNumber) ? { number: result.prNumber, url: result.prUrl } : null,
-                commitResult: result.commitResult ?? null
-            }
-        };
-        return await this.updateTaskState(taskId, TaskStates.COMPLETED, metadata);
+    /** Returns null on ownership mismatch; throws if strict durable settlement fails. */
+    async markTaskCancelledIfCurrent(taskId: string, expectation: TaskStateExpectation,
+        cancelledBy: string = 'user', metadata: UpdateMetadata = {}): Promise<TaskStateData | null> {
+        if (TERMINAL_TASK_STATES.has(expectation.state) && expectation.state !== TaskStates.CANCELLED) return null;
+        const result = await this.updateTaskStateIfCurrentDetailed(taskId, expectation, TaskStates.CANCELLED,
+            cancellationMetadata(cancelledBy, { ...metadata, requireDurableHistory: true }));
+        return result?.state ?? null;
     }
+
+    /*
+     * `markTaskCompleted` is deliberately absent.
+     *
+     * It was a keyless, evidence-free completion writer on the public state-manager API: anything
+     * holding a state manager could publish the signal a consumer re-dispatches on, with no
+     * execution evidence and no idempotency key. Completions are published through the durability
+     * barrier (`publishCompletedWithDurableExecutionEvidence`), and a path that genuinely ran no
+     * model execution publishes with `nonExecutingCompletionGuard`. Do not reintroduce it.
+     */
 
     /**
      * Gets all tasks in processing states (for recovery)

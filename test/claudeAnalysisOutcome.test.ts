@@ -29,6 +29,21 @@ function buildOutput(overrides: Partial<ClaudeOutput>): ClaudeOutput {
 }
 
 describe('resolveAnalysisOutcome', () => {
+  test('closed planning results reject API authentication, missing init and configured MCP', () => {
+    for (const init of [undefined,
+      { type: 'system', subtype: 'init', apiKeySource: 'ANTHROPIC_API_KEY', mcp_servers: [] },
+      { type: 'system', subtype: 'init', apiKeySource: 'apiKeyHelper', mcp_servers: [] },
+      { type: 'system', subtype: 'init', apiKeySource: 'none', mcp_servers: [{ name: 'credential-holder' }] }]) {
+      const output = buildOutput({ rawOutput: init ? JSON.stringify(init) : '',
+        finalResult: { type: 'result', is_error: false, result: '{}' } });
+      assert.strictEqual((resolveAnalysisOutcome as any)(output, '', true).isSuccess, false);
+    }
+  });
+  test('closed authenticated Max init uses observed apiKeySource none, not invented OAuth enum', () => {
+    const output = buildOutput({ rawOutput: JSON.stringify({ type: 'system', subtype: 'init',
+      apiKeySource: 'none', mcp_servers: [] }), finalResult: { type: 'result', is_error: false, result: '{}' } });
+    assert.strictEqual((resolveAnalysisOutcome as any)(output, '', true).isSuccess, true);
+  });
   after(async () => {
     await closeConnection();
   });

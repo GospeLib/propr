@@ -14,6 +14,7 @@ import {
     type ReconciliationStateManager,
     type TaskStateReconciliationResult,
 } from './taskStateReconciler.js';
+import { boundedInteger } from './shared/boundedInteger.js';
 
 const RECONCILIATION_LEASE_KEY = 'lock:worker:pr-task-state-reconciliation';
 const RELEASE_LEASE_SCRIPT = `
@@ -143,14 +144,6 @@ async function runUntilAborted<T>(
     });
 }
 
-function boundedInteger(value: string | undefined, fallback: number, minimum: number, maximum: number): number {
-    if (value === undefined) return fallback;
-    const parsed = Number(value);
-    return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum
-        ? parsed
-        : fallback;
-}
-
 function createLeaseRedis(): InstanceType<typeof Redis> {
     return new Redis({
         host: process.env.REDIS_HOST || '127.0.0.1',
@@ -259,7 +252,15 @@ export async function startWorkerTaskStateRecovery(
             );
             cursor = result.nextCursor;
             backlog = result.backlog ?? [];
-            logger.info(result.summary, 'Reconciled stale PR comment task states');
+            // An unverifiable completion is not a quiet skip: work may be delivered, stuck or
+            // about to be retried, so the run that found one is reported at a level an alert
+            // can key on, with the count in the summary it already publishes.
+            if (result.summary.unverifiableCompletions > 0) {
+                logger.error(result.summary,
+                    'Reconciled stale PR comment task states, leaving unverifiable completions unsettled');
+            } else {
+                logger.info(result.summary, 'Reconciled stale PR comment task states');
+            }
             return true;
         } catch (error) {
             if (!closed) {

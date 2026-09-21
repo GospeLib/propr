@@ -1,3 +1,7 @@
+import { admittedCommentJobId, enqueueAdmittedComment } from '../admission/admittedComment.js';
+import { EZER_REVIEW_REQUEST } from '../admission/reviewRequest.js';
+import { requiresEzerExecutionAdmission } from '../admission/ezerExecutionAdmission.js';
+import { claimEzerAddressedComment, resolveOwnerEzerCommandBody } from '../intake/routingOwnerEvent.js';
 /* eslint-disable max-lines */
 import logger, { generateCorrelationId } from '../utils/logger.js';
 import { handleError } from '../utils/errorHandler.js';
@@ -184,16 +188,18 @@ export async function handleCommentEdited(payload: IssueCommentEvent | PullReque
     const repo = payload.repository.name;
     const repoFullName = `${owner}/${repo}`;
 
-    let prNumber: number, commentId: number;
+    let prNumber: number, commentId: number, commentBody: string | null;
     if (eventType === 'issue_comment') {
         const issuePayload = payload as IssueCommentEvent;
         if (!issuePayload.issue.pull_request) { correlatedLogger.debug({ repository: repoFullName }, 'Issue comment is not on a PR, skipping'); return; }
         prNumber = issuePayload.issue.number;
         commentId = issuePayload.comment.id;
+        commentBody = issuePayload.comment.body;
     } else if (eventType === 'pull_request_review_comment') {
         const prPayload = payload as PullRequestReviewCommentEvent;
         prNumber = prPayload.pull_request.number;
         commentId = prPayload.comment.id;
+        commentBody = prPayload.comment.body;
     } else { correlatedLogger.warn({ eventType }, 'Unknown event type for comment edit'); return; }
 
     correlatedLogger.info({ repository: repoFullName, pullRequestNumber: prNumber, commentId }, 'Comment edited, restarting any active jobs for this PR');
@@ -206,6 +212,33 @@ export async function handleCommentEdited(payload: IssueCommentEvent | PullReque
     }
 
     if (foundJob) {
+        const ezerReview = eventType === 'issue_comment'
+            ? EZER_REVIEW_REQUEST.exec(commentBody || '')
+            : null;
+        if (ezerReview && foundJob.id === admittedCommentJobId(ezerReview[1]!)) {
+            try {
+                const replay = await enqueueAdmittedComment({
+                    repository: repoFullName,
+                    prNumber,
+                    commentId,
+                    body: commentBody!,
+                    admissionId: ezerReview[1]!,
+                    review: true,
+                });
+                if (replay.jobId === foundJob.id) {
+                    correlatedLogger.info(
+                        { jobId: foundJob.id, pullRequestNumber: prNumber, repository: repoFullName, commentId },
+                        'Ignoring identical edit delivery for the active signed Ezer review',
+                    );
+                    return;
+                }
+            } catch {
+                correlatedLogger.info(
+                    { jobId: foundJob.id, pullRequestNumber: prNumber, repository: repoFullName, commentId },
+                    'Signed Ezer review edit changed its validated admission binding; retaining cancellation path',
+                );
+            }
+        }
         correlatedLogger.info({ jobId: foundJob.id, pullRequestNumber: prNumber, repository: repoFullName }, 'Aborting existing job due to comment edit');
         const taskId = foundJob.id ?? `${owner}-${repo}-${prNumber}`;
         await redisClient.set(`worker:abort:${taskId}`, JSON.stringify({ timestamp: new Date().toISOString(), reason: 'comment_edited', commentId }), 'EX', 3600);
@@ -626,8 +659,50 @@ export async function processCommentEvent(payload: IssueCommentEvent | PullReque
 
     const { prNumber, comment: rawComment } = eventDetails;
 
+    // THE `/ezer` AUTHORIZATION CHOKEPOINT — the first decision made about any comment, on every
+    // path, before any Ezer-specific handling, before the slash parser, before `/ezer` is resolved
+    // to a command at all, and before any generic follow-up logic.
+    //
+    // This function is also the ONLY place `/ezer` acquires a command meaning at all: the shared
+    // slash parser has no `/ezer` alias, and the address is resolved to `/fix` below by
+    // `resolveOwnerEzerCommandBody`, which returns nothing for a comment the owner did not write.
+    // It is the single boundary every route to the dispatcher passes through: routing-WebSocket intake and
+    // `direct_webhook` (both via processWebhookEvent -> handleIssueCommentEvent /
+    // handlePullRequestReviewCommentEvent), the daemon and API comment-processor wrappers, the
+    // edited-comment reprocess hook, and the system-ultrafix synthetic re-entry. Gating here
+    // dominates all of them, which per-call-site gates demonstrably did not — the same bypass was
+    // found three times through three different reachable call sites.
+    //
+    // Identity is the configured owner's stable numeric GitHub user id (EZER_OWNER_GITHUB_USER_ID),
+    // never a login. Fail closed: unset owner id admits no `/ezer` comment at all. The refusal is a
+    // terminal `ignored` disposition, so the delivery is ACKed (an outsider cannot force endless
+    // redelivery) and consumes no seat.
+    const unauthorizedEzerComment = claimEzerAddressedComment(rawComment);
+    if (unauthorizedEzerComment) {
+        correlatedLogger.warn({ repository: repoFullName, pullRequestNumber: prNumber, commentId: rawComment.id,
+            commentAuthor: rawComment.user.login, eventType },
+            'Refused an /ezer comment from a user that is not the configured Ezer owner');
+        return unauthorizedEzerComment;
+    }
+
     const commentAuthor = rawComment.user.login;
-    const parsedCommand = parseSlashCommand(rawComment.body);
+    const ezerReview = EZER_REVIEW_REQUEST.exec(rawComment.body || '');
+    if (ezerReview && eventType === 'issue_comment') {
+        const queued = await enqueueAdmittedComment({ repository: repoFullName, prNumber, commentId: rawComment.id,
+            body: rawComment.body!, admissionId: ezerReview[1]!, review: true });
+        correlatedLogger.info({ jobId: queued.jobId, commentId: rawComment.id }, 'Signed Ezer candidate review admitted through GitHub');
+        return { status: 'accepted', evidence: { triggerCommentIds: [rawComment.id] } };
+    }
+    if (rawComment.body?.startsWith('/ezer ') && requiresEzerExecutionAdmission({ repository: repoFullName,
+        protectedRepositories: process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES })) {
+        return { status: 'ignored', reason: 'awaiting_ezer_comment_admission' };
+    }
+    // `/ezer` -> `/fix` resolution, INSIDE the authorized boundary. Reaching this line at all
+    // means the chokepoint above admitted the comment, and this helper independently re-checks
+    // owner authorship, so an `/ezer` address can only become a command for the configured owner.
+    // The rewritten body is fed to the parser only — `comment` below still carries the owner's
+    // original `/ezer` text, so everything downstream sees exactly what it saw under the alias.
+    const parsedCommand = parseSlashCommand(resolveOwnerEzerCommandBody(rawComment) ?? rawComment.body);
     const configuredBotUsernames = new Set(
         [getBotUsername(), process.env.GITHUB_BOT_USERNAME, 'propr-dev[bot]']
             .filter((value): value is string => typeof value === 'string' && value.length > 0)

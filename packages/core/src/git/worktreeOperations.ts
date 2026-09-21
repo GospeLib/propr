@@ -9,11 +9,23 @@ import { redactAuthenticatedGitUrl } from './repoBranching.js';
 
 const WORKTREES_BASE_PATH = process.env.GIT_WORKTREES_BASE_PATH || "/tmp/git-processor/worktrees";
 
-interface CleanupOptions {
+/** Root directory under which every issue worktree is created. */
+export function getWorktreesBasePath(): string {
+    return WORKTREES_BASE_PATH;
+}
+
+export interface CleanupOptions {
     deleteBranch?: boolean;
     success?: boolean;
     retentionStrategy?: string;
     retentionHours?: number;
+    /**
+     * Keep the worktree, its index, and its local branch now — ignoring `retentionStrategy`
+     * and `success` entirely. Set this when a checkpoint push failed. The checkpoint
+     * commit itself is pinned by a local ref; the retained-checkpoint reconciler owns the
+     * worktree from here and removes it only after publication or bounded expiry.
+     */
+    retain?: boolean;
 }
 
 interface CleanupResult {
@@ -34,7 +46,8 @@ export async function cleanupWorktree(localRepoPath: string, worktreePath: strin
         deleteBranch = false,
         success = true,
         retentionStrategy = process.env.WORKTREE_RETENTION_STRATEGY || 'always_delete',
-        retentionHours = parseInt(process.env.WORKTREE_RETENTION_HOURS || '24', 10)
+        retentionHours = parseInt(process.env.WORKTREE_RETENTION_HOURS || '24', 10),
+        retain = false
     } = options;
 
     logger.info({
@@ -43,19 +56,11 @@ export async function cleanupWorktree(localRepoPath: string, worktreePath: strin
         deleteBranch,
         success,
         retentionStrategy,
-        retentionHours
+        retentionHours,
+        retain
     }, 'Cleaning up Git worktree...');
 
-    if (!success && retentionStrategy === 'keep_on_failure') {
-        logger.info({ worktreePath, branchName, retentionStrategy }, 'Keeping worktree due to failure and retention strategy');
-        await createRetentionMarker(worktreePath, retentionHours);
-        return;
-    }
-
-    if (!success && retentionStrategy === 'keep_for_hours') {
-        logger.info({ worktreePath, retentionHours }, `Scheduling worktree cleanup in ${retentionHours} hours`);
-        await createRetentionMarker(worktreePath, retentionHours);
-    }
+    if (await keepWorktreeForRetention(worktreePath, branchName, { success, retentionStrategy, retentionHours, retain })) return;
 
     const git: SimpleGit = createHooklessGit(localRepoPath);
 
@@ -89,6 +94,28 @@ export async function cleanupWorktree(localRepoPath: string, worktreePath: strin
     // NOTE: Removed `git worktree prune` here - it was causing race conditions by
     // deleting worktree metadata for other running tasks. Stale worktree references
     // will be cleaned up by the periodic cleanupExpiredWorktrees job instead.
+}
+
+/** Applies the retention policy; returns true when the worktree must be kept now. */
+async function keepWorktreeForRetention(worktreePath: string, branchName: string,
+    options: { success: boolean; retentionStrategy: string; retentionHours: number; retain: boolean }): Promise<boolean> {
+    const { success, retentionStrategy, retentionHours, retain } = options;
+    if (retain) {
+        logger.warn({ worktreePath, branchName },
+            'Retaining worktree: its partial-work checkpoint is not yet published; the checkpoint-retention reconciler owns it');
+        await createRetentionMarker(worktreePath, retentionHours);
+        return true;
+    }
+    if (!success && retentionStrategy === 'keep_on_failure') {
+        logger.info({ worktreePath, branchName, retentionStrategy }, 'Keeping worktree due to failure and retention strategy');
+        await createRetentionMarker(worktreePath, retentionHours);
+        return true;
+    }
+    if (!success && retentionStrategy === 'keep_for_hours') {
+        logger.info({ worktreePath, retentionHours }, `Scheduling worktree cleanup in ${retentionHours} hours`);
+        await createRetentionMarker(worktreePath, retentionHours);
+    }
+    return false;
 }
 
 async function createRetentionMarker(worktreePath: string, retentionHours: number): Promise<void> {

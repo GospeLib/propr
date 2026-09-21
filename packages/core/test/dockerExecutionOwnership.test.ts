@@ -12,7 +12,20 @@ await mock.module('../src/claude/docker/dockerContainerControl.js', {
 
 const { abortSpawnedExecution } = await import('../src/claude/docker/dockerExecutionOwnership.js');
 
+test('all abort paths inherit terminal-retention policy from the shared execution state', async () => {
+    teardownDockerExecution.mock.resetCalls();
+    const child = Object.assign(new EventEmitter(), { exitCode: 0, signalCode: null, kill: mock.fn(() => true) }) as unknown as ChildProcess;
+    await abortSpawnedExecution(child, { aborted: { value: false }, containerId: { value: 'owned' },
+        teardownPromise: null, preserveTerminalEvidence: true }, {
+        namedContainer: 'owned', scheduleForceKill: mock.fn(), taskId: 'task', attemptGeneration: 'generation',
+    });
+    assert.ok(teardownDockerExecution.mock.calls.length > 0);
+    for (const call of teardownDockerExecution.mock.calls)
+        assert.equal(call.arguments[0].preserveTerminalEvidence, true);
+});
+
 test('runs a final generation-fenced teardown after fallback child termination', async () => {
+    teardownDockerExecution.mock.resetCalls();
     const kill = mock.fn(() => true);
     const scheduleForceKill = mock.fn();
     const childState = Object.assign(new EventEmitter(), {

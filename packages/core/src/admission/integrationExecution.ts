@@ -25,7 +25,12 @@ export async function mergeIntegrationHeads(clone:string,p:IntegrationPayload) {
 export async function validateCurrentIntegration(data: Pick<IntegrationJobData,'executionDigest'|'operationId'>, fetchImpl = fetch) {
   // Ezer's own base URL. Named EZER_OWNER_RELAY_BASE_URL until S28, when the owner-event relay
   // this shared a variable with was retired; the callback itself is unchanged.
-  const base = new URL(process.env.EZER_API_BASE_URL ?? '');
+  // PARSED INSIDE THE NAMED REFUSAL, not outside it. `new URL('')` throws a bare TypeError
+  // ("Invalid URL"), which is exactly what an operator who has not yet renamed the variable would
+  // see — a stack trace instead of the configuration error this already has a name for.
+  let base: URL;
+  try { base = new URL(process.env.EZER_API_BASE_URL ?? ''); }
+  catch { throw Error('INTEGRATION_CALLBACK_CONFIG_INVALID'); }
   if (base.username || base.password || !['http:','https:'].includes(base.protocol)) throw Error('INTEGRATION_CALLBACK_CONFIG_INVALID');
   const secret = process.env.EZER_INTERNAL_API_SECRET ?? '';
   if (Buffer.byteLength(secret) < 32) throw Error('INTEGRATION_CALLBACK_SECRET_REQUIRED');

@@ -23,7 +23,9 @@ export async function mergeIntegrationHeads(clone:string,p:IntegrationPayload) {
   return {git,worktree,headSha:(await git.revparse(['HEAD'])).trim()};
 }
 export async function validateCurrentIntegration(data: Pick<IntegrationJobData,'executionDigest'|'operationId'>, fetchImpl = fetch) {
-  const base = new URL(process.env.EZER_OWNER_RELAY_BASE_URL ?? '');
+  // Ezer's own base URL. Named EZER_OWNER_RELAY_BASE_URL until S28, when the owner-event relay
+  // this shared a variable with was retired; the callback itself is unchanged.
+  const base = new URL(process.env.EZER_API_BASE_URL ?? '');
   if (base.username || base.password || !['http:','https:'].includes(base.protocol)) throw Error('INTEGRATION_CALLBACK_CONFIG_INVALID');
   const secret = process.env.EZER_INTERNAL_API_SECRET ?? '';
   if (Buffer.byteLength(secret) < 32) throw Error('INTEGRATION_CALLBACK_SECRET_REQUIRED');

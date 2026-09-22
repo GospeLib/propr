@@ -4,8 +4,10 @@
  * `/ezer` is PUBLICLY REACHABLE: any GitHub user can post a comment containing it on any pull
  * request or issue in a watched repository, and the production slash-command parser aliases
  * `/ezer` to `/fix`. Two earlier fixes were installed at ONE call site each — first inside
- * `forwardRoutingOwnerEvent`, then keyed on "carries a comment body" — and both were reachable
- * around, because `forwardRoutingOwnerEvent` is invoked ONLY by `RoutingWebSocketIntakeService`.
+ * the relay's own forwarding, then keyed on "carries a comment body" — and both were reachable
+ * around, because that forwarding was invoked ONLY by `RoutingWebSocketIntakeService`. It was
+ * retired in S28 (Ezer receives GitHub's webhooks itself and hands ProPR the deliveries); the
+ * boundary this file tests is the one that survived it.
  * In `direct_webhook` mode the signed GitHub endpoint calls `processWebhookEvent` directly and
  * never touches that gate at all. GitHub's HMAC signature authenticates GitHub's DELIVERY, never
  * the comment's AUTHOR, so a valid signature proves nothing about authorization.
@@ -151,7 +153,6 @@ before(async () => {
     // DEFAULT admission configuration: the repository is NOT protected and no Ezer capability is
     // enabled. This is the configuration the bypass was reachable under.
     delete process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES;
-    delete process.env.EZER_OWNER_RELAY_ENABLED;
     delete process.env.EZER_OWNER_STOP_ENABLED;
     delete process.env.EZER_OWNER_PLAN_CONTROL_ENABLED;
     delete process.env.EZER_OWNER_PAUSE_ENABLED;

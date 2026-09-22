@@ -163,7 +163,6 @@ before(async () => {
     // DEFAULT admission configuration: the repository is NOT protected and no Ezer capability is
     // enabled. This is the configuration the bypass was reachable under.
     delete process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES;
-    delete process.env.EZER_OWNER_RELAY_ENABLED;
     delete process.env.EZER_OWNER_STOP_ENABLED;
     delete process.env.EZER_OWNER_PLAN_CONTROL_ENABLED;
     delete process.env.EZER_OWNER_PAUSE_ENABLED;
@@ -239,7 +238,12 @@ test('a hostile non-owner /ezer PR review comment never reaches the dispatcher a
         assert.equal(acks[0].status, EZER_NOT_OWNER_DISPOSITION.status);
         assert.equal(acks[0].reason, EZER_NOT_OWNER_DISPOSITION.reason);
         assert.deepEqual(acks[0].billing, { seatConsumed: false });
-        assert.deepEqual(dispatched, [], 'the /ezer text must never reach the ordinary comment dispatcher');
+        // REACHES the comment processor, and is refused by its FIRST decision. Until S28 the
+        // intake claimed `/ezer` on the way in, because it also relayed the owner's comments to
+        // Ezer; that carriage is retired (Ezer receives GitHub's webhooks itself), so the claim is
+        // made where it always had to be correct anyway — `claimEzerAddressedComment`, the first
+        // decision of `processCommentEvent`, which every intake mode reaches. What must be true is
+        // unchanged and is asserted below: terminal `user_not_allowed` ACK, and no job enqueued.
         assert.deepEqual(enqueuedJobs, [], 'no job may be enqueued by an unauthorized commenter');
 
         // An identical redelivery is re-ACKed with the same disposition and still reprocesses nothing.
@@ -251,7 +255,6 @@ test('a hostile non-owner /ezer PR review comment never reaches the dispatcher a
         assert.equal(redelivered.length, 2);
         assert.equal(redelivered[1].status, EZER_NOT_OWNER_DISPOSITION.status);
         assert.equal(redelivered[1].reason, EZER_NOT_OWNER_DISPOSITION.reason);
-        assert.deepEqual(dispatched, []);
         assert.deepEqual(enqueuedJobs, []);
     } finally {
         await service.stop();
@@ -280,7 +283,7 @@ test('the same hostile comment on every supported comment event type is refused 
             const acks = socket.acks();
             assert.equal(acks.length, 1, `${eventType}: exactly one ACK`);
             assert.equal(acks[0].reason, EZER_NOT_OWNER_DISPOSITION.reason, `${eventType}: refused as user_not_allowed`);
-            assert.deepEqual(dispatched, [], `${eventType}: never dispatched`);
+            // Refused inside the comment processor (see above); what matters is that nothing ran.
             assert.deepEqual(enqueuedJobs, [], `${eventType}: never enqueued`);
         } finally {
             await service.stop();

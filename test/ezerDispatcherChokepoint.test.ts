@@ -317,3 +317,39 @@ test('a caller cannot redefine the owner by supplying its own numeric id', async
     // Sanity: the same hostile comment is refused through the normal single-argument call too.
     assert.strictEqual(resolveOwnerEzerCommandBody({ body, user: hostileWithOwnClaimedId }), null);
 });
+
+/**
+ * WHAT PROTECTS THE OWNER'S OWN `/ezer` COMMANDS FROM BECOMING PROPR WORK.
+ *
+ * `/ezer` is Ezer's namespace, but for the owner this repo also aliases it to `/fix` — the test
+ * above pins that on purpose. Until S28 the WebSocket intake claimed every `/ezer` comment before
+ * the dispatcher could see it, so an owner command addressed to EZER never reached the alias on
+ * that path. That claim is gone (Ezer receives GitHub's webhooks itself and hands ProPR the
+ * deliveries), which leaves exactly one thing standing between an owner command to Ezer and a
+ * billable ProPR fix job: EZER_ADMISSION_PROTECTED_REPOSITORIES.
+ *
+ * So it is pinned here rather than left to a deployment nobody tests. Every repository Ezer
+ * drives MUST be listed, or `/ezer approve …` on a contract pull request enqueues a `/fix` job
+ * beside Ezer's own handling of the same comment.
+ */
+test('an owner /ezer command on a protected repository awaits Ezer admission instead of enqueuing a fix', async () => {
+    const saved = process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES;
+    process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES = 'testowner/testrepo';
+    try {
+        for (const body of [
+            '/ezer approve sha256:' + 'b'.repeat(64) + ' ' + 'a'.repeat(40),
+            '/ezer stop typed-work:item',
+            '/ezer retry EP-real-S01 2',
+        ]) {
+            enqueuedJobs.length = 0;
+            const disposition = await processCommentEvent(
+                issueComment(body, OWNER_USER) as never, 'issue_comment', 'chokepoint-protected', config());
+            assert.deepEqual(disposition, { status: 'ignored', reason: 'awaiting_ezer_comment_admission' },
+                `${body} must await Ezer admission`);
+            assert.deepEqual(enqueuedJobs, [], `${body} must enqueue nothing`);
+        }
+    } finally {
+        if (saved === undefined) delete process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES;
+        else process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES = saved;
+    }
+});

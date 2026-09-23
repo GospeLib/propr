@@ -109,12 +109,57 @@ function verifyWebhookSignature(req: Request, res: Response, webhookSecret: stri
 export interface WebhookHandlerDeps {
   webhookSecret: string | undefined;
   redis: {
-    set: (key: string, value: string, opts?: { NX?: boolean; EX?: number }) => Promise<string | null>;
+    set: (
+      key: string,
+      value: string,
+      opts?: { NX?: boolean; EX?: number; KEEPTTL?: boolean },
+    ) => Promise<string | null>;
+    /** Reads the delivery-dedup key's stored OUTCOME (see `WEBHOOK_DELIVERY_STATE_*`). */
+    get: (key: string) => Promise<string | null>;
   };
   processor: (payload: Record<string, unknown>, event: string, correlationId: string, deliveryId: string) => Promise<void>;
   correlationId: string;
   /** When provided, active PR tasks are automatically cancelled on merged PR close events. */
   mergedPRTaskCanceller?: MergedPRTaskCancellerDeps;
+}
+
+/**
+ * The delivery-dedup key's stored VALUE, not merely its presence.
+ *
+ * The key is reserved (NX) before this delivery's JSON is even parsed, and — see the "Failure
+ * semantics" note on `handleWebhookRequest` below — deliberately RETAINED however processing
+ * turns out, so a GitHub retry of a delivery whose first attempt may have partially applied is
+ * refused rather than reprocessed. That retention is correct; treating every key PRESENCE as
+ * "already succeeded" was not. A first attempt that answered 400 (malformed JSON) or 500
+ * (processor threw) still reserved the key, so a retry of THAT delivery also hit the NX check and
+ * got the same 409 a genuinely successful delivery gets — and, before this fix, the SAME
+ * duplicate-delivery marker, telling a caller (Ezer's webhook handoff) that a delivery ProPR
+ * never actually processed was "already processed = success". The stored value distinguishes the
+ * three states the key's lifetime can be in, so the marker header is set on exactly one of them.
+ */
+const WEBHOOK_DELIVERY_STATE_IN_PROGRESS = 'in-progress';
+const WEBHOOK_DELIVERY_STATE_COMPLETED = 'completed';
+const WEBHOOK_DELIVERY_STATE_FAILED = 'failed';
+
+/**
+ * Overwrites the delivery-dedup key's OUTCOME without touching its TTL or its reservation — the
+ * key itself is never deleted (see the retention rationale above). `KEEPTTL` is load-bearing: a
+ * plain `SET` with no expiration option makes the key persist forever, silently defeating
+ * `WEBHOOK_DELIVERY_TTL_SECONDS`. Logged and swallowed on failure rather than thrown: a Redis
+ * write that fails here must never mask the outcome (a parse failure, a processor error, or a
+ * genuine success) the caller already has to report.
+ */
+async function markDeliveryOutcome(
+  redis: WebhookHandlerDeps['redis'],
+  deliveryKey: string,
+  state: typeof WEBHOOK_DELIVERY_STATE_COMPLETED | typeof WEBHOOK_DELIVERY_STATE_FAILED,
+  deliveryId: string,
+): Promise<void> {
+  try {
+    await redis.set(deliveryKey, state, { KEEPTTL: true });
+  } catch (error) {
+    console.error('[webhook] Failed to record delivery outcome', { deliveryId, state, error });
+  }
 }
 
 /** Machine-readable cancellation reason recorded when tasks are stopped because their PR merged. */
@@ -262,7 +307,10 @@ export async function cancelActiveTasksForMergedPR(
  * Failure semantics: once a delivery ID is reserved in Redis, it is NOT
  * removed on downstream processing errors. This prevents a partially-
  * processed webhook from being re-accepted on a GitHub retry, which could
- * re-trigger side effects. Downstream consumers must be idempotent.
+ * re-trigger side effects. Downstream consumers must be idempotent. The key's
+ * stored VALUE (`WEBHOOK_DELIVERY_STATE_*`) does change with the outcome, so
+ * that a retry's 409 carries `WEBHOOK_DUPLICATE_DELIVERY_HEADER` only when
+ * the first attempt actually completed — never merely because the key exists.
  */
 export async function handleWebhookRequest(
   req: Request,
@@ -301,21 +349,38 @@ export async function handleWebhookRequest(
 
   // --- Replay protection: reject duplicate delivery IDs via Redis NX ---
   const deliveryKey = `webhook:delivery:${rawDeliveryId}`;
-  const isNew = await redis.set(deliveryKey, '1', { NX: true, EX: WEBHOOK_DELIVERY_TTL_SECONDS });
+  const isNew = await redis.set(deliveryKey, WEBHOOK_DELIVERY_STATE_IN_PROGRESS, {
+    NX: true,
+    EX: WEBHOOK_DELIVERY_TTL_SECONDS,
+  });
   if (!isNew) {
-    console.warn(`[webhook] Duplicate delivery rejected: ${rawDeliveryId}`);
-    res.set(WEBHOOK_DUPLICATE_DELIVERY_HEADER, WEBHOOK_DUPLICATE_DELIVERY_OUTCOME);
+    // The marker (`WEBHOOK_DUPLICATE_DELIVERY_HEADER`) says "already processed = success" to a
+    // caller like Ezer's webhook handoff, so it is set ONLY when this delivery's first attempt
+    // actually reached that outcome — never merely because the dedup key exists. A first attempt
+    // that is still running, or that already failed (400/500), left the key at `IN_PROGRESS` or
+    // `FAILED`; either one answers 409 WITHOUT the marker, which correctly tells the caller this
+    // is a refusal, not a success it can treat as done.
+    const outcome = await redis.get(deliveryKey);
+    console.warn(`[webhook] Duplicate delivery rejected: ${rawDeliveryId} (recorded outcome: ${outcome ?? 'expired'})`);
+    if (outcome === WEBHOOK_DELIVERY_STATE_COMPLETED) {
+      res.set(WEBHOOK_DUPLICATE_DELIVERY_HEADER, WEBHOOK_DUPLICATE_DELIVERY_OUTCOME);
+    }
     res.status(409).send('Duplicate webhook delivery.');
     return;
   }
 
-  // The delivery ID remains reserved in Redis regardless of processing outcome.
-  // This is intentional — see the JSDoc above for rationale.
+  // The delivery ID remains reserved in Redis regardless of processing outcome — the key is
+  // never deleted. This is intentional: a first attempt that answered 400/500 may have partially
+  // applied its side effects, and a GitHub retry must be refused (above) rather than reprocessed.
+  // What CAN and does change is the value the key holds — `IN_PROGRESS` until this attempt
+  // reaches a terminal outcome, then `COMPLETED` or `FAILED` — which is what the duplicate check
+  // above reads to decide whether a retry's 409 carries the "already succeeded" marker.
   let payload: { action?: string; repository?: { full_name?: string }; [key: string]: unknown };
   try {
     payload = JSON.parse(req.body.toString());
   } catch {
     console.error(`[webhook] Failed to parse JSON body for delivery ${rawDeliveryId}`);
+    await markDeliveryOutcome(redis, deliveryKey, WEBHOOK_DELIVERY_STATE_FAILED, rawDeliveryId);
     res.status(400).send('Invalid JSON payload.');
     return;
   }
@@ -362,7 +427,13 @@ export async function handleWebhookRequest(
     }
   }
 
-  await processor(payload, rawEvent, correlationId, rawDeliveryId);
+  try {
+    await processor(payload, rawEvent, correlationId, rawDeliveryId);
+  } catch (error) {
+    await markDeliveryOutcome(redis, deliveryKey, WEBHOOK_DELIVERY_STATE_FAILED, rawDeliveryId);
+    throw error;
+  }
+  await markDeliveryOutcome(redis, deliveryKey, WEBHOOK_DELIVERY_STATE_COMPLETED, rawDeliveryId);
 
   res.status(200).send('Webhook processed.');
 }

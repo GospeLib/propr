@@ -48,13 +48,16 @@ function createMockRedisClient() {
   const store = new Map<string, StoredEntry>();
   return {
     store,
-    set: async (key: string, value: string, opts?: { NX?: boolean; EX?: number }) => {
+    set: async (key: string, value: string, opts?: { NX?: boolean; EX?: number; KEEPTTL?: boolean }) => {
       if (opts?.NX && store.has(key)) {
         return null;
       }
-      store.set(key, { value, ex: opts?.EX });
+      const previous = store.get(key);
+      const ex = opts?.KEEPTTL ? previous?.ex : opts?.EX;
+      store.set(key, { value, ex });
       return 'OK';
     },
+    get: async (key: string) => store.get(key)?.value ?? null,
   };
 }
 
@@ -270,6 +273,14 @@ describe('Webhook Replay Protection', () => {
           'x-github-event': 'issues',
         });
         assert.strictEqual(retry.status, 409, 'retry after failure must be rejected as duplicate');
+        // Codex round-3 P1: the first attempt never completed, so this 409 must NOT carry the
+        // "already processed = success" marker — a caller (Ezer's webhook handoff) that reads it
+        // as success would be wrong about a delivery ProPR never actually processed.
+        assert.strictEqual(
+          retry.headers[WEBHOOK_DUPLICATE_DELIVERY_HEADER.toLowerCase()],
+          undefined,
+          'a 409 for a delivery whose first attempt failed must not carry the duplicate-delivery marker',
+        );
       } finally {
         await new Promise<void>((resolve) => failServer.close(() => resolve()));
       }
@@ -311,8 +322,71 @@ describe('Webhook Replay Protection', () => {
         assert.strictEqual(result.status, 400);
         assert.strictEqual(result.body, 'Invalid JSON payload.');
         assert.ok(parseRedis.store.has(`webhook:delivery:${deliveryId}`), 'delivery key must be retained after parse failure to block duplicate processing');
+
+        // Codex round-3 P1: a redelivery of a payload that never even parsed must not be told
+        // "already processed = success" either.
+        const retry = await sendWebhook(parseServer, body, {
+          'x-hub-signature-256': signPayload(body, WEBHOOK_SECRET),
+          'x-github-delivery': deliveryId,
+          'x-github-event': 'issues',
+        });
+        assert.strictEqual(retry.status, 409);
+        assert.strictEqual(
+          retry.headers[WEBHOOK_DUPLICATE_DELIVERY_HEADER.toLowerCase()],
+          undefined,
+          'a 409 for a delivery whose first attempt never parsed must not carry the duplicate-delivery marker',
+        );
       } finally {
         await new Promise<void>((resolve) => parseServer.close(() => resolve()));
+      }
+    });
+
+    test('a delivery still IN PROGRESS is rejected without the marker, not treated as a duplicate success', async () => {
+      const inProgressRedis = createMockRedisClient();
+      let releaseFirstAttempt: (() => void) | undefined;
+      let resolveStarted: (() => void) | undefined;
+      const firstAttemptStarted = new Promise<void>((resolve) => { resolveStarted = resolve; });
+      const inProgressApp = createTestApp(inProgressRedis, async () => {
+        resolveStarted?.();
+        await new Promise<void>((resolve) => { releaseFirstAttempt = resolve; });
+      });
+      const inProgressServer = inProgressApp.listen(0);
+      await new Promise<void>((resolve) => inProgressServer.on('listening', resolve));
+
+      try {
+        const body = makeBody();
+        const deliveryId = 'delivery-still-in-progress';
+        const headers = {
+          'x-hub-signature-256': signPayload(body, WEBHOOK_SECRET),
+          'x-github-delivery': deliveryId,
+          'x-github-event': 'issues',
+        };
+
+        const firstAttempt = sendWebhook(inProgressServer, body, headers);
+        await firstAttemptStarted;
+
+        // The first attempt has reserved the key but not yet completed — a concurrent redelivery
+        // must see IN_PROGRESS, not COMPLETED, and must not carry the "already succeeded" marker.
+        // `releaseFirstAttempt` runs in a nested `finally` BEFORE any assertion: an assertion
+        // failure here must not leave the first attempt's connection open forever — that would
+        // hang `inProgressServer.close()` below and the whole suite with it, which is exactly what
+        // happened the one time this assertion failed during falsification.
+        let concurrentRetry: Awaited<ReturnType<typeof sendWebhook>>;
+        try {
+          concurrentRetry = await sendWebhook(inProgressServer, body, headers);
+        } finally {
+          releaseFirstAttempt?.();
+        }
+        const first = await firstAttempt;
+        assert.strictEqual(first.status, 200);
+        assert.strictEqual(concurrentRetry.status, 409);
+        assert.strictEqual(
+          concurrentRetry.headers[WEBHOOK_DUPLICATE_DELIVERY_HEADER.toLowerCase()],
+          undefined,
+          'a 409 for a delivery still being processed must not carry the duplicate-delivery marker',
+        );
+      } finally {
+        await new Promise<void>((resolve) => inProgressServer.close(() => resolve()));
       }
     });
   });
@@ -616,6 +690,42 @@ describe('Webhook Replay Protection', () => {
 
       const second = await adapter.set('webhook:delivery:dup', '1', { NX: true, EX: 300 });
       assert.strictEqual(second, null, 'NX must return null for existing key');
+    });
+
+    // The exact adapter from server.ts, including KEEPTTL/get: catches a mismatch between the
+    // handler's interface and node-redis's API for the outcome-marking calls this fix adds.
+    test('adapter reshapes KEEPTTL and passes GET through, the same shapes server.ts uses', async () => {
+      const calls: Array<{ key: string; value: string; opts: Record<string, unknown> }> = [];
+      const store = new Map<string, string>();
+      const fakeNodeRedisClient = {
+        set: async (key: string, value: string, opts?: Record<string, unknown>) => {
+          calls.push({ key, value, opts: opts ?? {} });
+          store.set(key, value);
+          return 'OK' as string | null;
+        },
+        get: async (key: string) => store.get(key) ?? null,
+      };
+
+      const adapter = {
+        set: (key: string, value: string, opts?: { NX?: boolean; EX?: number; KEEPTTL?: boolean }) => {
+          if (opts) {
+            return fakeNodeRedisClient.set(key, value, {
+              ...(opts.NX ? { NX: true as const } : {}),
+              ...(opts.EX != null ? { EX: opts.EX } : {}),
+              ...(opts.KEEPTTL ? { KEEPTTL: true as const } : {}),
+            }) as Promise<string | null>;
+          }
+          return fakeNodeRedisClient.set(key, value) as Promise<string | null>;
+        },
+        get: (key: string) => fakeNodeRedisClient.get(key) as Promise<string | null>,
+      };
+
+      await adapter.set('webhook:delivery:outcome-test', 'in-progress', { NX: true, EX: 300 });
+      await adapter.set('webhook:delivery:outcome-test', 'completed', { KEEPTTL: true });
+
+      assert.deepStrictEqual(calls[1].opts, { KEEPTTL: true });
+      assert.strictEqual(await adapter.get('webhook:delivery:outcome-test'), 'completed');
+      assert.strictEqual(await adapter.get('webhook:delivery:missing'), null);
     });
   });
 

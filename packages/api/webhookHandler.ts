@@ -25,6 +25,17 @@ function parsePositiveIntEnv(name: string, fallback: number): number {
 export const WEBHOOK_DELIVERY_TTL_SECONDS: number = parsePositiveIntEnv('WEBHOOK_DELIVERY_TTL_SECONDS', DEFAULT_DELIVERY_TTL_SECONDS);
 
 /**
+ * Machine-readable marker for the duplicate-delivery 409, so a caller can tell it apart from
+ * every other 409 this handler can answer (e.g. a conflicting write elsewhere in the stack)
+ * without parsing the human-readable body text below. The body sentence stays — it is what an
+ * operator reads in logs — but it is prose, not a contract, and a consumer that keyed off it
+ * (Ezer's webhook handoff did) would break the moment the sentence was reworded. This header is
+ * the contract instead: set on exactly the duplicate-delivery response, nothing else.
+ */
+export const WEBHOOK_DUPLICATE_DELIVERY_HEADER = 'X-ProPR-Webhook-Outcome';
+export const WEBHOOK_DUPLICATE_DELIVERY_OUTCOME = 'duplicate-delivery';
+
+/**
  * NOTE: Payload-timestamp–based staleness detection was intentionally removed.
  *
  * GitHub webhook payloads do not include a signed delivery timestamp. Fields
@@ -293,6 +304,7 @@ export async function handleWebhookRequest(
   const isNew = await redis.set(deliveryKey, '1', { NX: true, EX: WEBHOOK_DELIVERY_TTL_SECONDS });
   if (!isNew) {
     console.warn(`[webhook] Duplicate delivery rejected: ${rawDeliveryId}`);
+    res.set(WEBHOOK_DUPLICATE_DELIVERY_HEADER, WEBHOOK_DUPLICATE_DELIVERY_OUTCOME);
     res.status(409).send('Duplicate webhook delivery.');
     return;
   }

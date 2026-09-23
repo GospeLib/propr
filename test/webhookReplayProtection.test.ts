@@ -3,7 +3,12 @@ import assert from 'node:assert';
 import crypto from 'crypto';
 import http from 'node:http';
 import express, { Request, Response } from 'express';
-import { handleWebhookRequest, WEBHOOK_DELIVERY_TTL_SECONDS } from '../packages/api/webhookHandler.js';
+import {
+  handleWebhookRequest,
+  WEBHOOK_DELIVERY_TTL_SECONDS,
+  WEBHOOK_DUPLICATE_DELIVERY_HEADER,
+  WEBHOOK_DUPLICATE_DELIVERY_OUTCOME,
+} from '../packages/api/webhookHandler.js';
 import { closeConnection } from '@propr/core';
 
 after(async () => {
@@ -101,7 +106,7 @@ function sendWebhook(
   server: http.Server,
   body: string,
   headers: Record<string, string | string[]>,
-): Promise<{ status: number; body: string }> {
+): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const addr = server.address() as { port: number };
     const req = http.request(
@@ -109,7 +114,7 @@ function sendWebhook(
       (res) => {
         let data = '';
         res.on('data', (chunk) => (data += chunk));
-        res.on('end', () => resolve({ status: res.statusCode!, body: data }));
+        res.on('end', () => resolve({ status: res.statusCode!, body: data, headers: res.headers }));
       },
     );
     req.on('error', reject);
@@ -186,6 +191,12 @@ describe('Webhook Replay Protection', () => {
       });
       assert.strictEqual(second.status, 409);
       assert.match(second.body, /Duplicate webhook delivery/);
+      // The machine-readable marker a caller (Ezer's webhook handoff) checks instead of parsing
+      // this English sentence. Case-insensitive per HTTP, so match loosely on the header name.
+      assert.strictEqual(
+        second.headers[WEBHOOK_DUPLICATE_DELIVERY_HEADER.toLowerCase()],
+        WEBHOOK_DUPLICATE_DELIVERY_OUTCOME,
+      );
     });
 
     test('accepts different delivery IDs with same body', async () => {
@@ -467,6 +478,49 @@ describe('Webhook Replay Protection', () => {
         'x-github-event': 'issues',
       });
       assert.strictEqual(forwarded.status, 200, 'forwarded delivery with fwd- prefix must not collide with original');
+    });
+  });
+
+  describe('Duplicate-delivery header is exclusive to the duplicate-delivery 409', () => {
+    test('is absent from a 400 (missing delivery header)', async () => {
+      const body = makeBody();
+      const res = await sendWebhook(server, body, {
+        'x-hub-signature-256': signPayload(body, WEBHOOK_SECRET),
+      });
+      assert.strictEqual(res.status, 400);
+      assert.strictEqual(res.headers[WEBHOOK_DUPLICATE_DELIVERY_HEADER.toLowerCase()], undefined);
+    });
+
+    test('is absent from a 401 (signature mismatch)', async () => {
+      const body = makeBody();
+      const res = await sendWebhook(server, body, {
+        'x-hub-signature-256': 'sha256=0000000000000000000000000000000000000000000000000000000000000000',
+        'x-github-delivery': 'delivery-marker-check-401',
+        'x-github-event': 'issues',
+      });
+      assert.strictEqual(res.status, 401);
+      assert.strictEqual(res.headers[WEBHOOK_DUPLICATE_DELIVERY_HEADER.toLowerCase()], undefined);
+    });
+
+    test('is absent from a 500 (a still-reserved delivery that failed processing, not a duplicate)', async () => {
+      const failRedis = createMockRedisClient();
+      const failApp = createTestApp(failRedis, async () => {
+        throw new Error('Simulated processing failure');
+      });
+      const failServer = failApp.listen(0);
+      await new Promise<void>((resolve) => failServer.on('listening', resolve));
+      try {
+        const body = makeBody();
+        const res = await sendWebhook(failServer, body, {
+          'x-hub-signature-256': signPayload(body, WEBHOOK_SECRET),
+          'x-github-delivery': 'delivery-marker-check-500',
+          'x-github-event': 'issues',
+        });
+        assert.strictEqual(res.status, 500);
+        assert.strictEqual(res.headers[WEBHOOK_DUPLICATE_DELIVERY_HEADER.toLowerCase()], undefined);
+      } finally {
+        await new Promise<void>((resolve) => failServer.close(() => resolve()));
+      }
     });
   });
 

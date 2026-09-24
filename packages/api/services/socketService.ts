@@ -22,6 +22,7 @@ import {
 import { QueueBroadcaster } from './queueBroadcaster.js';
 import { TaskWatcherManager } from './taskWatcher.js';
 import { EzerStreamingService, EZER_REDIS_CHANNEL } from '../ep-ezer-follow-ups-s02.js';
+import { EzerControlService, createEzerExecutionControl } from '../routes/ep-ezer-follow-ups-s03.js';
 import {
   configureSocketAuthentication,
   type SocketAuthenticationOptions,
@@ -119,6 +120,9 @@ export class SocketService {
   private draftUpdateTails = new Map<string, Promise<void>>();
   private notificationProjection: NotificationProjectionService | null = null;
   private ezerStreaming = new EzerStreamingService();
+  // EP-ezer-follow-ups-S03: control commands project their acks and
+  // confirmations onto the same operation stream the progress events use.
+  private ezerControl = new EzerControlService({ stream: this.ezerStreaming });
 
   constructor(
     httpServer: HttpServer,
@@ -171,6 +175,8 @@ export class SocketService {
     this.queueBroadcaster.init();
     this.notificationProjection = deps.notificationProjection ?? null;
     this.notificationProjection?.startStalledDetector();
+    // EP-ezer-follow-ups-S03: bind the control plane to the real execution fence.
+    this.ezerControl.setPort(createEzerExecutionControl(deps.redisClient));
     console.log('[SocketService] Queue features initialized');
   }
 
@@ -393,6 +399,11 @@ export class SocketService {
   /** Get the Ezer journal-projection stream (EP-ezer-follow-ups-S02). */
   getEzerStreaming(): EzerStreamingService {
     return this.ezerStreaming;
+  }
+
+  /** Get the Ezer control plane (EP-ezer-follow-ups-S03). */
+  getEzerControl(): EzerControlService {
+    return this.ezerControl;
   }
 
   /** Get the number of connected clients */

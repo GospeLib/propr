@@ -9,7 +9,7 @@ import { Redis, RedisOptions } from 'ioredis';
 import { authenticateSocketRequest, setupAuth, ensureAuthenticated } from './auth.js';
 import { configureDemoMode, createDemoRedisClient, demoModeReadOnlyMiddleware } from './demoMode.js';
 import { resolveGithubAuthMode, resolveGithubEventIntakeMode, validateIntakeModePrerequisites } from '@propr/shared';
-import { initSocketService, closeSocketService } from './services/socketService.js';
+import { initSocketService, closeSocketService, getSocketService } from './services/socketService.js';
 import { corsRejectionHandler, createCorsOriginValidator } from './corsValidation.js';
 import {
   createStatusRoutes, createTaskRoutes,
@@ -33,6 +33,7 @@ import {
   createAdminRoutes,
   createVisualPreviewAuthRoutes,
   createInstanceCatalogRoutes,
+  createEzerControlRoutes,
   attachmentUpload
 } from './routes/index.js';
 import { agentLoginSessionManager } from './services/agentLoginSessionManager.js';
@@ -284,6 +285,16 @@ function setupRoutes(): void {
   const visualPreviewAuthRoutes = createVisualPreviewAuthRoutes();
   const instanceCatalogRoutes = createInstanceCatalogRoutes();
   const agentVersionRoutes = createAgentVersionRoutes();
+  // EP-ezer-follow-ups-S03. The control plane and its authorization both live
+  // on the socket service, which is initialized after setupRoutes(), so both
+  // are resolved per request rather than captured here.
+  const ezerControlRoutes = createEzerControlRoutes({
+    getService: () => getSocketService()?.getEzerControl() ?? null,
+    authorize: async (operationId, principal) => {
+      const streaming = getSocketService()?.getEzerStreaming();
+      return streaming ? await streaming.authorizeSubscription(operationId, principal) : false;
+    },
+  });
 
   const operationalRoutes: RouteEntry[] = [
     ['get', '/api/status', statusRoutes.getStatus], ['get', '/api/tasks', taskRoutes.getTasks], ['get', '/api/tasks/revert-preview', taskRoutes.getRevertPreview], ['post', '/api/tasks/revert', taskRoutes.revertChanges],
@@ -308,6 +319,7 @@ function setupRoutes(): void {
     ['put', '/api/repos/todos/:todoId', repoTodoRoutes.updateTodo], ['delete', '/api/repos/todos/:todoId', repoTodoRoutes.deleteTodo], ['post', '/api/repos/todos/reorder', repoTodoRoutes.reorderTodos], ['get', '/api/user/repo-preferences', userRepoPreferencesRoutes.getRepoPreferences],
     ['post', '/api/user/repo-preferences', userRepoPreferencesRoutes.updateRepoPreferences], ['get', '/api/notifications', notificationRoutes.getNotifications], ['get', '/api/notifications/unread-count', notificationRoutes.getUnreadCount], ['get', '/api/notifications/config', notificationRoutes.getConfiguration], ['get', '/api/notifications/capabilities', notificationRoutes.getCapabilities],
     ['get', '/api/notifications/preferences', notificationRoutes.getPreferences], ['patch', '/api/notifications/preferences', notificationRoutes.updatePreferences], ['get', '/api/notifications/push-subscriptions', notificationRoutes.listPushSubscriptions], ['post', '/api/notifications/push-subscriptions', notificationRoutes.createPushSubscription], ['delete', '/api/notifications/push-subscriptions', notificationRoutes.revokePushSubscription], ['delete', '/api/notifications/push-subscriptions/:subscriptionId', notificationRoutes.revokePushSubscriptionById], ['post', '/api/notifications/dismiss-all', notificationRoutes.dismissAll], ['post', '/api/notifications/:id/read', notificationRoutes.markRead], ['post', '/api/notifications/:id/dismiss', notificationRoutes.dismiss],
+    ['post', '/api/ezer/operations/:operationId/control', ezerControlRoutes.postControl], ['get', '/api/ezer/operations/:operationId/control/:commandId', ezerControlRoutes.getControlCommand], ['get', '/api/ezer/operations/:operationId/steer', ezerControlRoutes.getSteerRevisions],
   ];
   const routes = [
     ...operationalRoutes,

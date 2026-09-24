@@ -240,6 +240,28 @@ export { buildPlannerAbortSignalKey, executeDockerCommand, findRunningDockerCont
 export type { RunningTaskContainer } from './claude/docker/dockerExecutor.js';
 export { cleanupUnusedAgentImages, listAgentImages } from './claude/docker/dockerImageManager.js';
 export type { VersionedImageBuildResult } from './claude/docker/dockerExecutor.js';
+// EP-ezer-follow-ups-S03: control propagation over the execution ownership fence.
+export { ExecutionControlRegistry, ATTEMPT_CESSATION_CONFIRMATION_MS } from './claude/docker/ep-ezer-follow-ups-s03.js';
+export type {
+    AttemptCancellationOutcome,
+    AttemptCancellationResult,
+    AttemptCessationEvidence,
+    AttemptControlRefusal,
+    AttemptPauseCapability,
+    AttemptPauseOutcome,
+    AttemptPauseResult,
+    AttemptRefusalReason,
+    AttemptResumeOutcome,
+    AttemptResumeResult,
+    AttemptSteerDelivery,
+    AttemptSteerOutcome,
+    AttemptSteerResult,
+    AttemptStatus,
+    ControlledAttemptRegistration,
+    ExecutionControlRegistryOptions,
+} from './claude/docker/ep-ezer-follow-ups-s03.js';
+export { observeExecutionContainers, pauseDockerContainer, unpauseDockerContainer } from './claude/docker/dockerContainerControl.js';
+export type { ContainerSuspensionResult, ExecutionContainerObservation } from './claude/docker/dockerContainerControl.js';
 export {
     AGENT_RUNTIME_BUILD_QUEUE_NAME,
     buildAgentRuntimePackageProfile,

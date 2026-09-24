@@ -270,6 +270,21 @@ export class EzerStreamingService {
     if (execution && execution.admittedAttemptId === attemptId) execution.completed = true;
   }
 
+  /** Last journal cursor projected for an operation, if any. */
+  getLastCursor(operationId: string): string | null { return this.operations.get(operationId)?.lastCursor ?? null; }
+
+  /**
+   * Deliver a projection-level envelope — a heartbeat, or an S03 control
+   * acknowledgement/confirmation — to an operation's live subscribers. These
+   * carry no new journal cursor and are never part of replay, so the journal
+   * remains the sole delivery/replay authority.
+   */
+  broadcastProjection(operationId: string, envelope: EzerEventEnvelope): void {
+    for (const subscriber of this.operations.get(operationId)?.subscribers.values() ?? []) {
+      if (!subscriber.replaying) this.send(subscriber, EZER_STREAM_EVENT, envelope);
+    }
+  }
+
   async operationExists(operationId: string): Promise<boolean> {
     if (this.operations.has(operationId)) return true;
     if (!this.journal?.hasOperation) return false;
@@ -483,9 +498,7 @@ export class EzerStreamingService {
       summary: `No progress observed for ${elapsedMs}ms; the operation is still pending.`,
       diagnosticId: `hb-${operation.operationId}-${operation.heartbeatSeq}`,
     };
-    for (const subscriber of operation.subscribers.values()) {
-      if (!subscriber.replaying) this.send(subscriber, EZER_STREAM_EVENT, heartbeat);
-    }
+    this.broadcastProjection(operation.operationId, heartbeat);
     operation.lastActivityAt = this.now();
     this.armHeartbeat(operation);
   }

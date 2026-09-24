@@ -231,6 +231,118 @@ export async function teardownDockerExecution(
     await retryExecutionContainerRemoval(options, attempts, retryDelayMs, deadline);
 }
 
+/** Result of a container-level suspend/resume request. */
+export interface ContainerSuspensionResult {
+    success: boolean;
+    /** The container was already in the requested state. */
+    alreadyInState?: boolean;
+    /** The container no longer exists, so nothing was suspended. */
+    missing?: boolean;
+    error?: string;
+}
+
+async function runContainerStateChange(
+    action: 'pause' | 'unpause',
+    containerId: string,
+): Promise<ContainerSuspensionResult> {
+    if (!containerId || !CONTAINER_IDENTIFIER_PATTERN.test(containerId)) {
+        return { success: false, error: 'Invalid Docker container identifier' };
+    }
+    try {
+        await runDocker([action, containerId], 10000);
+        return { success: true };
+    } catch (error) {
+        const message = (error as Error).message;
+        if (message.includes('No such container') || message.includes('No such object')) {
+            return { success: false, missing: true, error: message };
+        }
+        // Docker reports an already-frozen/already-thawed container as an
+        // error; the requested state still holds, so this is not a failure.
+        if (/is already paused|is not paused/i.test(message)) {
+            return { success: true, alreadyInState: true };
+        }
+        return { success: false, error: message };
+    }
+}
+
+/**
+ * Freezes every process in a container using the cgroup freezer without
+ * stopping it, so the execution is genuinely suspended rather than terminated.
+ */
+export function pauseDockerContainer(containerId: string): Promise<ContainerSuspensionResult> {
+    return runContainerStateChange('pause', containerId);
+}
+
+/** Thaws a container previously frozen by {@link pauseDockerContainer}. */
+export function unpauseDockerContainer(containerId: string): Promise<ContainerSuspensionResult> {
+    return runContainerStateChange('unpause', containerId);
+}
+
+export interface ExecutionContainerObservation {
+    /** True when the Docker daemon answered; false when the state is unknown. */
+    observed: boolean;
+    /** Container identifiers still present for the attempt. */
+    present: string[];
+    error?: string;
+}
+
+async function observeContainerPresence(
+    reference: string,
+    timeoutMs: number,
+): Promise<'present' | 'absent' | 'unknown'> {
+    if (!CONTAINER_IDENTIFIER_PATTERN.test(reference)) return 'absent';
+    try {
+        await runDocker(['inspect', '--type', 'container', '--format', '{{.Id}}', reference], timeoutMs);
+        return 'present';
+    } catch (error) {
+        return /No such (?:container|object)/i.test((error as Error).message) ? 'absent' : 'unknown';
+    }
+}
+
+/**
+ * Observes which containers an execution attempt still owns. An empty
+ * `present` list together with `observed: true` is the only evidence that lets
+ * a caller report the attempt as actually stopped; when the daemon cannot be
+ * queried the state is unknown and must be reported as still running.
+ */
+export async function observeExecutionContainers(
+    options: DockerExecutionTeardownOptions,
+    timeoutMs = 2000,
+): Promise<ExecutionContainerObservation> {
+    const budgetMs = Math.max(100, Math.min(MAX_TEARDOWN_DEADLINE_MS, timeoutMs));
+    if (options.taskId && options.attemptGeneration) {
+        try {
+            const output = await runDocker([
+                'ps', '-aq',
+                '--filter', `label=propr.task.id=${options.taskId}`,
+                '--filter', `label=propr.task.attempt-generation=${options.attemptGeneration}`,
+            ], budgetMs);
+            return {
+                observed: true,
+                present: output.split('\n').map(value => value.trim()).filter(Boolean),
+            };
+        } catch (error) {
+            return { observed: false, present: [], error: (error as Error).message };
+        }
+    }
+    const references = [options.containerId, options.containerName].filter((value): value is string => Boolean(value));
+    if (references.length === 0) {
+        // Nothing identifies the attempt's containers, so their state was not
+        // observed. Reporting `observed: true` here would let a caller claim a
+        // stop it never witnessed.
+        return { observed: false, present: [], error: 'No container identifiers available for this execution' };
+    }
+    const present: string[] = [];
+    for (const reference of references) {
+        const presence = await observeContainerPresence(reference, budgetMs);
+        if (presence === 'unknown') {
+            return { observed: false, present: [], error: `Container state unavailable for ${reference}` };
+        }
+        if (presence === 'present') present.push(reference);
+    }
+    return { observed: true, present };
+}
+
 /** Gracefully stops a Docker container, then force-kills it when necessary. */
 export async function stopDockerContainer(
     containerId: string,

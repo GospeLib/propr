@@ -10,7 +10,8 @@ import { Redis, RedisOptions } from 'ioredis';
 import { authenticateSocketRequest, setupAuth, ensureAuthenticated } from './auth.js';
 import { configureDemoMode, createDemoRedisClient, demoModeReadOnlyMiddleware } from './demoMode.js';
 import { resolveGithubAuthMode, resolveGithubEventIntakeMode, validateIntakeModePrerequisites } from '@propr/shared';
-import { initSocketService, closeSocketService } from './services/socketService.js';
+import { initSocketService, closeSocketService, getSocketService } from './services/socketService.js';
+import { createEzerControlRoutes } from './routes/ep-ezer-follow-ups-s03.js';
 import { corsRejectionHandler, createCorsOriginValidator } from './corsValidation.js';
 import {
   createStatusRoutes, createTaskRoutes,
@@ -285,6 +286,12 @@ function setupRoutes(): void {
   const visualPreviewAuthRoutes = createVisualPreviewAuthRoutes();
   const instanceCatalogRoutes = createInstanceCatalogRoutes();
   const agentVersionRoutes = createAgentVersionRoutes();
+  // EP-ezer-follow-ups-S03: the control plane reads the live Ezer projection
+  // from the socket service, which is initialised after routes are registered.
+  const ezerControlRoutes = createEzerControlRoutes({
+    redisClient,
+    getStreaming: () => getSocketService()?.getEzerStreaming() ?? null,
+  });
 
   const operationalRoutes: RouteEntry[] = [
     ['post', '/api/tasks/integration', postEzerIntegration], ['get', '/api/tasks/integration/:digest', getEzerIntegration],
@@ -310,6 +317,7 @@ function setupRoutes(): void {
     ['put', '/api/repos/todos/:todoId', repoTodoRoutes.updateTodo], ['delete', '/api/repos/todos/:todoId', repoTodoRoutes.deleteTodo], ['post', '/api/repos/todos/reorder', repoTodoRoutes.reorderTodos], ['get', '/api/user/repo-preferences', userRepoPreferencesRoutes.getRepoPreferences],
     ['post', '/api/user/repo-preferences', userRepoPreferencesRoutes.updateRepoPreferences], ['get', '/api/notifications', notificationRoutes.getNotifications], ['get', '/api/notifications/unread-count', notificationRoutes.getUnreadCount], ['get', '/api/notifications/config', notificationRoutes.getConfiguration], ['get', '/api/notifications/capabilities', notificationRoutes.getCapabilities],
     ['get', '/api/notifications/preferences', notificationRoutes.getPreferences], ['patch', '/api/notifications/preferences', notificationRoutes.updatePreferences], ['get', '/api/notifications/push-subscriptions', notificationRoutes.listPushSubscriptions], ['post', '/api/notifications/push-subscriptions', notificationRoutes.createPushSubscription], ['delete', '/api/notifications/push-subscriptions', notificationRoutes.revokePushSubscription], ['delete', '/api/notifications/push-subscriptions/:subscriptionId', notificationRoutes.revokePushSubscriptionById], ['post', '/api/notifications/dismiss-all', notificationRoutes.dismissAll], ['post', '/api/notifications/:id/read', notificationRoutes.markRead], ['post', '/api/notifications/:id/dismiss', notificationRoutes.dismiss],
+    ['post', '/api/ezer/operations/:operationId/control', ezerControlRoutes.postControl], ['get', '/api/ezer/operations/:operationId/control', ezerControlRoutes.getControlState],
   ];
   const routes = [
     ...operationalRoutes,

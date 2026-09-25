@@ -1,3 +1,6 @@
+/* eslint-disable max-lines -- one projection owns the operation/attempt state,
+   so S03's control-event publication and attempt lookups belong on it rather
+   than in a second module that would become a competing source of truth. */
 /**
  * EP-ezer-follow-ups-S02 — Real incremental progress streaming (REQ-EF17).
  *
@@ -94,6 +97,33 @@ export interface EzerDropRecord { reason: EzerDropReason; operationId?: string; 
 export interface EzerSubscriptionPrincipal { user: { id: string }; authorization: { permissions: string[] } }
 
 export interface EzerStreamSubscriber { id: string; send: (event: string, payload: unknown) => void }
+
+/**
+ * The attempt an operation is currently publishing under, as observed on the
+ * live journal stream. S03 control commands target exactly this attempt.
+ */
+export interface EzerActiveAttempt {
+  executionId: string;
+  attemptId: string;
+  /** The attempt already delivered its final result. */
+  completed: boolean;
+  /** The attempt was fenced (cancel/timeout) and can no longer publish. */
+  fenced: boolean;
+}
+
+/** A control event authored locally by ProPR rather than by the Ezer journal. */
+interface EzerControlEventInput {
+  operationId: string;
+  type: Exclude<EzerEventType, 'heartbeat'>;
+  summary: string;
+  requestId?: string;
+  sessionId?: string;
+  executionId?: string;
+  attemptId?: string;
+  diagnosticId?: string;
+  detail?: EzerProgressDetail;
+  error?: EzerErrorDetail;
+}
 
 export interface EzerStreamingMetrics { delivered: number; dropped: number; maxProjectionDelayMs: number }
 
@@ -228,6 +258,7 @@ export class EzerStreamingService {
   private readonly cancelTimer: (handle: unknown) => void;
   private readonly onDrop: ((drop: EzerDropRecord) => void) | null;
   private journal: EzerJournalReader | null;
+  private readonly envelopeListeners = new Set<(envelope: EzerEventEnvelope) => void>();
   private closed = false;
   private readonly metrics: EzerStreamingMetrics = { delivered: 0, dropped: 0, maxProjectionDelayMs: 0 };
 
@@ -268,6 +299,63 @@ export class EzerStreamingService {
     operation.fencedAttempts.add(attemptKey(executionId, attemptId));
     const execution = operation.executions.get(executionId);
     if (execution && execution.admittedAttemptId === attemptId) execution.completed = true;
+  }
+
+  /** The last durable journal cursor projected for an operation, if any. */
+  getOperationCursor(operationId: string): string | null {
+    return this.operations.get(operationId)?.lastCursor ?? null;
+  }
+
+  /** Whether this exact attempt has been fenced out of publishing. */
+  isAttemptFenced(operationId: string, executionId: string, attemptId: string): boolean {
+    return this.operations.get(operationId)?.fencedAttempts.has(attemptKey(executionId, attemptId)) ?? false;
+  }
+
+  /**
+   * The attempt the operation is currently publishing under. Control commands
+   * resolve their target through this so they act on the exact active attempt
+   * rather than on a stale or replacement one.
+   */
+  getActiveAttempt(operationId: string): EzerActiveAttempt | null {
+    const operation = this.operations.get(operationId);
+    const last = operation?.lastEnvelope;
+    if (!operation || !last) return null;
+    const execution = operation.executions.get(last.executionId);
+    if (!execution) return null;
+    return {
+      executionId: last.executionId,
+      attemptId: execution.admittedAttemptId,
+      completed: execution.completed,
+      fenced: operation.fencedAttempts.has(attemptKey(last.executionId, execution.admittedAttemptId)),
+    };
+  }
+
+  /**
+   * Observe every envelope this projection accepts. The S03 control plane uses
+   * it to flip an accepted steering revision to applied when real subsequent
+   * activity appears, instead of assuming acceptance took effect.
+   */
+  onEnvelope(listener: (envelope: EzerEventEnvelope) => void): () => void {
+    this.envelopeListeners.add(listener);
+    return () => { this.envelopeListeners.delete(listener); };
+  }
+
+  /**
+   * Publish a control event that ProPR authored locally (an acknowledgement or
+   * the later confirmation of real downstream state). Like a heartbeat, it is a
+   * projection-level signal rather than a journal event: it reuses the last
+   * durable cursor, never advances it, and is never part of replay — so the
+   * journal stays the only delivery/replay authority.
+   */
+  publishControlEvent(input: EzerControlEventInput): EzerEventEnvelope {
+    const operation = this.ensureOperation(input.operationId);
+    const envelope = this.buildControlEnvelope(operation, input);
+    for (const subscriber of operation.subscribers.values()) {
+      if (!subscriber.replaying) this.send(subscriber, EZER_STREAM_EVENT, envelope);
+    }
+    operation.lastActivityAt = this.now();
+    this.armHeartbeat(operation);
+    return envelope;
   }
 
   async operationExists(operationId: string): Promise<boolean> {
@@ -351,7 +439,36 @@ export class EzerStreamingService {
     operation.lastActivityAt = this.now();
     this.armHeartbeat(operation);
     for (const subscriber of operation.subscribers.values()) this.deliver(subscriber, envelope);
+    this.notifyEnvelopeListeners(envelope);
     return { accepted: true, envelope };
+  }
+
+  private buildControlEnvelope(operation: OperationState, input: EzerControlEventInput): EzerEventEnvelope {
+    const last = operation.lastEnvelope;
+    return {
+      type: input.type,
+      requestId: input.requestId ?? last?.requestId ?? operation.requestId ?? UNASSIGNED,
+      sessionId: input.sessionId ?? last?.sessionId ?? operation.sessionId ?? UNASSIGNED,
+      operationId: input.operationId,
+      executionId: input.executionId ?? last?.executionId ?? UNASSIGNED,
+      attemptId: input.attemptId ?? last?.attemptId ?? UNASSIGNED,
+      cursor: operation.lastCursor ?? '0',
+      ts: this.iso(),
+      summary: input.summary,
+      ...(input.diagnosticId ? { diagnosticId: input.diagnosticId } : {}),
+      ...(input.detail ? { detail: input.detail } : {}),
+      ...(input.error ? { error: input.error } : {}),
+    };
+  }
+
+  private notifyEnvelopeListeners(envelope: EzerEventEnvelope): void {
+    for (const listener of this.envelopeListeners) {
+      try {
+        listener(envelope);
+      } catch (error) {
+        console.error(`[EzerStreaming] Envelope listener failed for ${envelope.operationId}:`, error);
+      }
+    }
   }
 
   /**
@@ -404,6 +521,7 @@ export class EzerStreamingService {
 
   close(): void {
     this.closed = true;
+    this.envelopeListeners.clear();
     for (const operation of this.operations.values()) {
       if (operation.heartbeatTimer !== null) this.cancelTimer(operation.heartbeatTimer);
       operation.heartbeatTimer = null;

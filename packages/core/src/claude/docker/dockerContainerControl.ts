@@ -294,6 +294,51 @@ async function retryExecutionContainerRemoval(
 }
 
 /**
+ * Lists the containers that still exist for an owned execution so a stop can be
+ * confirmed against real daemon state instead of assumed from the stop command.
+ *
+ * Returns `null` when the daemon could not be queried: an unobservable daemon
+ * must never be read as "no containers remain", because that would let a caller
+ * claim a false stop or miss an orphan (EP-ezer-follow-ups-S03).
+ */
+export async function listOwnedExecutionContainers(
+    options: DockerExecutionTeardownOptions,
+    timeoutMs = 2000,
+): Promise<string[] | null> {
+    const selectors: string[][] = [];
+    if (options.taskId && options.attemptGeneration) {
+        selectors.push([
+            '--filter', `label=propr.task.id=${options.taskId}`,
+            '--filter', `label=propr.task.attempt-generation=${options.attemptGeneration}`,
+        ]);
+    }
+    if (options.containerId && CONTAINER_IDENTIFIER_PATTERN.test(options.containerId)) {
+        selectors.push(['--filter', `id=${options.containerId}`]);
+    }
+    if (options.containerName && CONTAINER_IDENTIFIER_PATTERN.test(options.containerName)) {
+        selectors.push(['--filter', `name=^${options.containerName}$`]);
+    }
+    if (selectors.length === 0) return [];
+    const remaining = new Set<string>();
+    for (const selector of selectors) {
+        try {
+            const output = await runDocker(['ps', '-aq', ...selector], Math.max(250, timeoutMs));
+            for (const id of output.split('\n').map(value => value.trim()).filter(Boolean)) {
+                remaining.add(id);
+            }
+        } catch (error) {
+            logger.debug({
+                taskId: options.taskId,
+                attemptGeneration: options.attemptGeneration,
+                error: (error as Error).message,
+            }, 'Could not observe Docker containers while confirming execution cessation');
+            return null;
+        }
+    }
+    return [...remaining];
+}
+
+/**
  * Removes every container belonging to an aborted execution, retrying long
  * enough to cover the window in which `docker run` has reached the daemon but
  * the container has not appeared in `docker ps` yet.

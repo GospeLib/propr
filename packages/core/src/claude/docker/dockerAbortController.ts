@@ -6,6 +6,12 @@ import {
     abortSpawnedExecution,
     type SpawnedExecutionState,
 } from './dockerExecutionOwnership.js';
+import {
+    confirmExecutionCessation,
+    EZER_CESSATION_CONFIRM_TIMEOUT_MS,
+    EZER_CESSATION_POLL_INTERVAL_MS,
+    type ExecutionCessationReport,
+} from './ep-ezer-follow-ups-s03.js';
 
 export interface AbortCheckerOptions {
     taskId: string;
@@ -17,6 +23,12 @@ export interface AbortCheckerOptions {
     redisFactory?: AbortRedisFactory;
     pollIntervalMs?: number;
     closeTimeoutMs?: number;
+    /** Deadline for confirming that the aborted execution really stopped. */
+    cessationTimeoutMs?: number;
+    /** How often child/container cessation evidence is re-observed. */
+    cessationPollIntervalMs?: number;
+    /** Receives the observed cessation evidence for the aborted attempt. */
+    onCessation?: (report: ExecutionCessationReport) => void;
 }
 
 export interface AbortCheckerHandle {
@@ -171,6 +183,9 @@ export function setupAbortChecker({
     redisFactory = createAbortRedis,
     pollIntervalMs = 2000,
     closeTimeoutMs = DEFAULT_ABORT_REDIS_TIMEOUT_MS,
+    cessationTimeoutMs = EZER_CESSATION_CONFIRM_TIMEOUT_MS,
+    cessationPollIntervalMs = EZER_CESSATION_POLL_INTERVAL_MS,
+    onCessation,
 }: AbortCheckerOptions): AbortCheckerHandle {
     const redis = redisFactory();
     let pollInFlight = false;
@@ -178,6 +193,37 @@ export function setupAbortChecker({
     let consecutiveLookupFailures = 0;
     let closePromise: Promise<void> | null = null;
     let pollPromise: Promise<void> | null = null;
+    /**
+     * Terminating is a request; this observes whether it actually took effect.
+     * A failure to confirm is reported as still-running with a recovery step —
+     * it is never downgraded into a silent success (EP-ezer-follow-ups-S03).
+     */
+    const confirmCessation = async (): Promise<void> => {
+        try {
+            const report = await confirmExecutionCessation({
+                child,
+                taskId,
+                attemptGeneration,
+                containerId: state.containerId.value,
+                containerName: namedContainer,
+                timeoutMs: cessationTimeoutMs,
+                pollIntervalMs: cessationPollIntervalMs,
+            });
+            const context = {
+                taskId,
+                attemptGeneration,
+                elapsedMs: report.elapsedMs,
+                childExited: report.childExited,
+                containerEvidence: report.containerEvidence,
+                containersRemaining: report.containersRemaining,
+            };
+            if (report.stopped) logger.info(context, 'Confirmed cessation of aborted execution');
+            else logger.error({ ...context, reason: report.reason, recovery: report.recovery }, 'Aborted execution is not confirmed stopped');
+            onCessation?.(report);
+        } catch (error) {
+            logger.error({ taskId, attemptGeneration, error: (error as Error).message }, 'Failed to observe cessation of aborted execution');
+        }
+    };
     const terminateExecution = async (message: string): Promise<void> => {
         if (state.aborted.value) return;
         logger.info({ taskId, containerId: state.containerId.value || namedContainer }, message);
@@ -187,6 +233,7 @@ export function setupAbortChecker({
             { namedContainer, scheduleForceKill, taskId, attemptGeneration },
         );
         await clearWorkerAbortSignalWithClient(taskId, redis);
+        await confirmCessation();
     };
     const interval = setInterval(() => {
         if (pollInFlight) return;

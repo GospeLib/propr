@@ -1,3 +1,4 @@
+import { classifyExecutionFailure } from '../agents/executionFailure.js';
 import path from 'path';
 import os from 'os';
 import logger from '../utils/logger.js';
@@ -61,6 +62,8 @@ export interface ExecuteClaudeCodeOptions {
 }
 
 export interface ClaudeCodeResponse {
+    failureKind?: import('../agents/executionFailure.js').FailureKind;
+    usageResetAt?: string;
     success: boolean;
     executionTime: number;
     output: ClaudeOutput | null;
@@ -147,6 +150,12 @@ export async function executeClaudeCode(options: ExecuteClaudeCodeOptions): Prom
             summary: claudeOutput.finalResult?.result || null,
             error: terminationReason ? result.stderr : undefined,
             terminationReason,
+            ...(!(claudeOutput.success && !terminationReason) ? classifyExecutionFailure({
+                ...claudeOutput.failure, terminationReason,
+                error: claudeOutput.finalResult?.result || claudeOutput.error,
+                infrastructure: result.infrastructureFailure,
+                agentRan: !!claudeOutput.finalResult || !!claudeOutput.sessionId || claudeOutput.conversationLog.length > 0,
+            }) : {}),
             prompt: prompt,
             tokenUsage: claudeOutput.tokenUsage,
             usageMetrics
@@ -171,7 +180,7 @@ export async function executeClaudeCode(options: ExecuteClaudeCodeOptions): Prom
         const err = error as Error;
         logger.error({ issueNumber: issueRef.number, executionTime, error: err.message }, 'Error during Claude Code execution');
         return {
-            success: false, error: err.message, executionTime, output: null,
+            success: false, ...classifyExecutionFailure({ error, ...error as object }), error: err.message, executionTime, output: null,
             logs: (error as { stderr?: string }).stderr || err.message,
             modifiedFiles: [], commitMessage: null, summary: null
         };

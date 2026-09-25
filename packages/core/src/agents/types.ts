@@ -166,6 +166,8 @@ export interface AnalyzeOptions {
 }
 
 export interface AgentExecutionResult {
+    failureKind?: import('./executionFailure.js').FailureKind;
+    usageResetAt?: string;
     success: boolean;
     logs: string;           // Full stderr/stdout logs
     summary?: string;       // Extracted summary of work

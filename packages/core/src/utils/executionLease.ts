@@ -291,7 +291,7 @@ export async function acquireExecutionLease(request: ExecutionLeaseRequest): Pro
     // statement-level condition below is what actually decides it — this is only the outcome the
     // caller is told, and `unreconciled` is the truthful one: the operation is waiting for
     // `reconcileProviderInvocationSpend`, not for a successor.
-    if (Boolean(held.provider_invocation_started)) {
+    if (held.provider_invocation_started) {
         return { outcome: 'unreconciled', holderGeneration: held.lease_generation, expiresAt: held.expires_at };
     }
     //
@@ -587,7 +587,7 @@ export async function recordVerifiedExecutorStop(options: {
     if (row.expires_at > await databaseNow()) {
         return refuse('the term has not lapsed, so the executor is still reporting itself alive');
     }
-    if (Boolean(row.provider_invocation_started)) {
+    if (row.provider_invocation_started) {
         return refuse('that executor had already reached the provider, so its spend must be reconciled first');
     }
     const recorded = await recordExecutorStopProof({

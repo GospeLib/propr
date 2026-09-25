@@ -54,6 +54,8 @@ export const ClaudeResultPhases = {
 } as const satisfies Record<string, ClaudeResultPhase>;
 
 export interface ClaudeResultSummary {
+    failureKind?: import('../agents/executionFailure.js').FailureKind;
+    usageResetAt?: string;
     success: boolean;
     /** Provisional start-time placeholder vs. the execution's real outcome. Absent on legacy records. */
     resultPhase?: ClaudeResultPhase;

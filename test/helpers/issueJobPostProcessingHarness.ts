@@ -46,6 +46,7 @@ await mock.module('timers/promises', {
 
 await mock.module('@propr/core', {
     namedExports: {
+        ...(await import('../../packages/core/src/agents/executionFailure.js')),
         ...completionCoreExports, ...publicationPolicy, requireAuthorizedPublicationMetadata,
         cleanupWorktree: mock.fn(async () => undefined),
         cleanupPreparedVisualPreviewEvidence: mock.fn(async () => undefined),

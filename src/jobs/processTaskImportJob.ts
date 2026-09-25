@@ -60,6 +60,10 @@ function taskImportExecutionEvidence(agentResult: AgentExecutionResult): UpdateM
     return {
         claudeResult: finalClaudeExecutionResult({
             success: agentResult.success,
+            failureKind: agentResult.failureKind,
+            usageResetAt: agentResult.usageResetAt,
+            terminationReason: agentResult.terminationReason,
+            error: agentResult.error,
             sessionId: agentResult.sessionId,
             conversationId: agentResult.conversationId,
             executionTime: agentResult.executionTimeMs,

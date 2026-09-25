@@ -1,15 +1,19 @@
 /** Claude CLI stream framing, results, and loss provenance. Public compatibility exports remain in claudeHelpers. */
+import { classifyExecutionFailure, type ExecutionFailure } from '../agents/executionFailure.js';
 import logger from '../utils/logger.js';
 import type { ExecutionResult } from './docker/dockerExecutor.js';
 import { parseResetTimeFromMessage, calculateNextRoundHourPlus2Minutes } from '../utils/scheduling.js';
 
 export class UsageLimitError extends Error {
+    readonly failureKind = 'usage_limit' as const;
+    usageResetAt?: string;
     resetTimestamp: number;
     retryable: boolean;
     rawErrorMessage?: string;
 
-    constructor(message: string, resetTimestamp: number, rawErrorMessage?: string) {
+    constructor(message: string, resetTimestamp: number, rawErrorMessage?: string, usageResetAt?: string) {
         super(message);
+        this.usageResetAt = usageResetAt;
         this.name = 'UsageLimitError';
         this.resetTimestamp = resetTimestamp;
         this.retryable = true;
@@ -52,6 +56,7 @@ export interface ClaudeOutputResult {
 }
 
 export interface ClaudeOutput {
+    failure?: ExecutionFailure;
     success: boolean;
     rawOutput: string;
     /** Explicit false means a stream record was dropped; absence is not proof of completeness. */
@@ -85,7 +90,9 @@ interface JsonLineMessage {
     total_cost_usd?: number;
     cost_usd?: number;
     usage?: TokenUsage;
-    error?: string;
+    error?: unknown;
+    status?: number;
+    headers?: Record<string, string>;
 }
 
 export function parseStreamJsonOutput(result: ExecutionResult): ClaudeOutput {
@@ -139,9 +146,12 @@ function handleRateLimitError(jsonLine: JsonLineMessage): void {
         const textItem = jsonLine.message.content.find(item => item.type === 'text' && item.text);
         if (textItem) messageText = textItem.text || '';
     }
-    const resetTimestamp = parseResetTimeFromMessage(messageText) || calculateNextRoundHourPlus2Minutes();
+    const reportedTimestamp = parseResetTimeFromMessage(messageText);
+    const resetTimestamp = reportedTimestamp || calculateNextRoundHourPlus2Minutes();
+    const usageResetAt = classifyExecutionFailure({ error: jsonLine }).usageResetAt
+        ?? (reportedTimestamp ? new Date(reportedTimestamp * 1000).toISOString() : undefined);
     logger.warn({ messageText, resetTimestamp }, 'Claude rate limit reached (new format). Throwing specific error for requeue.');
-    throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`, resetTimestamp, messageText || 'Rate limit reached');
+    throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`, resetTimestamp, messageText || 'Rate limit reached', usageResetAt);
 }
 
 function processConversationMessage(jsonLine: JsonLineMessage, claudeOutput: ClaudeOutput, messageTimestamps: Map<string, string>): void {
@@ -156,6 +166,11 @@ function processJsonLine(
     claudeOutput: ClaudeOutput,
     messageTimestamps: Map<string, string>
 ): void {
+    if (jsonLine.error || jsonLine.is_error || jsonLine.type === 'error') {
+        claudeOutput.failure = classifyExecutionFailure({ error: { ...jsonLine,
+            message: jsonLine.result, type: jsonLine.subtype ?? jsonLine.type,
+        }, agentRan: true });
+    }
     // Check for new rate limit format: {"type": "assistant", "error": "rate_limit", "message": {...}}
     if (jsonLine.type === 'assistant' && jsonLine.error === 'rate_limit') {
         handleRateLimitError(jsonLine);
@@ -208,7 +223,7 @@ function processResultLine(jsonLine: JsonLineMessage, claudeOutput: ClaudeOutput
         if (limitMatch && limitMatch[1]) {
             const resetTimestamp = parseInt(limitMatch[1], 10);
             logger.warn({ resetTimestamp }, 'Claude usage limit reached. Throwing specific error for requeue.');
-            throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`, resetTimestamp);
+            throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`, resetTimestamp, undefined, new Date(resetTimestamp * 1000).toISOString());
         }
     }
 

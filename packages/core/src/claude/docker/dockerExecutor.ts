@@ -48,6 +48,8 @@ export interface ExecutionResult {
     /** Set when ProPR stopped the process after its configured execution deadline. */
     timedOut?: boolean;
     timeoutMs?: number;
+    /** Docker could not launch the container command (reserved exit codes 125-127). */
+    infrastructureFailure?: boolean;
 }
 export interface RunningTaskContainer { id: string; name: string; }
 export interface ExecutionChildIdentity { pid: number; containerName: string | null; }
@@ -357,11 +359,14 @@ export function executeDockerCommand(command: string, args: string[], options: D
                 if (preserveOutputOnTimeout) {
                     resolve({ exitCode, stdout, stderr: timeoutStderr, messageTimestamps, timedOut: true, timeoutMs: timeout });
                 } else {
-                    reject(new Error(timeoutMessage));
+                    reject(Object.assign(new Error(timeoutMessage), { failureKind: 'timeout', timedOut: true }));
                 }
                 return;
             }
-            resolve({ exitCode, stdout, stderr, messageTimestamps });
+            resolve({ exitCode, stdout, stderr, messageTimestamps,
+                ...(command === 'docker' && args[0] === 'run' && [125, 126, 127].includes(exitCode ?? -1)
+                    ? { infrastructureFailure: true } : {}),
+            });
         });
         child.on('error', async (error: Error) => {
             clearTimeout(timeoutHandle);

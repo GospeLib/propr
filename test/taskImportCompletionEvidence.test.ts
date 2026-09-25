@@ -73,6 +73,7 @@ const coreLogger = { debug: () => undefined, info: () => undefined, warn: () => 
 
 await mock.module('@propr/core', {
     namedExports: {
+        ...(await import('../packages/core/src/agents/executionFailure.js')),
         ...completionCoreExports,
         TaskStates: TASK_STATES,
         ErrorCategories: ERROR_CATEGORIES,

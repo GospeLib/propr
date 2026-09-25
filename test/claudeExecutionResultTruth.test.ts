@@ -123,6 +123,7 @@ const durabilityOutcome = await import('../packages/core/src/utils/completionDur
 
 await mock.module('@propr/core', {
     namedExports: {
+        ...(await import('../packages/core/src/agents/executionFailure.js')),
         ...barrier,
         ...durabilityOutcome,
         TaskStates: TASK_STATES,

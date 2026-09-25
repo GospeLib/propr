@@ -1,3 +1,4 @@
+import { classifyExecutionFailure } from '@propr/core';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 const typedGit = promisify(execFile);
@@ -50,6 +51,9 @@ export function agentResultToClaudeResponse(result: AgentExecutionResult): Claud
   const terminationReason = resolveAgentTerminationReason(result);
   return {
     success: result.success,
+    ...(!result.success ? classifyExecutionFailure({ ...result,
+      agentRan: !!result.sessionId || result.numTurns !== undefined || !!result.summary || (result.exitCode != null && ![125, 126, 127].includes(result.exitCode)),
+    }) : {}),
     model: result.modelUsed,
     ...(result.reasoningLevel && { reasoningLevel: result.reasoningLevel }),
     executionTime: result.executionTimeMs,
@@ -77,7 +81,7 @@ export function agentResultToClaudeResponse(result: AgentExecutionResult): Claud
 
 /** Admitted executions also record truthful outcome evidence (turns, usage, final output) on the task. */
 export function buildExecutionStateSummary(claudeResult: ClaudeCodeResponse, admitted: boolean): ClaudeResultSummary {
-  const summary = { success: claudeResult.success, sessionId: claudeResult.sessionId, conversationId: claudeResult.conversationId, executionTime: claudeResult.executionTime };
+  const summary = { success: claudeResult.success, failureKind: claudeResult.failureKind, usageResetAt: claudeResult.usageResetAt, terminationReason: claudeResult.terminationReason, error: claudeResult.error, sessionId: claudeResult.sessionId, conversationId: claudeResult.conversationId, executionTime: claudeResult.executionTime };
   if (!admitted) return summary;
   const { terminationReason, numTurns, tokenUsage, finalOutput, error } = buildAgentOutcome(claudeResult);
   return { ...summary, terminationReason, numTurns, tokenUsage, finalOutput, error };

@@ -238,6 +238,39 @@ export {
 export type { ClaudeOutput, ConversationLogEntry, ClaudeOutputResult, BuildClaudePromptOptions, DockerArgsParams, StorePromptOptions } from './claude/claudeHelpers.js';
 export { buildPlannerAbortSignalKey, executeDockerCommand, findRunningDockerContainerForTask, findTaskContainer, inspectLegacyDockerContainerLivenessForTask, runWithExecutionAbortSignal, runWithPlannerAbortContext, stopDockerContainer, ExecutionAbortedError, ensureAgentBundleImage } from './claude/docker/dockerExecutor.js';
 export type { RunningTaskContainer } from './claude/docker/dockerExecutor.js';
+export {
+    EzerAttemptControlRegistry,
+    EZER_CESSATION_CONFIRM_TARGET_MS,
+    EZER_CESSATION_POLL_INTERVAL_MS,
+    EZER_CONTROL_ACK_TARGET_MS,
+    attemptIdentity,
+    buildEzerIdempotencyKey,
+    computeEzerPayloadFingerprint,
+    parseEzerControlCommand,
+} from './claude/docker/ep-ezer-follow-ups-s03.js';
+export type {
+    EzerAttemptObserver,
+    EzerAttemptPhase,
+    EzerAttemptRegistration,
+    EzerAttemptSnapshot,
+    EzerCessationEvidence,
+    EzerCessationReport,
+    EzerCessationState,
+    EzerCheckpoint,
+    EzerControlAck,
+    EzerControlAckState,
+    EzerControlCommand,
+    EzerControlRegistryOptions,
+    EzerControlRejection,
+    EzerControlRejectionCode,
+    EzerControlType,
+    EzerPauseSupport,
+    EzerPublicationDecision,
+    EzerResumeGrant,
+    EzerSteerRevision,
+    EzerStopPropagationResult,
+    EzerStopPropagator,
+} from './claude/docker/ep-ezer-follow-ups-s03.js';
 export { cleanupUnusedAgentImages, listAgentImages } from './claude/docker/dockerImageManager.js';
 export type { VersionedImageBuildResult } from './claude/docker/dockerExecutor.js';
 export {

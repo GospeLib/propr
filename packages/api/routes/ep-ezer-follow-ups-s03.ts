@@ -984,7 +984,7 @@ export function createEzerControlRoutes(deps: EzerControlRoutesDeps) {
       const result = await service.submit(req.body, operationId, req.user?.username || 'user');
       res.status(result.httpStatus).json(result.body);
     } catch (error) {
-      console.error(`[ezer-control] Failed to process control command for ${operationId}:`, error);
+      console.error('[ezer-control] Failed to process control command for %s:', operationId, error);
       res.status(500).json({
         error: contractError('CONTROL_COMMAND_FAILED', 'The control command could not be processed.', {
           knownCause: (error as Error).message,
@@ -1003,7 +1003,7 @@ export function createEzerControlRoutes(deps: EzerControlRoutesDeps) {
       if (!await authorize(req, res, operationId)) return;
       res.json(service.describe(operationId));
     } catch (error) {
-      console.error(`[ezer-control] Failed to read control state for ${operationId}:`, error);
+      console.error('[ezer-control] Failed to read control state for %s:', operationId, error);
       res.status(500).json({
         error: contractError('CONTROL_STATE_UNREADABLE', 'The control state could not be read.', {
           knownCause: (error as Error).message,

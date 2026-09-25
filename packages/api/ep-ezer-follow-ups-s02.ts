@@ -364,7 +364,7 @@ export class EzerStreamingService {
     try {
       return await this.journal.hasOperation(operationId);
     } catch (error) {
-      console.error(`[EzerStreaming] Journal lookup failed for ${operationId}:`, error);
+      console.error('[EzerStreaming] Journal lookup failed for %s:', operationId, error);
       return false;
     }
   }
@@ -466,7 +466,7 @@ export class EzerStreamingService {
       try {
         listener(envelope);
       } catch (error) {
-        console.error(`[EzerStreaming] Envelope listener failed for ${envelope.operationId}:`, error);
+        console.error('[EzerStreaming] Envelope listener failed for %s:', envelope.operationId, error);
       }
     }
   }
@@ -499,7 +499,7 @@ export class EzerStreamingService {
         this.send(state, EZER_STREAM_EVENT, this.replayUnavailableEnvelope(operation, afterCursor));
       }
     } catch (error) {
-      console.error(`[EzerStreaming] Journal replay failed for ${operationId}:`, error);
+      console.error('[EzerStreaming] Journal replay failed for %s:', operationId, error);
       this.send(state, EZER_STREAM_EVENT, this.replayUnavailableEnvelope(operation, afterCursor ?? null));
     } finally {
       state.replaying = false;
@@ -625,7 +625,7 @@ export class EzerStreamingService {
       subscriber.send(event, payload);
       if (event === EZER_STREAM_EVENT) this.metrics.delivered += 1;
     } catch (error) {
-      console.error(`[EzerStreaming] Failed to deliver to subscriber ${subscriber.id}:`, error);
+      console.error('[EzerStreaming] Failed to deliver to subscriber %s:', subscriber.id, error);
     }
   }
 

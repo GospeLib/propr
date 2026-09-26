@@ -72,6 +72,12 @@ describe('planner background abort reconciliation', () => {
     const redisFactory: AbortRedisFactory = () => ({
       get: async key => keys.get(key) ?? null,
       del: async key => { deletedKeys.push(key); return keys.delete(key) ? 1 : 0; },
+      // f730c101: consume only the exact marker observed by the caller.
+      eval: async (_script, _keyCount, key, marker) => {
+        if (keys.get(key) !== marker) return 0;
+        deletedKeys.push(key);
+        return keys.delete(key) ? 1 : 0;
+      },
       quit: async () => undefined,
       disconnect: () => undefined,
     });

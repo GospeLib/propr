@@ -24,9 +24,11 @@ const CONSUMED_KEY_PREFIX = 'ezer:execution-admission:consumed:';
 const RECEIPT_KEY_PREFIX = 'ezer:execution-admission:receipt:';
 const PENDING_KEY_PREFIX = 'ezer:execution-admission:pending:';
 const REPOSITORY_LIST_SEPARATOR = ',';
+// Stop authorization must outlive the execution lease; this never extends worker authority.
+const CONSUMED_ADMISSION_RETENTION_SECONDS = 24 * 60 * 60;
 const REDIS_CONSUME_AND_ISSUE_SCRIPT = `
 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
-redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
 redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
 return 1
 `;
@@ -96,7 +98,7 @@ export function requiresEzerExecutionAdmission(input: {
 export function createRedisAdmissionStore(redis: Redis): AdmissionStore {
     return {
         async consumeAndIssue(consumedKey, receiptKey, value, ttlSeconds) {
-            const result = await redis.eval(REDIS_CONSUME_AND_ISSUE_SCRIPT, 2, consumedKey, receiptKey, value, String(ttlSeconds));
+            const result = await redis.eval(REDIS_CONSUME_AND_ISSUE_SCRIPT, 2, consumedKey, receiptKey, value, String(ttlSeconds), String(ttlSeconds + CONSUMED_ADMISSION_RETENTION_SECONDS));
             return result === 1;
         },
         async get(key) {
@@ -121,6 +123,28 @@ export async function readExecutionAdmissionConsumption(store: Pick<AdmissionSto
         store.get(`${RECEIPT_KEY_PREFIX}${admissionId}`),
     ]);
     return { admissionConsumed: consumed !== null, workerReceiptPresent: receipt !== null };
+}
+
+/** Read ProPR's retained admission evidence, never a caller-supplied receipt. */
+export async function readAdmittedExecutionBinding(
+    store: Pick<AdmissionStore, 'get'>,
+    execution: { admissionId: string; operationId: string },
+): Promise<{ repository: string; issueNumber: number }> {
+    const raw = await store.get(`${CONSUMED_KEY_PREFIX}${execution.admissionId}`);
+    if (!raw) refuse('missing-execution-admission');
+    let value: Record<string, unknown>;
+    try {
+        value = JSON.parse(raw);
+    } catch {
+        refuse('malformed-execution-admission');
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value) ||
+        value.admissionId !== execution.admissionId || value.operationId !== execution.operationId ||
+        value.control !== undefined || typeof value.repository !== 'string' || !value.repository.trim() ||
+        !Number.isSafeInteger(value.issueNumber) || Number(value.issueNumber) < 1) {
+        refuse('mismatched-execution-admission');
+    }
+    return { repository: value.repository, issueNumber: Number(value.issueNumber) };
 }
 
 interface ExpectedExecution {

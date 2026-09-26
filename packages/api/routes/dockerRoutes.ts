@@ -1,7 +1,7 @@
 import {Redis} from 'ioredis';
 import {stopAdmittedTask} from './ezerStopTask.js';
 import {EZER_INTERNAL_SECRET_HEADER,verifyEzerInternalRequest} from '../ezerInternalAuth.js';
-import {db,getAuthenticatedOctokit,createRedisAdmissionStore} from '@propr/core';
+import {db,getAuthenticatedOctokit,createRedisAdmissionStore,loadMonitoredRepos} from '@propr/core';
 import type { Response } from 'express';
 import type { FlatRequest } from '../requestTypes.js';
 import { RedisClientType } from 'redis';
@@ -541,6 +541,7 @@ export function createDockerRoutes(deps: DockerRoutesDeps) {
         try{
           const result=await stopAdmittedTask({taskId:req.params.taskId,commentId:req.body.existingCommentId,token:req.body.signedAdmission},{
             store:createRedisAdmissionStore(admissionRedis),signingSecret:process.env.EZER_ADMISSION_HMAC_SECRET||'',
+            readServedRepositories:loadMonitoredRepos,
             readTask:async taskId=>{const row=await db('tasks').where({task_id:taskId}).first();return row?{repository:row.repository,issueNumber:row.issue_number}:undefined;},
             readComment:async(repository,commentId)=>{const [owner,repo]=repository.split('/');const api=await getAuthenticatedOctokit();const {data}=await api.request('GET /repos/{owner}/{repo}/issues/comments/{comment_id}',{owner,repo,comment_id:commentId});return {...data,body:data.body??'',user:data.user?{id:data.user.id,login:data.user.login}:null};},
             readState:taskId=>redisClient.get(`worker:state:${taskId}`),

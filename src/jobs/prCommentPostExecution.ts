@@ -299,6 +299,10 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
                 commitHash: commitResult?.commitHash,
                 claudeResult: finalClaudeExecutionResult({
                     success: state.claudeResult.success,
+                    failureKind: state.claudeResult.failureKind,
+                    usageResetAt: state.claudeResult.usageResetAt,
+                    terminationReason: state.claudeResult.terminationReason,
+                    error: state.claudeResult.error,
                     sessionId: state.claudeResult.sessionId,
                     conversationId: state.claudeResult.conversationId,
                     executionTime: state.claudeResult.executionTime,

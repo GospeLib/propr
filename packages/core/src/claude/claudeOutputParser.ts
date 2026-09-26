@@ -1,15 +1,19 @@
 /** Claude CLI stream framing, results, and loss provenance. Public compatibility exports remain in claudeHelpers. */
+import { classifyExecutionFailure, type ExecutionFailure } from '../agents/executionFailure.js';
 import logger from '../utils/logger.js';
 import type { ExecutionResult } from './docker/dockerExecutor.js';
 import { parseResetTimeFromMessage, calculateNextRoundHourPlus2Minutes } from '../utils/scheduling.js';
 
 export class UsageLimitError extends Error {
+    readonly failureKind = 'usage_limit' as const;
+    usageResetAt?: string;
     resetTimestamp: number;
     retryable: boolean;
     rawErrorMessage?: string;
 
-    constructor(message: string, resetTimestamp: number, rawErrorMessage?: string) {
+    constructor(message: string, resetTimestamp: number, rawErrorMessage?: string, usageResetAt?: string) {
         super(message);
+        this.usageResetAt = usageResetAt;
         this.name = 'UsageLimitError';
         this.resetTimestamp = resetTimestamp;
         this.retryable = true;
@@ -52,6 +56,7 @@ export interface ClaudeOutputResult {
 }
 
 export interface ClaudeOutput {
+    failure?: ExecutionFailure;
     success: boolean;
     rawOutput: string;
     /** Explicit false means a stream record was dropped; absence is not proof of completeness. */
@@ -85,7 +90,21 @@ interface JsonLineMessage {
     total_cost_usd?: number;
     cost_usd?: number;
     usage?: TokenUsage;
-    error?: string;
+    error?: unknown;
+    status?: number;
+    headers?: Record<string, string>;
+}
+
+const CLI_API_ERROR_PATTERN = /^API Error: (429|5\d\d)\b/;
+const CLI_USAGE_LIMIT_PATTERN = /^Claude AI usage limit reached\|(\d+)$/;
+const STDERR_USAGE_LIMIT_PATTERN = new RegExp(CLI_USAGE_LIMIT_PATTERN.source, 'm');
+
+function requeueReportedUsageLimit(message: string, pattern: RegExp): void {
+    const limitMatch = message.match(pattern);
+    if (!limitMatch?.[1]) return;
+    const resetTimestamp = Number(limitMatch[1]);
+    throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`,
+        resetTimestamp, message, new Date(resetTimestamp * 1000).toISOString());
 }
 
 export function parseStreamJsonOutput(result: ExecutionResult): ClaudeOutput {
@@ -98,6 +117,8 @@ export function parseStreamJsonOutput(result: ExecutionResult): ClaudeOutput {
         sessionId: null,
         finalResult: null
     };
+
+    requeueReportedUsageLimit(result.stderr, STDERR_USAGE_LIMIT_PATTERN);
 
     if (!result.stdout) return claudeOutput;
 
@@ -139,9 +160,12 @@ function handleRateLimitError(jsonLine: JsonLineMessage): void {
         const textItem = jsonLine.message.content.find(item => item.type === 'text' && item.text);
         if (textItem) messageText = textItem.text || '';
     }
-    const resetTimestamp = parseResetTimeFromMessage(messageText) || calculateNextRoundHourPlus2Minutes();
+    const reportedTimestamp = parseResetTimeFromMessage(messageText);
+    const resetTimestamp = reportedTimestamp || calculateNextRoundHourPlus2Minutes();
+    const usageResetAt = classifyExecutionFailure({ error: jsonLine }).usageResetAt
+        ?? (reportedTimestamp ? new Date(reportedTimestamp * 1000).toISOString() : undefined);
     logger.warn({ messageText, resetTimestamp }, 'Claude rate limit reached (new format). Throwing specific error for requeue.');
-    throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`, resetTimestamp, messageText || 'Rate limit reached');
+    throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`, resetTimestamp, messageText || 'Rate limit reached', usageResetAt);
 }
 
 function processConversationMessage(jsonLine: JsonLineMessage, claudeOutput: ClaudeOutput, messageTimestamps: Map<string, string>): void {
@@ -156,6 +180,17 @@ function processJsonLine(
     claudeOutput: ClaudeOutput,
     messageTimestamps: Map<string, string>
 ): void {
+    // Only error-result records can carry CLI diagnostics in the result field.
+    // Pass only the recognized prefix, never surrounding agent-authored prose.
+    const cliResult = jsonLine.type === 'result' && jsonLine.is_error === true && typeof jsonLine.result === 'string'
+        ? jsonLine.result : undefined;
+    if (cliResult !== undefined) requeueReportedUsageLimit(cliResult, CLI_USAGE_LIMIT_PATTERN);
+    const cliApiError = cliResult?.match(CLI_API_ERROR_PATTERN)?.[0];
+    if (jsonLine.error || jsonLine.is_error || jsonLine.type === 'error') {
+        claudeOutput.failure = classifyExecutionFailure({ error: { ...jsonLine,
+            type: jsonLine.subtype ?? jsonLine.type,
+        }, transportError: cliApiError, agentRan: true });
+    }
     // Check for new rate limit format: {"type": "assistant", "error": "rate_limit", "message": {...}}
     if (jsonLine.type === 'assistant' && jsonLine.error === 'rate_limit') {
         handleRateLimitError(jsonLine);
@@ -203,14 +238,6 @@ function processResultLine(jsonLine: JsonLineMessage, claudeOutput: ClaudeOutput
         };
     }
 
-    if (jsonLine.result) {
-        const limitMatch = jsonLine.result.match(/Claude AI usage limit reached\|(\d+)/);
-        if (limitMatch && limitMatch[1]) {
-            const resetTimestamp = parseInt(limitMatch[1], 10);
-            logger.warn({ resetTimestamp }, 'Claude usage limit reached. Throwing specific error for requeue.');
-            throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`, resetTimestamp);
-        }
-    }
 
     if (jsonLine.total_cost_usd && !jsonLine.cost_usd) {
         claudeOutput.finalResult.cost_usd = jsonLine.total_cost_usd;

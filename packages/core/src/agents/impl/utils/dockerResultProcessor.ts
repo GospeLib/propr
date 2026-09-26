@@ -5,6 +5,7 @@
  * into structured AgentExecutionResult objects.
  */
 
+import { classifyExecutionFailure } from '../../executionFailure.js';
 import { AgentExecutionResult, TokenUsage } from '../../types.js';
 import { ExecutionResult } from '../../../claude/docker/dockerExecutor.js';
 import { parseStreamJsonOutput } from '../../../claude/claudeHelpers.js';
@@ -114,7 +115,7 @@ export function processDockerResult(
     const terminationReason = resolveAgentTerminationReason({
         timedOut: result.timedOut,
         subtype: claudeOutput.finalResult?.subtype,
-        error: executionError
+        error: result.stderr
     });
     const summary = claudeOutput.finalResult?.result
         ?? (terminationReason ? getClaudeAnalysisText(claudeOutput) || undefined : undefined);
@@ -136,6 +137,11 @@ export function processDockerResult(
         summary,
         error: executionError || (terminationReason ? describeAgentTermination(terminationReason) : undefined),
         terminationReason,
+        ...(!(claudeOutput.success && !terminationReason) ? classifyExecutionFailure({
+            ...claudeOutput.failure, terminationReason, transportError: result.stderr,
+            infrastructure: result.infrastructureFailure,
+            agentRan: !!claudeOutput.finalResult || !!claudeOutput.sessionId || claudeOutput.conversationLog.length > 0,
+        }) : {}),
         prompt,
         conversationLog: fullConversationLog,
         tokenUsage: correctedTokenUsage,

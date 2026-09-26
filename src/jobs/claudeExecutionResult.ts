@@ -10,9 +10,15 @@
  * Reader contract, for a reader holding only the history:
  * - `claudeResult.resultPhase === 'provisional'` — execution-start marker. Never evidence of failure.
  * - `claudeResult.resultPhase === 'final'` — the execution returned; `success` is the real outcome.
+ * - Failed final results carry `failureKind`: provider_error, usage_limit, timeout, max_turns,
+ *   agent_error, or infrastructure. Older records may omit it; absence means unknown.
+ * - `usageResetAt` is ISO-8601 and only accompanies usage_limit when the provider reports
+ *   a reset/Retry-After. Absence gives no retry-time guarantee; readers must not infer one.
+ * - Provisional and successful results carry neither failure field. Read the final correlated
+ *   result before deciding whether to retry; these causes do not themselves authorize a retry.
  * - a genuine failure is `resultPhase: 'final'` with `success: false` (and a terminal failed entry).
  */
-import { ClaudeResultPhases, TaskStates } from '@propr/core';
+import { classifyExecutionFailure, ClaudeResultPhases, TaskStates } from '@propr/core';
 import type { ClaudeResultSummary, WorkerStateManager } from '@propr/core';
 import type { Logger } from 'pino';
 
@@ -35,7 +41,12 @@ export function provisionalClaudeExecutionResult(
 
 /** The execution returned: this is its real outcome, whatever it was. */
 export function finalClaudeExecutionResult(summary: ClaudeResultSummary): ClaudeResultSummary {
-    return { ...summary, resultPhase: ClaudeResultPhases.FINAL };
+    const { failureKind, usageResetAt, ...rest } = summary;
+    return { ...rest, resultPhase: ClaudeResultPhases.FINAL,
+        ...(!summary.success ? classifyExecutionFailure({ ...summary, failureKind, usageResetAt,
+            agentRan: !!summary.sessionId || summary.numTurns !== undefined || summary.finalOutput !== undefined,
+        }) : {}),
+    };
 }
 
 /**

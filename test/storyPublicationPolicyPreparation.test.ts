@@ -10,7 +10,9 @@ const verifyStoryPublication = mock.fn(async () => []);
 const pushBranch = mock.fn(async () => ({ rebased: false }));
 
 await mock.module('@propr/core', {
-    namedExports: { ...publicationPolicy,
+    namedExports: {
+        ...publicationPolicy,
+        ...(await import('../packages/core/src/admission/executionRecoveryContext.js')),
         createWorktreeForIssue: mock.fn(async (_repo: string, _issue: unknown, options: { execution?: unknown }) => {
             assert.ok(options.execution, 'the exact signed execution must create the worktree');
             return { worktreePath: policyWorktree, branchName: 'task/signed-story' };

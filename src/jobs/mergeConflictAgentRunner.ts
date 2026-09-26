@@ -169,7 +169,7 @@ export async function handleMergeWithAgent(options: {
     // Supersede the start-time provisional record before appending the completed entry, so the
     // history entry that describes this execution carries its real outcome.
     const executionSummary = await recordFinalClaudeExecutionResult(stateManager, taskId,
-        { success: claudeResult.success, sessionId: claudeResult.sessionId, conversationId: claudeResult.conversationId, executionTime: claudeResult.executionTime },
+        { success: claudeResult.success, failureKind: claudeResult.failureKind, usageResetAt: claudeResult.usageResetAt, terminationReason: claudeResult.terminationReason, error: claudeResult.error, sessionId: claudeResult.sessionId, conversationId: claudeResult.conversationId, executionTime: claudeResult.executionTime },
         correlatedLogger);
     await stateManager.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, {
         reason: `${agent.config.type} agent execution completed for merge conflict resolution`,

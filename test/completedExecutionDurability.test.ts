@@ -230,6 +230,7 @@ const { ClaudeResultPhases: CORE_RESULT_PHASES } =
 
 await mock.module('@propr/core', {
     namedExports: {
+        ...(await import('../packages/core/src/agents/executionFailure.js')),
         TaskStates: TASK_STATES,
         ErrorCategories: ERROR_CATEGORIES,
         logger: { ...coreLogger, withCorrelation: () => coreLogger },

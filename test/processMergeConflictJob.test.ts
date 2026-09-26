@@ -159,6 +159,7 @@ const mockRegistry = {
 // Mock @propr/core
 await mock.module('@propr/core', {
     namedExports: {
+        ...(await import('../packages/core/src/agents/executionFailure.js')),
         ...completionCoreExports,
         logger: {
             info: mock.fn(),

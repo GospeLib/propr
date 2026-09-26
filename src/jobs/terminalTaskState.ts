@@ -45,6 +45,10 @@ function completionMetadata(
   const finalResult = claudeResult
     ? finalClaudeExecutionResult({
       success: claudeResult.success,
+      failureKind: claudeResult.failureKind,
+      usageResetAt: claudeResult.usageResetAt,
+      terminationReason: claudeResult.terminationReason,
+      error: claudeResult.error,
       sessionId: claudeResult.sessionId,
       conversationId: claudeResult.conversationId,
       executionTime: claudeResult.executionTime,

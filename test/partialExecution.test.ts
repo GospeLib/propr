@@ -1,8 +1,10 @@
+import { agentResultToClaudeResponse as prResponse } from '../src/jobs/prFileUtils.js';
+import { finalClaudeExecutionResult } from '../src/jobs/claudeExecutionResult.js';
 import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { after, describe, test } from 'node:test';
+import { after, describe, test, mock } from 'node:test';
 import { closeConnection } from '@propr/core';
 import {
     executeDockerCommand,
@@ -22,6 +24,9 @@ import { getTaskCompletionStatus } from '../src/jobs/issueJob/completion.js';
 import { buildCommitMessage } from '../src/jobs/prCommentJobUtils.js';
 import { buildIssueReference } from '../src/jobs/issueJobHelpers.js';
 import type { ClaudeCodeResponse } from '../packages/core/src/claude/claudeService.js';
+
+await mock.module('../src/jobs/issueJob/config.js', { namedExports: { redisClient: {} } });
+const { agentResultToClaudeResponse, buildExecutionStateSummary } = await import('../src/jobs/issueJob/agent.js');
 
 after(async () => {
     await closeConnection();
@@ -262,4 +267,16 @@ describe('partial agent execution', () => {
         assert.match(commitMessage, /Partial execution:/);
         assert.doesNotMatch(comment, /Applied the requested follow-up changes/);
     });
+});
+
+test('provider metadata survives issue and PR response adapters and final summary reduction', () => {
+    const result = processDockerResult(executionResult(JSON.stringify({ type: 'result', is_error: true,
+        status: 429, headers: { 'retry-after': 'Fri, 25 Sep 2026 12:02:00 GMT' } }), { exitCode: 1 }), 'task', 'claude', 1).response;
+    for (const convert of [agentResultToClaudeResponse, prResponse]) {
+        for (const admitted of [true, false]) {
+            const summary = finalClaudeExecutionResult(buildExecutionStateSummary(convert(result), admitted));
+            assert.equal(summary.failureKind, 'usage_limit');
+            assert.equal(summary.usageResetAt, '2026-09-25T12:02:00.000Z');
+        }
+    }
 });

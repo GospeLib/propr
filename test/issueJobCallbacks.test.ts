@@ -13,7 +13,8 @@ const ensureDir = mock.fn(async () => undefined);
 const writeFile = mock.fn(async () => undefined);
 
 await mock.module('@propr/core', {
-    namedExports: { ...publicationPolicy, TaskStates: TASK_STATES, ClaudeResultPhases },
+    namedExports: {
+        ...(await import('../packages/core/src/agents/executionFailure.js')), ...publicationPolicy, TaskStates: TASK_STATES, ClaudeResultPhases },
 });
 
 await mock.module('fs-extra', {

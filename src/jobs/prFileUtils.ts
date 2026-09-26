@@ -1,3 +1,4 @@
+import { classifyExecutionFailure } from '@propr/core';
 import { getAuthenticatedOctokit } from '@propr/core';
 import { resolveAgentTerminationReason } from '@propr/core';
 import type { ClaudeCodeResponse, AgentExecutionResult } from '@propr/core';
@@ -265,6 +266,9 @@ export function agentResultToClaudeResponse(result: AgentExecutionResult): Claud
     const terminationReason = resolveAgentTerminationReason(result);
     return {
         success: result.success,
+        ...(!result.success ? classifyExecutionFailure({ ...result,
+            agentRan: !!result.sessionId || result.numTurns !== undefined || !!result.summary || (result.exitCode != null && ![125, 126, 127].includes(result.exitCode)),
+        }) : {}),
         model: result.modelUsed,
         ...(result.reasoningLevel && { reasoningLevel: result.reasoningLevel }),
         executionTime: result.executionTimeMs,

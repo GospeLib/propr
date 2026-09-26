@@ -12,3 +12,6 @@ export * from './index.services-admission.js';
 // over a same-name wildcard export).
 export type { AgentConfig } from './agents/types.js';
 export type { VersionedImageBuildResult } from './claude/docker/dockerExecutor.js';
+
+export { classifyExecutionFailure } from './agents/executionFailure.js';
+export type { FailureKind, ExecutionFailure } from './agents/executionFailure.js';

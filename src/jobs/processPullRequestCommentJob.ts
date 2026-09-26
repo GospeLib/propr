@@ -404,7 +404,7 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
     // Supersede the start-time provisional record before appending the completed entry, so the
     // history entry that describes this execution carries its real outcome.
     const executionSummary = await recordFinalClaudeExecutionResult(stateManager, taskId,
-        { success: state.claudeResult.success, sessionId: state.claudeResult.sessionId, conversationId: state.claudeResult.conversationId, executionTime: state.claudeResult.executionTime },
+        { success: state.claudeResult.success, failureKind: state.claudeResult.failureKind, usageResetAt: state.claudeResult.usageResetAt, terminationReason: state.claudeResult.terminationReason, error: state.claudeResult.error, sessionId: state.claudeResult.sessionId, conversationId: state.claudeResult.conversationId, executionTime: state.claudeResult.executionTime },
         correlatedLogger);
     await stateManager.updateTaskState(taskId, TaskStates.CLAUDE_EXECUTION, {
         reason: `${agentType} agent execution completed`,

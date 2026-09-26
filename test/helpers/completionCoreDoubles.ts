@@ -9,6 +9,7 @@
  * stable across however many attempts ask for it.
  */
 import { mock } from 'node:test';
+import { classifyExecutionFailure } from '../../packages/core/src/agents/executionFailure.js';
 import {
     durableExecutionCompletionGuard,
     nonExecutingCompletionGuard,
@@ -126,6 +127,7 @@ try {
 const barrier = await import('../../packages/core/src/utils/durableCompletionBarrier.js');
 
 export const completionCoreExports = {
+    classifyExecutionFailure,
     // The production barrier, reading through whatever database double the suite installed.
     publishCompletedWithDurableExecutionEvidence: barrier.publishCompletedWithDurableExecutionEvidence,
     carriesTerminalExecutionEvidence: barrier.carriesTerminalExecutionEvidence,

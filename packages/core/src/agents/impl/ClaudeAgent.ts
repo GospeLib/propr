@@ -1,3 +1,4 @@
+import { classifyExecutionFailure } from '../executionFailure.js';
 /** Claude Agent Implementation. */
 
 import logger from '../../utils/logger.js';
@@ -168,7 +169,7 @@ export class ClaudeAgent implements Agent {
             }, 'Error during Claude agent execution');
 
             return {
-                success: false, error: (error as Error).message, executionTimeMs: executionTime,
+                success: false, ...classifyExecutionFailure({ error, ...error as object, transportError: error }), error: (error as Error).message, executionTimeMs: executionTime,
                 logs: (error as { stderr?: string }).stderr || (error as Error).message,
                 modifiedFiles: [], commitMessage: null, summary: undefined,
                 modelUsed: this.config.defaultModel || 'unknown',

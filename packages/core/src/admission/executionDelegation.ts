@@ -2,10 +2,10 @@
  * The delegated authority an Ezer execution admission may be issued under, in the exact shape
  * Ezer signs (services/ezer/src/upstreams/propr-admission-delegation.ts `ExecutionDelegation`).
  *
- * Every security-defining field is required: the grant window, and a scope naming the exact unit,
- * epic, repository, issue, attempt, target branch and paths. A delegation missing any of them is
- * refused outright, never read as "unconstrained". There is no legacy form: Ezer mints only the
- * complete shape, and a delegated admission always carries a story execution.
+ * V1 requires the grant window. V2 permits durable grants without grantExpiresAt; both require
+ * a scope naming the exact unit, epic, repository, issue, attempt, target branch and paths.
+ * A delegation missing any scope field is refused, never read as "unconstrained". Both versions
+ * require this exact scope, and a delegated admission always carries a story execution.
  *
  * The attempt the grant names is checked against the executing attempt Ezer signs outside the
  * delegation (`attemptOrdinal`), and against the selected route's attempt when one is signed; an
@@ -31,7 +31,7 @@ export interface ExecutionDelegation {
     delegateSessionId: string;
     approvalPrincipalId: string;
     grantIssuedAt: string;
-    grantExpiresAt: string;
+    grantExpiresAt?: string;
     provenance?: string;
     approvalEventId?: string;
     proposalEventId?: string;
@@ -66,22 +66,23 @@ function parseScope(input: unknown): ExecutionDelegationScope {
     };
 }
 
-export function parseDelegation(input: unknown): ExecutionDelegation {
+export function parseDelegation(input: unknown, version: 1 | 2 = 1): ExecutionDelegation {
     if (!input || typeof input !== 'object' || Array.isArray(input)) refuse('invalid-execution-delegation');
     const value = input as Record<string, unknown>;
     const references: Partial<Pick<ExecutionDelegation, typeof OPTIONAL_REFERENCES[number]>> = {};
     for (const field of OPTIONAL_REFERENCES)
         if (value[field] !== undefined) references[field] = requiredString(value[field], `invalid-delegation-${field}`);
     const grantIssuedAt = requireIsoTimestamp(value.grantIssuedAt, INVALID_WINDOW);
-    const grantExpiresAt = requireIsoTimestamp(value.grantExpiresAt, INVALID_WINDOW);
-    if (Date.parse(grantExpiresAt) <= Date.parse(grantIssuedAt)) refuse(INVALID_WINDOW);
+    const grantExpiresAt = version === 2 && value.grantExpiresAt === undefined
+        ? undefined : requireIsoTimestamp(value.grantExpiresAt, INVALID_WINDOW);
+    if (grantExpiresAt !== undefined && Date.parse(grantExpiresAt) <= Date.parse(grantIssuedAt)) refuse(INVALID_WINDOW);
     return {
         grantId: requiredString(value.grantId, 'missing-delegation-grant'),
         delegatePrincipalId: requiredString(value.delegatePrincipalId, 'missing-delegation-principal'),
         delegateSessionId: requiredString(value.delegateSessionId, 'missing-delegation-session'),
         approvalPrincipalId: requiredString(value.approvalPrincipalId, 'missing-delegation-approval-principal'),
         grantIssuedAt,
-        grantExpiresAt,
+        ...(grantExpiresAt === undefined ? {} : { grantExpiresAt }),
         ...references,
         scope: parseScope(value.scope),
     };
@@ -89,6 +90,7 @@ export function parseDelegation(input: unknown): ExecutionDelegation {
 
 /** The claims a delegated grant is checked against. */
 export interface DelegatedAdmission {
+    version?: 1 | 2;
     delegatedAuthority?: ExecutionDelegation;
     storyExecution?: unknown;
     /** The executing attempt Ezer signs outside the delegation. */
@@ -114,8 +116,9 @@ export function requireDelegationWithinAdmission(admission: DelegatedAdmission, 
     const { grantIssuedAt, grantExpiresAt, scope } = delegation;
     if (!admission.storyExecution) refuse('delegation-requires-story-execution');
     if (Date.parse(grantIssuedAt) > nowMs + ADMISSION_CLOCK_SKEW_MS) refuse('not-yet-valid');
-    if (Date.parse(grantExpiresAt) <= nowMs) refuse('expired');
-    if (admission.startBy === undefined || Date.parse(admission.startBy) > Date.parse(grantExpiresAt))
+    if (grantExpiresAt !== undefined && Date.parse(grantExpiresAt) <= nowMs) refuse('expired');
+    if ((admission.version !== 2 && (grantExpiresAt === undefined || admission.startBy === undefined)) ||
+        (grantExpiresAt !== undefined && admission.startBy !== undefined && Date.parse(admission.startBy) > Date.parse(grantExpiresAt)))
         refuse('delegation-start-unbounded');
     if (admission.attemptOrdinal === undefined) refuse('delegation-attempt-unknown');
     if (scope.attemptOrdinal !== admission.attemptOrdinal ||

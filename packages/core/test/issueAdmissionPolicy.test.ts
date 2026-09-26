@@ -149,3 +149,38 @@ test('task-level authority with its exact-base spec link consumes once and queue
   assert.equal(atomicConsumeCalls, 1);
   assert.equal(queuedJobs, 1);
 });
+
+test('real daemon intake refuses v2 without claim and retries the pending admission when Ezer returns', async t => {
+  const env = { url: process.env.EZER_ADMISSION_CLAIM_URL, secret: process.env.EZER_INTERNAL_API_SECRET };
+  t.after(() => {
+    if (env.url === undefined) delete process.env.EZER_ADMISSION_CLAIM_URL; else process.env.EZER_ADMISSION_CLAIM_URL = env.url;
+    if (env.secret === undefined) delete process.env.EZER_INTERNAL_API_SECRET; else process.env.EZER_INTERNAL_API_SECRET = env.secret;
+  });
+  process.env.EZER_ADMISSION_CLAIM_URL = 'http://ezer.test/internal/admission-claims';
+  process.env.EZER_INTERNAL_API_SECRET = SIGNING_SECRET;
+  const taskClaims = { ...claims, version: 2, generation: 1, storyId: 'EP-publication-policy-S01-T02' };
+  pendingToken = signClaims(taskClaims);
+  atomicConsumeCalls = 0; queuedJobs = 0;
+  const redis = {
+    set: async () => 'OK', get: async (key: string) => key.includes('pending') ? pendingToken : null,
+    eval: async () => { atomicConsumeCalls++; return 1; }, lpush: async () => 1, ltrim: async () => 'OK',
+  };
+  let mode: 'unavailable' | 'refused' | 'stale' | 'success' = 'unavailable';
+  t.mock.method(globalThis, 'fetch', async (_url: unknown, options: { body: string }) => {
+    if (mode === 'unavailable') throw Error('ECONNREFUSED');
+    const request = JSON.parse(options.body);
+    return new Response(JSON.stringify({ ...request, claimed: mode !== 'refused', claimId: 'claim',
+      currentGeneration: mode === 'stale' ? 2 : 1, cancelled: false }), { status: 200 });
+  });
+  for (const failure of ['unavailable', 'refused', 'stale'] as const) {
+    mode = failure;
+    assert.deepEqual(await processDetectedIssue(issue as never, 'v2-correlation', redis as never),
+      { status: 'blocked', reason: 'ezer_admission_refused' });
+    assert.equal(atomicConsumeCalls, 0);
+    assert.equal(queuedJobs, 0);
+  }
+  mode = 'success';
+  assert.equal((await processDetectedIssue(issue as never, 'v2-correlation', redis as never)).status, 'accepted');
+  assert.equal(atomicConsumeCalls, 1);
+  assert.equal(queuedJobs, 1);
+});

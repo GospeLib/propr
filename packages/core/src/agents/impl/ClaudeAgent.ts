@@ -169,7 +169,7 @@ export class ClaudeAgent implements Agent {
             }, 'Error during Claude agent execution');
 
             return {
-                success: false, ...classifyExecutionFailure({ error, ...error as object }), error: (error as Error).message, executionTimeMs: executionTime,
+                success: false, ...classifyExecutionFailure({ error, ...error as object, transportError: error }), error: (error as Error).message, executionTimeMs: executionTime,
                 logs: (error as { stderr?: string }).stderr || (error as Error).message,
                 modifiedFiles: [], commitMessage: null, summary: undefined,
                 modelUsed: this.config.defaultModel || 'unknown',

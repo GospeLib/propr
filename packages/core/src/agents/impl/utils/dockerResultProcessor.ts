@@ -115,7 +115,7 @@ export function processDockerResult(
     const terminationReason = resolveAgentTerminationReason({
         timedOut: result.timedOut,
         subtype: claudeOutput.finalResult?.subtype,
-        error: executionError
+        error: result.stderr
     });
     const summary = claudeOutput.finalResult?.result
         ?? (terminationReason ? getClaudeAnalysisText(claudeOutput) || undefined : undefined);
@@ -138,7 +138,7 @@ export function processDockerResult(
         error: executionError || (terminationReason ? describeAgentTermination(terminationReason) : undefined),
         terminationReason,
         ...(!(claudeOutput.success && !terminationReason) ? classifyExecutionFailure({
-            ...claudeOutput.failure, terminationReason, error: executionError,
+            ...claudeOutput.failure, terminationReason, transportError: result.stderr,
             infrastructure: result.infrastructureFailure,
             agentRan: !!claudeOutput.finalResult || !!claudeOutput.sessionId || claudeOutput.conversationLog.length > 0,
         }) : {}),

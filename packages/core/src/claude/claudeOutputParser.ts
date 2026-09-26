@@ -106,6 +106,13 @@ export function parseStreamJsonOutput(result: ExecutionResult): ClaudeOutput {
         finalResult: null
     };
 
+    const limitMatch = result.stderr.match(/^Claude AI usage limit reached\|(\d+)$/m);
+    if (limitMatch?.[1]) {
+        const resetTimestamp = Number(limitMatch[1]);
+        throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`,
+            resetTimestamp, result.stderr, new Date(resetTimestamp * 1000).toISOString());
+    }
+
     if (!result.stdout) return claudeOutput;
 
     let streamStarted = false;
@@ -168,7 +175,7 @@ function processJsonLine(
 ): void {
     if (jsonLine.error || jsonLine.is_error || jsonLine.type === 'error') {
         claudeOutput.failure = classifyExecutionFailure({ error: { ...jsonLine,
-            message: jsonLine.result, type: jsonLine.subtype ?? jsonLine.type,
+            type: jsonLine.subtype ?? jsonLine.type,
         }, agentRan: true });
     }
     // Check for new rate limit format: {"type": "assistant", "error": "rate_limit", "message": {...}}
@@ -218,14 +225,6 @@ function processResultLine(jsonLine: JsonLineMessage, claudeOutput: ClaudeOutput
         };
     }
 
-    if (jsonLine.result) {
-        const limitMatch = jsonLine.result.match(/Claude AI usage limit reached\|(\d+)/);
-        if (limitMatch && limitMatch[1]) {
-            const resetTimestamp = parseInt(limitMatch[1], 10);
-            logger.warn({ resetTimestamp }, 'Claude usage limit reached. Throwing specific error for requeue.');
-            throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`, resetTimestamp, undefined, new Date(resetTimestamp * 1000).toISOString());
-        }
-    }
 
     if (jsonLine.total_cost_usd && !jsonLine.cost_usd) {
         claudeOutput.finalResult.cost_usd = jsonLine.total_cost_usd;

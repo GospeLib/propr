@@ -26,3 +26,11 @@ test('all failed finals are classified and persistence keeps the same cause', as
     assert.deepEqual(finalClaudeExecutionResult({ success: false, terminationReason: 'timeout', failureKind: 'usage_limit', usageResetAt: '2026-09-25T12:00:00Z' }),
         { success: false, terminationReason: 'timeout', resultPhase: 'final', failureKind: 'timeout' });
 });
+
+test('final summary error prose never supplies a transport classification', () => {
+    for (const error of ['The endpoint returns 503 and 429; rate limit implementation failed.',
+        'API Error: 503 {"error":{"type":"overloaded_error"}}',
+        'API Error: 429 {"error":{"type":"rate_limit_error"}}', 'overloaded_error']) {
+        assert.equal(finalClaudeExecutionResult({ success: false, sessionId: 'ran', error }).failureKind, 'agent_error');
+    }
+});

@@ -152,7 +152,7 @@ export async function executeClaudeCode(options: ExecuteClaudeCodeOptions): Prom
             terminationReason,
             ...(!(claudeOutput.success && !terminationReason) ? classifyExecutionFailure({
                 ...claudeOutput.failure, terminationReason,
-                error: claudeOutput.finalResult?.result || claudeOutput.error,
+                transportError: result.stderr,
                 infrastructure: result.infrastructureFailure,
                 agentRan: !!claudeOutput.finalResult || !!claudeOutput.sessionId || claudeOutput.conversationLog.length > 0,
             }) : {}),
@@ -180,7 +180,7 @@ export async function executeClaudeCode(options: ExecuteClaudeCodeOptions): Prom
         const err = error as Error;
         logger.error({ issueNumber: issueRef.number, executionTime, error: err.message }, 'Error during Claude Code execution');
         return {
-            success: false, ...classifyExecutionFailure({ error, ...error as object }), error: err.message, executionTime, output: null,
+            success: false, ...classifyExecutionFailure({ error, ...error as object, transportError: error }), error: err.message, executionTime, output: null,
             logs: (error as { stderr?: string }).stderr || err.message,
             modifiedFiles: [], commitMessage: null, summary: null
         };

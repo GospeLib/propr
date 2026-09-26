@@ -12,10 +12,12 @@ interface FailureInput extends ExecutionFailure {
     agentRan?: boolean;
     infrastructure?: boolean;
     error?: unknown;
+    /** Only CLI/transport diagnostics, never agent-authored result or summary text. */
+    transportError?: unknown;
     now?: number;
 }
-const USAGE_LIMIT_PATTERN = /(?:rate.?limit|usage limit|quota|insufficient[_ ]quota|too many requests|\b429\b)/i;
-const PROVIDER_ERROR_PATTERN = /(?:overloaded|overload_error|api_error|internal server error|service unavailable|\b5\d\d\b)/i;
+const USAGE_LIMIT_PATTERN = /^(?:API Error: 429\b[^\n]*|Claude AI usage limit reached\|\d+|rate_limit_error|insufficient_quota)$/im;
+const PROVIDER_ERROR_PATTERN = /^(?:API Error: 5\d\d\b[^\n]*|overloaded_error|overload_error|api_error)$/im;
 const TIMEOUT_PATTERN = /(?:^|\n)(?:command|agent execution) timed out after \d+ms$/i;
 const MAX_TURNS_PATTERN = /(?:error[_ -]max[_ -]turns|max(?:imum)?(?: number of)? (?:turns|steps|iterations)(?: reached| exceeded)?)/i;
 
@@ -69,7 +71,8 @@ export function classifyExecutionFailure(input: FailureInput): Required<Pick<Exe
     if (!failureKind && type === 'error_max_turns') failureKind = 'max_turns';
     if (!failureKind && ['APIConnectionError', 'ECONNREFUSED', 'ENOENT', 'EACCES'].includes(String(error.code ?? type))) failureKind = 'infrastructure';
     failureKind ??= input.failureKind;
-    const message = typeof input.error === 'string' ? input.error : String(error.message ?? nested.message ?? (typeof error.error === 'string' ? error.error : ''));
+    const transport = object(input.transportError);
+    const message = typeof input.transportError === 'string' ? input.transportError : String(transport.message ?? '');
     failureKind ??= classifyFailureMessage(message);
     failureKind ??= input.agentRan ? 'agent_error' : 'infrastructure';
     const usageResetAt = failureKind === 'usage_limit' ? iso(input.usageResetAt) ?? reportedReset(error, input.now ?? Date.now()) : undefined;

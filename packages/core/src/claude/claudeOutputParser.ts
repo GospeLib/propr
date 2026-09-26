@@ -95,6 +95,18 @@ interface JsonLineMessage {
     headers?: Record<string, string>;
 }
 
+const CLI_API_ERROR_PATTERN = /^API Error: (429|5\d\d)\b/;
+const CLI_USAGE_LIMIT_PATTERN = /^Claude AI usage limit reached\|(\d+)$/;
+const STDERR_USAGE_LIMIT_PATTERN = new RegExp(CLI_USAGE_LIMIT_PATTERN.source, 'm');
+
+function requeueReportedUsageLimit(message: string, pattern: RegExp): void {
+    const limitMatch = message.match(pattern);
+    if (!limitMatch?.[1]) return;
+    const resetTimestamp = Number(limitMatch[1]);
+    throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`,
+        resetTimestamp, message, new Date(resetTimestamp * 1000).toISOString());
+}
+
 export function parseStreamJsonOutput(result: ExecutionResult): ClaudeOutput {
     const claudeOutput: ClaudeOutput = {
         success: result.exitCode === 0,
@@ -106,12 +118,7 @@ export function parseStreamJsonOutput(result: ExecutionResult): ClaudeOutput {
         finalResult: null
     };
 
-    const limitMatch = result.stderr.match(/^Claude AI usage limit reached\|(\d+)$/m);
-    if (limitMatch?.[1]) {
-        const resetTimestamp = Number(limitMatch[1]);
-        throw new UsageLimitError(`Claude usage limit reached. Limit resets at timestamp ${resetTimestamp}.`,
-            resetTimestamp, result.stderr, new Date(resetTimestamp * 1000).toISOString());
-    }
+    requeueReportedUsageLimit(result.stderr, STDERR_USAGE_LIMIT_PATTERN);
 
     if (!result.stdout) return claudeOutput;
 
@@ -173,10 +180,16 @@ function processJsonLine(
     claudeOutput: ClaudeOutput,
     messageTimestamps: Map<string, string>
 ): void {
+    // Only error-result records can carry CLI diagnostics in the result field.
+    // Pass only the recognized prefix, never surrounding agent-authored prose.
+    const cliResult = jsonLine.type === 'result' && jsonLine.is_error === true && typeof jsonLine.result === 'string'
+        ? jsonLine.result : undefined;
+    if (cliResult !== undefined) requeueReportedUsageLimit(cliResult, CLI_USAGE_LIMIT_PATTERN);
+    const cliApiError = cliResult?.match(CLI_API_ERROR_PATTERN)?.[0];
     if (jsonLine.error || jsonLine.is_error || jsonLine.type === 'error') {
         claudeOutput.failure = classifyExecutionFailure({ error: { ...jsonLine,
             type: jsonLine.subtype ?? jsonLine.type,
-        }, agentRan: true });
+        }, transportError: cliApiError, agentRan: true });
     }
     // Check for new rate limit format: {"type": "assistant", "error": "rate_limit", "message": {...}}
     if (jsonLine.type === 'assistant' && jsonLine.error === 'rate_limit') {

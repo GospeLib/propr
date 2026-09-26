@@ -30,7 +30,9 @@ test('all failed finals are classified and persistence keeps the same cause', as
 test('final summary error prose never supplies a transport classification', () => {
     for (const error of ['The endpoint returns 503 and 429; rate limit implementation failed.',
         'API Error: 503 {"error":{"type":"overloaded_error"}}',
-        'API Error: 429 {"error":{"type":"rate_limit_error"}}', 'overloaded_error']) {
+        'API Error: 429 {"error":{"type":"rate_limit_error"}}', 'overloaded_error',
+        'API Error: 529 {"error":{"type":"overloaded_error"}}',
+        'Claude AI usage limit reached|1790000000']) {
         assert.equal(finalClaudeExecutionResult({ success: false, sessionId: 'ran', error }).failureKind, 'agent_error');
     }
 });

@@ -71,10 +71,11 @@ test('final output is redacted and bounded to the recovery checkpointText limit,
 
 test('the claude_execution state records outcome evidence only for admitted executions', () => {
     const claudeResult = { success: false, executionTime: 5, output: null, logs: '', modifiedFiles: [], commitMessage: null,
-        summary: 'Stopped mid-way.', error: 'timed out', terminationReason: 'timeout' as const, numTurns: 7, sessionId: 's', conversationId: 'c' };
+        summary: 'Stopped mid-way.', error: 'timed out', failureKind: 'timeout' as const, terminationReason: 'timeout' as const, numTurns: 7, sessionId: 's', conversationId: 'c' };
     assert.deepEqual(buildExecutionStateSummary(claudeResult, false),
-        { success: false, sessionId: 's', conversationId: 'c', executionTime: 5 });
+        { success: false, sessionId: 's', conversationId: 'c', executionTime: 5, failureKind: 'timeout',
+            usageResetAt: undefined, terminationReason: 'timeout', error: 'timed out' });
     assert.deepEqual(JSON.parse(JSON.stringify(buildExecutionStateSummary(claudeResult, true))), {
-        success: false, sessionId: 's', conversationId: 'c', executionTime: 5, terminationReason: 'timeout',
+        success: false, sessionId: 's', conversationId: 'c', executionTime: 5, failureKind: 'timeout', terminationReason: 'timeout',
         numTurns: 7, finalOutput: 'Stopped mid-way.', error: 'timed out' });
 });

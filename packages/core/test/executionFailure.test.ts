@@ -59,11 +59,15 @@ test('assistant rate-limit errors retain reported headers when requeued', () => 
 
 const agentFailureProse = [
     'The endpoint returns 503 and 429; could not implement the rate limit or quota handling.',
-    'API Error: 503 {"error":{"type":"overloaded_error"}}',
-    'API Error: 429 {"error":{"type":"rate_limit_error"}}',
+    'The CLI reported API Error: 529 {"error":{"type":"overloaded_error"}} during my task.',
+    'Diagnostics:\nAPI Error: 429 {"error":{"type":"rate_limit_error"}}',
     'overloaded_error',
-    'Claude AI usage limit reached|1790337600',
+    'Claude AI usage limit reached|1790337600 followed by agent prose',
+    'Diagnostics:\nClaude AI usage limit reached|1790337600',
     'maximum turns exceeded',
+    'API Error: 5290 invalid status',
+    ' API Error: 529 leading whitespace',
+    'api error: 529 lowercase prose',
 ];
 test('agent result prose cannot become transport or termination failures', () => {
     for (const result of agentFailureProse) {
@@ -87,4 +91,42 @@ test('CLI stderr API errors retain provider and usage classifications', () => {
 test('legacy CLI usage diagnostics preserve their reported reset from stderr', () => {
     assert.throws(() => parseStreamJsonOutput({ ...docker(''), stderr: 'Claude AI usage limit reached|1790337600' }),
         (error: unknown) => error instanceof UsageLimitError && error.usageResetAt === '2026-09-25T12:00:00.000Z');
+});
+
+test('CLI API diagnostics on error results reach the parser and agent response', () => {
+    for (const [result, expected] of [
+        ['API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}', 'provider_error'],
+        ['API Error: 429 ...', 'usage_limit'],
+    ]) {
+        const output = docker(JSON.stringify({ type: 'result', is_error: true, result }));
+        assert.equal(parseStreamJsonOutput(output).failure?.failureKind, expected);
+        assert.equal(processDockerResult(output, 'task', 'claude', 1).response.failureKind, expected);
+    }
+});
+
+test('error result usage markers requeue with the exact provider reset', () => {
+    const result = 'Claude AI usage limit reached|1790000000';
+    const output = docker(JSON.stringify({ type: 'result', is_error: true, result }));
+    for (const parse of [() => parseStreamJsonOutput(output), () => processDockerResult(output, 'task', 'claude', 1)]) {
+        assert.throws(parse, (error: unknown) => error instanceof UsageLimitError
+            && error.resetTimestamp === 1790000000 && error.usageResetAt === '2026-09-21T14:13:20.000Z'
+            && error.rawErrorMessage === result && error.retryable && error.failureKind === 'usage_limit');
+    }
+});
+
+test('non-error results cannot supply CLI failure classifications or requeue markers', () => {
+    for (const is_error of [false, undefined]) {
+        for (const result of ['My task failed after API Error: 529', 'API Error: 529 overloaded_error',
+            'API Error: 429 ...', 'Claude AI usage limit reached|1790000000']) {
+            const output = docker(JSON.stringify({ type: 'result', is_error, result, num_turns: 1 }));
+            const parsed = parseStreamJsonOutput(output);
+            assert.equal(parsed.failure, undefined);
+            assert.equal(classifyExecutionFailure({ agentRan: true, error: parsed.finalResult?.result }).failureKind, 'agent_error');
+        }
+    }
+});
+
+test('structured error signals precede error-result CLI API text', () => {
+    const output = docker(JSON.stringify({ type: 'result', is_error: true, status: 429, result: 'API Error: 529 ...' }));
+    assert.equal(parseStreamJsonOutput(output).failure?.failureKind, 'usage_limit');
 });

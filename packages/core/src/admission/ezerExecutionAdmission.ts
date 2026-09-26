@@ -8,6 +8,7 @@ import {
     type TypedInvestigationAdmission,
 } from './admissionBindings.js';
 import { parseDelegation, requireDelegationWithinAdmission, requirePositiveOrdinal, type ExecutionDelegation } from './executionDelegation.js';
+import { admissionTokenDigest, requireEzerAdmissionClaim, type AdmissionClaimClient, type StoredAdmissionClaim } from './ezerAdmissionClaim.js';
 import { admissionUnitId, requireAdmissionUnitId, requireUnitWithinAdmission } from './admissionUnit.js';
 
 export { requireTypedArtifactCorrection, requireTypedInvestigation };
@@ -38,7 +39,9 @@ export interface ExecutionAdmissionClaims {
     artifactCorrection?: TypedArtifactCorrection;
     typedWork?: TypedInvestigationAdmission;
     comment?: CommentAdmissionBinding;
-    version: 1;
+    version: 1 | 2;
+    /** Required positive per-unit generation under v2; ignored under v1. */
+    generation?: number;
     admissionId: string;
     operationId: string;
     storyId: string;
@@ -61,6 +64,8 @@ export interface ExecutionAdmissionClaims {
 }
 
 export interface WorkerAdmissionReceipt {
+    /** Absent for byte-identical v1 receipts. V2 must match trusted receipt storage. */
+    version?: 2;
     delegatedAuthority?: ExecutionDelegation;
     route?: ExecutionRouteBinding;
     admissionId: string;
@@ -134,21 +139,22 @@ function parseClaims(encodedPayload: string): ExecutionAdmissionClaims {
     }
     if (!value || typeof value !== 'object' || Array.isArray(value)) refuse('malformed-admission');
     const candidate = value as Record<string, unknown>;
-    if (candidate.version !== 1) refuse('unsupported-version');
+    if (candidate.version !== 1 && candidate.version !== 2) refuse('unsupported-version');
     const scope = candidate.scope;
     if (!Array.isArray(scope) || scope.length === 0 || scope.some(item => typeof item !== 'string' || item.trim() === '')) {
         refuse('ambiguous-scope');
     }
     if (!Number.isSafeInteger(candidate.issueNumber) || Number(candidate.issueNumber) < 1) refuse('invalid-issue');
     return {
-        ...(candidate.delegatedAuthority === undefined ? {} : { delegatedAuthority: parseDelegation(candidate.delegatedAuthority) }),
+        ...(candidate.delegatedAuthority === undefined ? {} : { delegatedAuthority: parseDelegation(candidate.delegatedAuthority, candidate.version) }),
         ...(candidate.route === undefined ? {} : {route:requireExecutionRoute(candidate.route)}),
     ...(candidate.control === undefined ? {} : {control:parseStopBinding(candidate.control)}),
         ...(candidate.storyExecution === undefined ? {} : { storyExecution: requireStoryExecutionContract(candidate.storyExecution) }),
         ...(candidate.artifactCorrection === undefined ? {} : { artifactCorrection: requireTypedArtifactCorrection(candidate.artifactCorrection) }),
         ...(candidate.typedWork === undefined ? {} : { typedWork: requireTypedInvestigation(candidate.typedWork) }),
         ...(candidate.comment === undefined ? {} : { comment: parseCommentBinding(candidate.comment) }),
-        version: 1,
+        version: candidate.version,
+        ...(candidate.version === 2 ? { generation: requirePositiveOrdinal(candidate.generation, 'invalid-unit-generation') } : {}),
         admissionId: requiredString(candidate.admissionId, 'missing-admission-id'),
         operationId: requiredString(candidate.operationId, 'missing-operation-id'),
         storyId: requiredString(candidate.storyId, 'missing-story-id'),
@@ -218,6 +224,7 @@ export async function consumeExecutionAdmission(input: {
     nowMs?: number;
     /** Runs only after signature and claim validation; rejection preserves the single-use admission. */
     preConsumePolicy?: (claims: ExecutionAdmissionClaims) => Promise<void>;
+    claimClient?: AdmissionClaimClient;
 }): Promise<{ claims: ExecutionAdmissionClaims; receipt: WorkerAdmissionReceipt }> {
     const tokenParts = input.token.split('.');
     if (tokenParts.length !== TOKEN_PART_COUNT) refuse('malformed-admission');
@@ -226,10 +233,19 @@ export async function consumeExecutionAdmission(input: {
     const claims = parseClaims(encodedPayload);
     validateClaims(claims, input.expected, input.nowMs ?? Date.now());
     await input.preConsumePolicy?.(claims);
+    // V1 never resolves callback configuration or invokes a claim client.
+    const v2Claim = claims.version === 2 ? await requireEzerAdmissionClaim({
+        version: 2, action: 'claim', admissionToken: input.token,
+        admissionId: claims.admissionId, operationId: claims.operationId,
+        repository: claims.repository, epicId: claims.epicId, unitId: admissionUnitId(claims),
+        generation: requirePositiveOrdinal(claims.generation, 'invalid-unit-generation'),
+        tokenDigest: admissionTokenDigest(input.token),
+    }, input.claimClient) : undefined;
     const ttlSeconds = validateClaims(claims, input.expected, input.nowMs ?? Date.now());
     const consumedKey = `${CONSUMED_KEY_PREFIX}${claims.admissionId}`;
     const receiptKey = `${RECEIPT_KEY_PREFIX}${claims.admissionId}`;
     const receiptValue = JSON.stringify({
+        ...(v2Claim === undefined ? {} : { version: 2, v2Claim }),
         ...(claims.delegatedAuthority === undefined ? {} : { delegatedAuthority: claims.delegatedAuthority }),
         admissionId: claims.admissionId,
         operationId: claims.operationId,
@@ -249,10 +265,11 @@ export async function consumeExecutionAdmission(input: {
         ...(claims.startBy === undefined ? {} : { startBy: claims.startBy }),
     });
     if (!await input.store.consumeAndIssue(consumedKey, receiptKey, receiptValue, ttlSeconds)) refuse('replayed-admission');
-    return { claims, receipt: { ...(claims.delegatedAuthority ? { delegatedAuthority: claims.delegatedAuthority } : {}), ...(claims.route ? {route:claims.route} : {}), admissionId: claims.admissionId, operationId: claims.operationId, storyId: claims.storyId, receiptKey } };
+    return { claims, receipt: { ...(v2Claim === undefined ? {} : { version: 2 as const }), ...(claims.delegatedAuthority ? { delegatedAuthority: claims.delegatedAuthority } : {}), ...(claims.route ? {route:claims.route} : {}), admissionId: claims.admissionId, operationId: claims.operationId, storyId: claims.storyId, receiptKey } };
 }
 
 interface WorkerReceiptVerification {
+    claimClient?: AdmissionClaimClient;
     receipt: WorkerAdmissionReceipt;
     expected: ExpectedExecution & { target: string };
     expectedRoute?: {agentId:string;agentAlias:string;provider:string;model:string};
@@ -271,8 +288,21 @@ export async function inspectWorkerAdmissionReceipt(input: WorkerReceiptVerifica
 }
 
 export async function verifyWorkerAdmissionReceipt(input: WorkerReceiptVerification & {
-    store: Pick<AdmissionStore, 'take'>;
+    store: Pick<AdmissionStore, 'take'> & Partial<Pick<AdmissionStore, 'get'>>;
 }): Promise<TypedInvestigationAdmission | undefined> {
+    if (input.receipt.version === 2) {
+        // Read/check first: an unavailable Ezer must leave the receipt retryable.
+        if (!input.store.get) refuse('v2-receipt-store-required');
+        const stored = await input.store.get(input.receipt.receiptKey);
+        validateWorkerAdmissionReceipt(stored, { ...input, onStoryExecution: undefined,
+            onExecutionDeadline: undefined, onArtifactCorrection: undefined });
+        const { v2Claim } = JSON.parse(stored!) as { v2Claim: StoredAdmissionClaim };
+        await requireEzerAdmissionClaim({ ...v2Claim.identity, version: 2, action: 'check',
+            admissionToken: v2Claim.admissionToken, claimId: v2Claim.claimId }, input.claimClient);
+        const taken = await input.store.take(input.receipt.receiptKey);
+        if (taken !== stored) refuse('missing-or-changed-worker-receipt');
+        return validateWorkerAdmissionReceipt(taken, input);
+    }
     return validateWorkerAdmissionReceipt(await input.store.take(input.receipt.receiptKey), input);
 }
 
@@ -284,8 +314,10 @@ function validateWorkerAdmissionReceipt(stored: string | null, input: WorkerRece
     } catch {
         refuse('malformed-worker-receipt');
     }
+    if (value.version !== input.receipt.version) refuse('worker-receipt-version-mismatch');
+    if (value.version === 2 && !value.v2Claim) refuse('missing-worker-claim');
     if(value.control!==undefined)refuse('stop-control-cannot-start-worker');
-    const delegated = value.delegatedAuthority === undefined ? undefined : parseDelegation(value.delegatedAuthority);
+    const delegated = value.delegatedAuthority === undefined ? undefined : parseDelegation(value.delegatedAuthority, value.version === 2 ? 2 : 1);
     if (JSON.stringify(delegated) !== JSON.stringify(input.receipt.delegatedAuthority)) refuse('delegation-receipt-changed');
     if (value.integrationDigest !== input.expectedIntegrationDigest) refuse('integration-worker-binding-changed');
     if (value.admissionId !== input.receipt.admissionId || value.operationId !== input.receipt.operationId ||

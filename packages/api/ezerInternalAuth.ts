@@ -13,6 +13,12 @@ export const EZER_INTERNAL_SECRET_ENV = 'EZER_INTERNAL_API_SECRET';
 export const EZER_INTERNAL_SECRET_HEADER = 'x-ezer-internal-secret';
 const MINIMUM_SECRET_BYTES = 32;
 
+/** Advertised on the already eligible GET /api/status; Ezer must negotiate before sending v2. */
+export const EZER_ADMISSION_CAPABILITIES = {
+  versions: [1, 2],
+  v2: { unitGeneration: true, consumeClaim: true, workerClaimRecheck: true },
+} as const;
+
 const EZER_INTERNAL_ELIGIBLE_ROUTES: ReadonlyArray<{ method: string; pattern: RegExp }> = [
   { method: 'POST', pattern: /^\/tasks\/integration$/ },
   { method: 'GET', pattern: /^\/tasks\/integration\/[a-f0-9]{64}$/ },

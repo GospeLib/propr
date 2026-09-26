@@ -21,6 +21,7 @@ import type { Agent, AgentConfig, AgentRegistryOperationalStatus } from '@propr/
 import type { SyntheticAgentConfig } from '@propr/shared';
 import path from 'node:path';
 import os from 'node:os';
+import { EZER_ADMISSION_CAPABILITIES } from '../ezerInternalAuth.js';
 import { applyRoutingStatus, parseConnectAccountStatus, type RoutingState } from './connectAccountStatus.js';
 
 interface StatusRoutesDeps {
@@ -84,7 +85,7 @@ export function createStatusRoutes(deps: StatusRoutesDeps) {
 
   async function getStatus(req: Request, res: Response): Promise<void> {
     try {
-      const compatibility = getProprCompatibilityMetadata();
+      const compatibility = { ...getProprCompatibilityMetadata(), ezerAdmission: EZER_ADMISSION_CAPABILITIES };
       // In demo mode, return all-green status
       if (isDemoMode()) {
         res.json({

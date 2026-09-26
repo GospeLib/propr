@@ -189,6 +189,8 @@ test('/api/status omits disabled configured agents', async () => {
   assert.equal(body.version, PROPR_VERSION);
   assert.equal(body.apiCompatibility, PROPR_API_COMPATIBILITY);
   assert.equal(body.uiCompatibility, PROPR_UI_COMPATIBILITY);
+  assert.deepEqual(body.ezerAdmission, { versions: [1, 2],
+    v2: { unitGeneration: true, consumeClaim: true, workerClaimRecheck: true } });
   assert.deepEqual(body.agents, []);
   assert.equal(body.claudeAuth, 'disconnected');
 });

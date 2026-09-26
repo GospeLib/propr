@@ -59,14 +59,14 @@ describe('agent config migration', () => {
         assert.strictEqual(migrated, true);
         assert.strictEqual(agent.cliVersionType, 'default');
         assert.strictEqual(agent.cliVersionResolved, AGENT_DEFAULT_VERSIONS.claude);
-        assert.strictEqual(agent.dockerImage, 'propr/agent:latest');
+        assert.strictEqual(agent.dockerImage, 'claude-code-processor:latest');
         assert.ok(agent.supportedModels.includes('claude-opus-5'));
         assert.ok(agent.supportedModels.includes('claude-sonnet-5'));
         assert.ok(agent.supportedModels.includes('claude-opus-4-6'));
         assert.ok(agent.supportedModels.includes('claude-sonnet-4-6'));
     });
 
-    test('normalizes legacy agent images while updating Codex defaults', () => {
+    test('preserves configured legacy agent images while updating Codex defaults', () => {
         const gemini = createAgent({
             id: 'gemini-1',
             type: 'gemini',
@@ -83,7 +83,7 @@ describe('agent config migration', () => {
         assert.strictEqual(migrateAgentConfig(gemini), true);
         assert.strictEqual(migrateAgentConfig(codex), true);
         assert.strictEqual(gemini.dockerImage, 'propr-gemini:latest');
-        assert.strictEqual(codex.dockerImage, 'propr/agent:latest');
+        assert.strictEqual(codex.dockerImage, 'codex-code-processor:latest');
         assert.ok(codex.supportedModels.includes('gpt-5.6-sol'));
         assert.ok(codex.supportedModels.includes('gpt-5.6-terra'));
         assert.ok(codex.supportedModels.includes('gpt-5.6-luna'));
@@ -91,7 +91,7 @@ describe('agent config migration', () => {
         assert.strictEqual(codex.defaultModel, 'gpt-5.6-sol');
     });
 
-    test('normalizes custom images during default CLI migration', () => {
+    test('preserves custom images during default CLI migration', () => {
         const agent = createAgent({
             type: 'codex',
             dockerImage: 'local/codex-custom:latest',
@@ -101,7 +101,7 @@ describe('agent config migration', () => {
 
         assert.strictEqual(migrateAgentConfig(agent), true);
         assert.strictEqual(agent.cliVersionType, 'default');
-        assert.strictEqual(agent.dockerImage, 'propr/agent:latest');
+        assert.strictEqual(agent.dockerImage, 'local/codex-custom:latest');
         assert.strictEqual(agent.defaultModel, 'gpt-5.6-sol');
         assert.strictEqual(agent.cliVersionResolved, AGENT_DEFAULT_VERSIONS.codex);
     });

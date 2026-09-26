@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
-import { after, test } from 'node:test';
+import { before, after, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Request, Response } from 'express';
-import { closeConnection, executeDockerCommand, getAgentRegistry, type Agent, type AnalyzeOptions } from '@propr/core';
+import { runMigrations, closeConnection, executeDockerCommand, getAgentRegistry, type Agent, type AnalyzeOptions } from '@propr/core';
 import { createAgentRoutes } from '../routes/index.js';
 import { nativeAnalysis } from '../routes/nativeAnalysis.js';
 
@@ -377,3 +377,6 @@ test('planning-artifact profile applies bounded semantic controls without trunca
         registry.getAgentById = originalGet;
     }
 });
+
+// af896baa / 6cc3073c: terminal identity and execution leases use durable SQL even with a fake projection.
+before(runMigrations);

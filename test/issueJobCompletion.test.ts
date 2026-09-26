@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { after, describe, mock, test } from 'node:test';
-import { closeConnection } from '@propr/core';
+import { before, after, describe, mock, test } from 'node:test';
+import { runMigrations, closeConnection } from '@propr/core';
 import { markTaskComplete, markTaskTerminalState } from '../src/jobs/issueJob/completion.js';
 import type { TaskCompletionParams } from '../src/jobs/issueJob/types.js';
 
@@ -158,3 +158,6 @@ describe('issue job terminal state', () => {
     assert.equal(stateManager.markTaskCompleted.mock.callCount(), 0);
   });
 });
+
+// af896baa: a completion claims its terminal identity in durable SQL.
+before(runMigrations);

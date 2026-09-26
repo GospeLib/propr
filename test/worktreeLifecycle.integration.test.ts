@@ -237,7 +237,7 @@ describe('Worktree Lifecycle Integration Tests', () => {
     beforeEach(async () => {
         originalEnv = { ...process.env };
 
-        tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'propr-worktree-lifecycle-'));
+        tempDir = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), 'propr-worktree-lifecycle-'));
 
         worktreesBasePath = path.join(tempDir, 'worktrees');
         testRepoPath = path.join(tempDir, 'test-repo');

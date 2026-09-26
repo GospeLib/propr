@@ -134,20 +134,9 @@ try {
 
     db = knex(config);
 
-    // Test connection
-    db.raw('SELECT 1')
-        .then(() => {
-            logger.info({
-                filename: dbFilename,
-                environment
-            }, 'SQLite database connection established successfully');
-        })
-        .catch((error: Error) => {
-            logger.error({
-                error: error.message,
-                filename: dbFilename
-            }, 'SQLite database connection test failed');
-        });
+    // Keep the pool lazy: importing a public helper must not acquire a SQLite
+    // connection and keep the process alive. Startup verifies the database through
+    // runMigrations/applyDatabaseMigrations before accepting work.
 
 } catch (error) {
     const err = error as Error;

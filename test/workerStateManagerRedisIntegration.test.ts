@@ -6,6 +6,7 @@ import {
     buildTaskStateTransition,
     compareAndSetTaskStateData,
 } from '../packages/core/src/utils/workerStateTransition.js';
+import { nonExecutingCompletionGuard } from '../packages/core/src/utils/completionGuard.js';
 import { closeConnection } from '../packages/core/src/db/connection.js';
 import {
     TaskStates,
@@ -55,6 +56,8 @@ test('Redis CAS rejects a stale metadata snapshot after terminalization', async 
         await redis.setex(key, 60, initialJson);
         const terminal = buildTaskStateTransition(initial, TaskStates.COMPLETED, {
             reason: 'BullMQ completed',
+            // 2015f2a6 guards completed transitions; this fixture tests CAS, with no model execution.
+            completionGuard: nonExecutingCompletionGuard('Redis CAS transition mechanics under test'),
         }).state;
         const staleMetadata = buildTaskStateMutation(initial, state => {
             state.issueRef = { ...state.issueRef, modelName: 'gpt-5.6' };

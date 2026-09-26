@@ -318,7 +318,9 @@ preflight_immutable_tag() {
   fi
 }
 
-declare -A PREFLIGHTED_CANDIDATE_DIGESTS=()
+# Indexed arrays also work with the system Bash 3.2 shipped by macOS.
+PREFLIGHTED_REPOSITORIES=()
+PREFLIGHTED_CANDIDATE_DIGESTS=()
 
 preflight_candidate_image() {
   local name="$1" repository candidate_ref staged_digest authoritative_digest suffix
@@ -358,14 +360,21 @@ preflight_candidate_image() {
     while IFS= read -r suffix; do
       preflight_immutable_tag "$repository:$suffix" "$authoritative_digest" || return
     done < <(immutable_suffixes_for "$name")
-    PREFLIGHTED_CANDIDATE_DIGESTS["$repository"]="$authoritative_digest"
+    PREFLIGHTED_REPOSITORIES+=("$repository")
+    PREFLIGHTED_CANDIDATE_DIGESTS+=("$authoritative_digest")
   done < <(repositories_for "$name")
 }
 
 publish_candidate_image() {
-  local name="$1" repository rebuilt_digest
+  local name="$1" repository rebuilt_digest index
   while IFS= read -r repository; do
-    rebuilt_digest="${PREFLIGHTED_CANDIDATE_DIGESTS[$repository]:-}"
+    rebuilt_digest=""
+    for index in "${!PREFLIGHTED_REPOSITORIES[@]}"; do
+      if [[ "${PREFLIGHTED_REPOSITORIES[$index]}" == "$repository" ]]; then
+        rebuilt_digest="${PREFLIGHTED_CANDIDATE_DIGESTS[$index]}"
+        break
+      fi
+    done
     if [[ -z "$rebuilt_digest" ]]; then
       echo "Refusing to publish $repository without a preflighted staged artifact digest" >&2
       return 1

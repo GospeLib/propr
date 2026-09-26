@@ -16,11 +16,14 @@ const { cleanupWorktree } = await import('../packages/core/src/git/worktreeOpera
 // Retained-worktree registrations live in an isolated directory, never the worker default.
 const retentionStoreDir = await mkdtemp(join(tmpdir(), 'propr-retention-store-'));
 process.env.CHECKPOINT_RETENTION_DIR = retentionStoreDir;
+// af896baa and a7804233 added transitive core imports; preserve their real implementations.
+const core = await import('@propr/core');
 const publicationPolicy = await import('../packages/core/src/publication/index.js');
 const { requireAuthorizedPublicationMetadata } = await import('../packages/core/src/admission/authorizedPublicationMetadata.js');
 
 await mock.module('@propr/core', {
     namedExports: {
+        ...core,
         ...publicationPolicy,
         requireAuthorizedPublicationMetadata,
         cleanupWorktree,

@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -58,7 +59,7 @@ function runCli(args: string[], cwd: string, home: string): string {
 
 for (const placement of commonOptionPlacements) {
   test(`init repo --json emits parseable JSON with options ${placement.name}`, () => {
-    const fixture = mkdtempSync(join(tmpdir(), "propr-init-repo-json-"));
+    const fixture = mkdtempSync(join(realpathSync(tmpdir()), "propr-init-repo-json-"));
     const repo = join(fixture, "repo");
     const home = join(fixture, "home");
     mkdirSync(repo);
@@ -87,7 +88,7 @@ for (const placement of commonOptionPlacements) {
   });
 
   test(`init stack --json emits parseable JSON with options ${placement.name}`, () => {
-    const fixture = mkdtempSync(join(tmpdir(), "propr-init-stack-json-"));
+    const fixture = mkdtempSync(join(realpathSync(tmpdir()), "propr-init-stack-json-"));
     const stack = join(fixture, "stack");
     const home = join(fixture, "home");
     mkdirSync(home);
@@ -118,7 +119,7 @@ for (const json of [false, true]) {
     test(
       `init repo --force${json ? " --json" : ""} with options ${placement.name} overwrites only scaffold files`,
       () => {
-        const fixture = mkdtempSync(join(tmpdir(), "propr-init-repo-force-"));
+        const fixture = mkdtempSync(join(realpathSync(tmpdir()), "propr-init-repo-force-"));
         const repo = join(fixture, "repo");
         const proprDir = join(repo, ".propr");
         const home = join(fixture, "home");
@@ -172,7 +173,7 @@ for (const json of [false, true]) {
     test(
       `init stack --force${json ? " --json" : ""} with options ${placement.name} backs up only the selected root`,
       () => {
-        const fixture = mkdtempSync(join(tmpdir(), "propr-init-stack-force-"));
+        const fixture = mkdtempSync(join(realpathSync(tmpdir()), "propr-init-stack-force-"));
         const caller = join(fixture, "caller");
         const stack = join(fixture, "selected-stack");
         const home = join(fixture, "home");

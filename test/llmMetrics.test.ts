@@ -1,7 +1,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'assert';
 import Redis from 'ioredis';
-import { recordLLMMetrics, getLLMMetricsSummary, getLLMMetricsByCorrelationId } from '@propr/core';
+import { runMigrations, closeConnection, recordLLMMetrics, getLLMMetricsSummary, getLLMMetricsByCorrelationId } from '@propr/core';
 
 interface ClaudeResultLike {
     success: boolean;
@@ -28,6 +28,7 @@ describe('LLM Metrics Tests', () => {
     const testCorrelationId = 'test-correlation-' + Date.now();
 
     before(async () => {
+        await runMigrations();
         redisClient = new Redis({
             host: process.env.REDIS_HOST || '127.0.0.1',
             port: parseInt(process.env.REDIS_PORT || '6379', 10),
@@ -49,6 +50,7 @@ describe('LLM Metrics Tests', () => {
             await redisClient.del(...keys);
         }
         await redisClient.quit();
+        await closeConnection();
     });
 
     it('should record LLM metrics successfully', async () => {
@@ -196,12 +198,8 @@ describe('LLM Metrics Tests', () => {
         assert.ok(metrics, 'Should store metrics even with missing data');
         assert.equal(metrics.success, false);
         assert.equal(metrics.costUsd, 0);
-        assert.equal(metrics.numTurns, 0);
+        // 09da242d: missing turn evidence is absent, never a fabricated zero.
+        assert.equal(Object.hasOwn(metrics, 'numTurns'), false);
         assert.equal(metrics.model, 'unknown');
     });
-});
-
-// Force exit due to module-level initialization in @propr/core
-after(() => {
-    process.exit(0);
 });

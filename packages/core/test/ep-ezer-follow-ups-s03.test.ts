@@ -177,7 +177,12 @@ test('the abort checker confirms real cessation after terminating an execution',
     const child = { kill: mock.fn(), exitCode: null as number | null, signalCode: null };
     const redis = {
         get: mock.fn(async (key: string) => (key === 'worker:abort:task-stop' ? 'abort' : null)),
-        del: mock.fn(async () => 1),
+        del: mock.fn(async (_key: string) => 1),
+        // f730c101: model the compare-delete operation, retaining the deletion assertion.
+        eval: async (_script: string, _keyCount: number, key: string, marker: string) => {
+            if (await redis.get(key) !== marker) return 0;
+            return redis.del(key);
+        },
         quit: mock.fn(async () => {}),
         disconnect: mock.fn(),
     };
@@ -211,7 +216,12 @@ test('the abort checker reports an unstopped container instead of claiming a sto
     const child = { kill: mock.fn(), exitCode: null as number | null, signalCode: null };
     const redis = {
         get: mock.fn(async (key: string) => (key === 'worker:abort:task-orphan' ? 'abort' : null)),
-        del: mock.fn(async () => 1),
+        del: mock.fn(async (_key: string) => 1),
+        // f730c101: model the compare-delete operation, retaining the deletion assertion.
+        eval: async (_script: string, _keyCount: number, key: string, marker: string) => {
+            if (await redis.get(key) !== marker) return 0;
+            return redis.del(key);
+        },
         quit: mock.fn(async () => {}),
         disconnect: mock.fn(),
     };

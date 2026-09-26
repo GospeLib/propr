@@ -1,7 +1,7 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { closeConnection, db } from '@propr/core';
+import { closeConnection, db, getAgentRegistry } from '@propr/core';
 import { withConfigLock, ConfigRouteError } from '../packages/api/routes/configHelpers.ts';
 import { applyAgentsUpdate } from '../packages/api/routes/configRoutesAgents.ts';
 import { saveSettingsWithRollback } from '../packages/api/routes/configRoutesSettings.ts';
@@ -25,7 +25,13 @@ test('withConfigLock preserves specific config operation failures', async () => 
   assert.deepEqual(result.body, { error: 'specific failure', failed_key: 'agents' });
 });
 
-test('saveSettingsWithRollback returns a specific failure without partial-commit bookkeeping keys', async () => {
+test('saveSettingsWithRollback returns a specific failure without partial-commit bookkeeping keys', async t => {
+  // c398aa5e requires an enabled supporting agent before settings reach persistence.
+  const registry = getAgentRegistry();
+  t.mock.method(registry, 'ensureInitialized', async () => undefined);
+  t.mock.method(registry, 'getAllAgents', () => [{
+    config: { enabled: true, type: 'claude', supportedModels: ['claude-sonnet-4-6'] },
+  }] as never);
   const originalTransaction = db.transaction.bind(db);
   const testDb = { transaction: db.transaction.bind(db) };
   let committed = false;

@@ -84,6 +84,12 @@ async function createHarness(): Promise<Harness> {
     get: async (key: string) => redisData.get(key) ?? null,
     set: async (key: string, value: string) => { redisData.set(key, value); return 'OK'; },
     del: async (key: string) => { redisData.delete(key); return 1; },
+    // f730c101: legacy markers are consumed with atomic compare-and-delete.
+    eval: async (_script: string, options: { keys: string[]; arguments: string[] }) => {
+      const [key] = options.keys;
+      if (redisData.get(key) !== options.arguments[0]) return 0;
+      return redisData.delete(key) ? 1 : 0;
+    },
     rPush: async (key: string, value: string) => {
       lists.set(key, [...(lists.get(key) ?? []), value]);
       return 1;

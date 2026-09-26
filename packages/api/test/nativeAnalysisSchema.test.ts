@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { after, test } from 'node:test';
-import { closeConnection, SyntheticAgent, type Agent, type AnalyzeOptions } from '@propr/core';
+import { before, after, test } from 'node:test';
+import { runMigrations, closeConnection, SyntheticAgent, type Agent, type AnalyzeOptions } from '@propr/core';
 import { nativeAnalysis, type NativeAnalysisBinding } from '../routes/nativeAnalysis.js';
 
 const PROMPT = 'exact original planning input';
@@ -75,3 +75,6 @@ for (const scenario of ['matching', 'omitted CLI schema', 'changed CLI schema', 
     }
   });
 }
+
+// af896baa / 6cc3073c: terminal identity and execution leases use durable SQL even with a fake projection.
+before(runMigrations);

@@ -3,7 +3,7 @@
  *
  * POST EZER_ADMISSION_CLAIM_URL (full URL, no implicit path), JSON AdmissionClaimRequest.
  * x-ezer-admission-signature = sha256=<hex HMAC-SHA256 of the exact UTF-8 body>, using
- * EZER_INTERNAL_API_SECRET (at least 32 bytes). No redirects; 10s timeout; non-200,
+ * EZER_ADMISSION_CLAIM_SECRET (at least 32 bytes). No redirects; 10s timeout; non-200,
  * malformed/mismatched responses, absent configuration and network errors all refuse.
  *
  * `claim`: verify the signed admissionToken and ALL identity fields; atomically append
@@ -33,6 +33,7 @@
 import { createHash, createHmac } from 'node:crypto';
 import { refuse } from './admissionBindings.js';
 
+const CLAIM_SECRET_ENV = 'EZER_ADMISSION_CLAIM_SECRET';
 const CLAIM_VERSION = 2;
 const CLAIM_TIMEOUT_MS = 10_000;
 const MINIMUM_SECRET_BYTES = 32;
@@ -79,7 +80,7 @@ export const requestEzerAdmissionClaim: AdmissionClaimClient = async request => 
     try { url = new URL(process.env.EZER_ADMISSION_CLAIM_URL ?? ''); }
     catch { return refuse('claim-url-unconfigured'); }
     if (url.username || url.password || url.hash || !['http:', 'https:'].includes(url.protocol)) refuse('claim-url-invalid');
-    const secret = process.env.EZER_INTERNAL_API_SECRET ?? '';
+    const secret = process.env[CLAIM_SECRET_ENV] ?? '';
     if (Buffer.byteLength(secret) < MINIMUM_SECRET_BYTES) refuse('claim-secret-unconfigured');
     const body = JSON.stringify(request);
     try {

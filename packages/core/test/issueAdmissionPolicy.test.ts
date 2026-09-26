@@ -151,13 +151,13 @@ test('task-level authority with its exact-base spec link consumes once and queue
 });
 
 test('real daemon intake refuses v2 without claim and retries the pending admission when Ezer returns', async t => {
-  const env = { url: process.env.EZER_ADMISSION_CLAIM_URL, secret: process.env.EZER_INTERNAL_API_SECRET };
+  const env = { url: process.env.EZER_ADMISSION_CLAIM_URL, secret: process.env.EZER_ADMISSION_CLAIM_SECRET };
   t.after(() => {
     if (env.url === undefined) delete process.env.EZER_ADMISSION_CLAIM_URL; else process.env.EZER_ADMISSION_CLAIM_URL = env.url;
-    if (env.secret === undefined) delete process.env.EZER_INTERNAL_API_SECRET; else process.env.EZER_INTERNAL_API_SECRET = env.secret;
+    if (env.secret === undefined) delete process.env.EZER_ADMISSION_CLAIM_SECRET; else process.env.EZER_ADMISSION_CLAIM_SECRET = env.secret;
   });
   process.env.EZER_ADMISSION_CLAIM_URL = 'http://ezer.test/internal/admission-claims';
-  process.env.EZER_INTERNAL_API_SECRET = SIGNING_SECRET;
+  process.env.EZER_ADMISSION_CLAIM_SECRET = SIGNING_SECRET;
   const taskClaims = { ...claims, version: 2, generation: 1, storyId: 'EP-publication-policy-S01-T02' };
   pendingToken = signClaims(taskClaims);
   atomicConsumeCalls = 0; queuedJobs = 0;

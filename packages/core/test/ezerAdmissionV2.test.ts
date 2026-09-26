@@ -191,9 +191,28 @@ test('only v2 supports durable delegation without grantExpiresAt and startBy; ad
     }
 });
 
+test('internal API secret alone leaves the claim client unconfigured and preserves admission', async t => {
+    const priorUrl = process.env.EZER_ADMISSION_CLAIM_URL;
+    const priorSecret = process.env.EZER_ADMISSION_CLAIM_SECRET;
+    const priorInternalSecret = process.env.EZER_INTERNAL_API_SECRET;
+    t.after(() => {
+        if (priorUrl === undefined) delete process.env.EZER_ADMISSION_CLAIM_URL; else process.env.EZER_ADMISSION_CLAIM_URL = priorUrl;
+        if (priorSecret === undefined) delete process.env.EZER_ADMISSION_CLAIM_SECRET; else process.env.EZER_ADMISSION_CLAIM_SECRET = priorSecret;
+        if (priorInternalSecret === undefined) delete process.env.EZER_INTERNAL_API_SECRET; else process.env.EZER_INTERNAL_API_SECRET = priorInternalSecret;
+    });
+    process.env.EZER_ADMISSION_CLAIM_URL = 'http://ezer.test/internal/admission-claims';
+    process.env.EZER_INTERNAL_API_SECRET = SECRET;
+    delete process.env.EZER_ADMISSION_CLAIM_SECRET;
+    const fetch = t.mock.method(globalThis, 'fetch', async () => { throw Error('unexpected-claim-request'); });
+    const f = fixture();
+    await assert.rejects(consumeExecutionAdmission(f), /claim-secret-unconfigured/);
+    assert.equal(fetch.mock.callCount(), 0);
+    assert.equal(f.values.size, 0);
+});
+
 test('HTTP claim lost response is retry-safe, signed, and fails closed without consuming Redis authority', async t => {
     const priorUrl = process.env.EZER_ADMISSION_CLAIM_URL;
-    const priorSecret = process.env.EZER_INTERNAL_API_SECRET;
+    const priorSecret = process.env.EZER_ADMISSION_CLAIM_SECRET;
     const j = journal();
     let loseResponse = true;
     const server = createServer(async (req, res) => {
@@ -210,10 +229,10 @@ test('HTTP claim lost response is retry-safe, signed, and fails closed without c
     });
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     process.env.EZER_ADMISSION_CLAIM_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/claims`;
-    process.env.EZER_INTERNAL_API_SECRET = SECRET;
+    process.env.EZER_ADMISSION_CLAIM_SECRET = SECRET;
     t.after(async () => {
         if (priorUrl === undefined) delete process.env.EZER_ADMISSION_CLAIM_URL; else process.env.EZER_ADMISSION_CLAIM_URL = priorUrl;
-        if (priorSecret === undefined) delete process.env.EZER_INTERNAL_API_SECRET; else process.env.EZER_INTERNAL_API_SECRET = priorSecret;
+        if (priorSecret === undefined) delete process.env.EZER_ADMISSION_CLAIM_SECRET; else process.env.EZER_ADMISSION_CLAIM_SECRET = priorSecret;
         server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
     });
     const f = fixture();

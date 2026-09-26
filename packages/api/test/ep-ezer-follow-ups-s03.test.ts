@@ -88,6 +88,18 @@ async function createHarness(): Promise<Harness> {
       lists.set(key, [...(lists.get(key) ?? []), value]);
       return 1;
     },
+    /**
+     * The exact semantics of the worker's compare-and-delete abort script.
+     * Without it the real stop path cannot consume the marker it wrote, so the
+     * cessation evidence below would never be exercised against it.
+     */
+    eval: async (_script: string, options: { keys: string[]; arguments: string[] }) => {
+      const [key] = options.keys;
+      const [expected] = options.arguments;
+      if (redisData.get(key) !== expected) return 0;
+      redisData.delete(key);
+      return 1;
+    },
   };
 
   redisData.set(`worker:state:${TASK_ID}`, JSON.stringify({

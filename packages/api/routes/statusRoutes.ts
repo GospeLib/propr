@@ -137,6 +137,19 @@ export function createStatusRoutes(deps: StatusRoutesDeps) {
         const activeWorkers = await redisClient.sCard('system:status:workers');
         status.worker = activeWorkers > 0 ? 'running' : 'stopped';
         status.workerCount = activeWorkers;
+        // TTL-scoped worker reports are authoritative across process boundaries.
+        // Keep compatibility with workers predating the health payload.
+        if (activeWorkers > 0 && redisClient.sMembers) {
+          const ids = await redisClient.sMembers('system:status:workers');
+          const health = (await Promise.all(ids.map(async id => {
+            try {
+              const raw = await redisClient.get(`system:status:worker:${id}`);
+              return raw ? JSON.parse(raw) : undefined;
+            } catch { return undefined; }
+          }))).filter(value => value?.workerId && ['running', 'degraded'].includes(value.status));
+          status.workerRuntime = health;
+          if (health.some(value => value.status === 'degraded')) status.worker = 'degraded';
+        }
       } catch {
         status.redis = 'disconnected';
       }
@@ -178,12 +191,17 @@ export function createStatusRoutes(deps: StatusRoutesDeps) {
       if (agentRuntime) {
         status.agentRuntime = agentRuntime;
         const image = agentRuntime.unifiedAgentImage;
-        if (image.status === 'unavailable') {
+        if (image.status !== 'ready') {
           warnings.push({
             type: 'agent_runtime_unified_image_unavailable',
             message: `Unified agent image is unavailable${image.imageTag ? ` (${image.imageTag})` : ''}: ${image.error || 'unknown error'}`
           });
         }
+      }
+      for (const worker of (status.workerRuntime ?? []) as Array<{ status: string; unifiedAgentImage?: { imageTag?: string; error?: string; fallbackImage?: string } }>) {
+        if (worker.status !== 'degraded') continue;
+        const image = worker.unifiedAgentImage;
+        warnings.push({ type: 'worker_agent_image_unavailable', message: `Worker degraded: ${image?.imageTag ?? 'agent image'}: ${image?.error ?? 'unavailable'}${image?.fallbackImage ? `; using ${image.fallbackImage}` : ''}` });
       }
       status.warnings = warnings;
 
@@ -395,7 +413,7 @@ async function getAgentStatuses(
   }
 
   try {
-    await registry.ensureInitialized();
+    await withTimeout(registry.ensureInitialized(), healthTimeoutMs, undefined);
   } catch (error) {
     console.error('Error initializing agent registry for status:', error);
   }

@@ -13,7 +13,8 @@ import { resolveDefaultAgentConfig, resolveInstalledAgentImages, resolveUnifiedA
 
 export interface AgentRegistryOperationalStatus {
     unifiedAgentImage: {
-        status: 'ready' | 'unavailable';
+        status: 'ready' | 'unavailable' | 'degraded';
+        fallbackImage?: string;
         imageTag?: string;
         error?: string;
         recordedAt?: string;
@@ -22,6 +23,7 @@ export interface AgentRegistryOperationalStatus {
 
 const RUNTIME_PACKAGE_STATE_CHECK_INTERVAL_MS = 5000;
 const UNIFIED_AGENT_IMAGE_RETRY_INTERVAL_MS = 60_000;
+const MAX_IMAGE_RETRY_INTERVAL_MS = 5 * 60_000;
 
 /**
  * AgentRegistry manages the lifecycle of agent instances.
@@ -40,7 +42,8 @@ export class AgentRegistry {
     private pendingRefresh: Promise<void> | null = null;
     private pendingRefreshPreparesImages = false;
     private pendingBackgroundRefresh: Promise<void> | null = null;
-    private unavailableUnifiedAgentImage: { imageTag?: string; error: string; recordedAt: string } | null = null;
+    private imageRetryDelayMs = UNIFIED_AGENT_IMAGE_RETRY_INTERVAL_MS;
+    private unavailableUnifiedAgentImage: { fallbackImage?: string; imageTag?: string; error: string; recordedAt: string } | null = null;
     private unifiedAgentImageRetryTimer: NodeJS.Timeout | null = null;
     private syntheticAgents = new SyntheticAgentRegistry(this.agents, this.agentsByAlias);
 
@@ -151,8 +154,7 @@ export class AgentRegistry {
             // Resolve potentially slow image work before replacing the live
             // registry, so a package/version rebuild does not interrupt tasks
             // that can still use the previous image.
-            this.clearUnifiedAgentImageRetry();
-            this.unavailableUnifiedAgentImage = null;
+            if (runtimeImages) this.markUnifiedAgentImageReady();
             this.agents.clear();
             this.agentsByAlias.clear();
             for (const config of configs) {
@@ -304,7 +306,7 @@ export class AgentRegistry {
         if (this.unavailableUnifiedAgentImage) {
             return {
                 unifiedAgentImage: {
-                    status: 'unavailable',
+                    status: this.unavailableUnifiedAgentImage.fallbackImage ? 'degraded' : 'unavailable',
                     ...this.unavailableUnifiedAgentImage
                 }
             };
@@ -342,6 +344,10 @@ export class AgentRegistry {
             }
             return;
         }
+
+        // Recovery owns the bounded retry schedule; requests must not turn an
+        // unavailable image into a tight pull/build loop.
+        if (this.unavailableUnifiedAgentImage && this.unifiedAgentImageRetryTimer) return;
 
         // If an image disappears after initialization, synchronously restore it
         // before returning an agent. An inspect-only refresh would rediscover
@@ -429,8 +435,8 @@ export class AgentRegistry {
             this.recordUnavailableUnifiedAgentImage(result.imageTag, error);
             return null;
         }
-        this.clearUnifiedAgentImageRetry();
-        this.unavailableUnifiedAgentImage = null;
+        if (result.fallbackImage) this.recordUnavailableUnifiedAgentImage(result.imageTag, result.error!, result.fallbackImage);
+        else this.markUnifiedAgentImageReady();
         return result.image;
     }
 
@@ -444,7 +450,11 @@ export class AgentRegistry {
         if (this.unifiedAgentImageRetryTimer) return;
         this.unifiedAgentImageRetryTimer = setTimeout(() => {
             this.unifiedAgentImageRetryTimer = null;
-            if (!this.initialized || !this.unavailableUnifiedAgentImage || this.pendingBackgroundRefresh) return;
+            if (!this.initialized || !this.unavailableUnifiedAgentImage) return;
+            if (this.pendingBackgroundRefresh) {
+                this.scheduleUnifiedAgentImageRetry();
+                return;
+            }
 
             const refresh = this.prepareImagesAndRefresh();
             this.pendingBackgroundRefresh = refresh;
@@ -457,9 +467,17 @@ export class AgentRegistry {
                 })
                 .finally(() => {
                     if (this.pendingBackgroundRefresh === refresh) this.pendingBackgroundRefresh = null;
+                    if (this.initialized && this.unavailableUnifiedAgentImage) this.scheduleUnifiedAgentImageRetry();
                 });
-        }, UNIFIED_AGENT_IMAGE_RETRY_INTERVAL_MS);
+        }, this.imageRetryDelayMs);
+        this.imageRetryDelayMs = Math.min(this.imageRetryDelayMs * 2, MAX_IMAGE_RETRY_INTERVAL_MS);
         this.unifiedAgentImageRetryTimer.unref?.();
+    }
+
+    private markUnifiedAgentImageReady(): void {
+        this.clearUnifiedAgentImageRetry();
+        this.imageRetryDelayMs = UNIFIED_AGENT_IMAGE_RETRY_INTERVAL_MS;
+        this.unavailableUnifiedAgentImage = null;
     }
 
     private clearUnifiedAgentImageRetry(): void {
@@ -489,8 +507,8 @@ export class AgentRegistry {
             return;
         }
 
-        this.clearUnifiedAgentImageRetry();
-        this.unavailableUnifiedAgentImage = null;
+        if (result.fallbackImage) this.recordUnavailableUnifiedAgentImage(result.imageTag, result.error!, result.fallbackImage);
+        else this.markUnifiedAgentImageReady();
         this.agents.clear();
         this.agentsByAlias.clear();
         const agent = new ClaudeAgent(result.config);
@@ -506,8 +524,9 @@ export class AgentRegistry {
         }, 'Default Claude agent registered');
     }
 
-    private recordUnavailableUnifiedAgentImage(imageTag: string | undefined, error: string): void {
+    private recordUnavailableUnifiedAgentImage(imageTag: string | undefined, error: string, fallbackImage?: string): void {
         this.unavailableUnifiedAgentImage = {
+            fallbackImage,
             imageTag,
             error,
             recordedAt: new Date().toISOString(),

@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { publishWorkerAgentHealth, WORKER_HEALTH_PREFIX } from './workerAgentHealth.js';
 import { executeIntegration } from '@propr/core';
 import { Worker } from 'bullmq';
 import { Redis } from 'ioredis';
@@ -221,21 +222,9 @@ async function startWorker(options: WorkerOptions = {}): Promise<StartedWorker> 
         resetPerformed: options.reset || false
     }, 'Starting GitHub Issue Worker...');
 
-    // The main worker is the single owner of base/runtime agent image
-    // preparation. Do this before heartbeats and BullMQ workers so the stack
-    // cannot advertise or claim task capacity while an image is still building.
-    logger.info('Preparing agent Docker images and initializing agent registry...');
     const registry = AgentRegistry.getInstance();
-    await registry.prepareImagesAndRefresh();
-    const imageStatus = registry.getOperationalStatus().unifiedAgentImage;
-    if (imageStatus.status !== 'ready') {
-        throw new Error(imageStatus.error || `Agent image ${imageStatus.imageTag || 'unknown'} is unavailable`);
-    }
-    const agents = registry.getAllAgents();
-    logger.info({
-        agentCount: agents.length,
-        agents: agents.map(a => ({ alias: a.config.alias, type: a.config.type, dockerImage: a.config.dockerImage }))
-    }, 'Agent images prepared and registry initialized successfully');
+    let preparingImages = true;
+    const mainWorker: { current?: MainWorker } = {};
 
     const heartbeatRedis = new Redis({
         host: process.env.REDIS_HOST || 'localhost',
@@ -245,8 +234,12 @@ async function startWorker(options: WorkerOptions = {}): Promise<StartedWorker> 
 
     const sendHeartbeat = async (): Promise<void> => {
         try {
-            await heartbeatRedis.sadd('system:status:workers', workerId);
-            await heartbeatRedis.expire('system:status:workers', 90);
+            await publishWorkerAgentHealth({
+                workerId, redis: heartbeatRedis, worker: mainWorker.current,
+                image: preparingImages
+                    ? { status: 'unavailable', error: 'Preparing deployed agent image' }
+                    : registry.getOperationalStatus().unifiedAgentImage,
+            });
             logger.debug('Worker heartbeat sent');
         } catch (error) {
             const err = error as Error;
@@ -257,6 +250,14 @@ async function startWorker(options: WorkerOptions = {}): Promise<StartedWorker> 
     await sendHeartbeat();
 
     const heartbeatInterval = setInterval(sendHeartbeat, 30000);
+
+    // Liveness is independent of image readiness. The registry retains a bounded
+    // recovery timer and returns unavailable/fallback status rather than throwing.
+    await registry.prepareImagesAndRefresh();
+    preparingImages = false;
+    const imageStatus = registry.getOperationalStatus().unifiedAgentImage;
+    if (imageStatus.status !== 'ready') logger.warn({ imageStatus }, 'Worker started degraded; agent image recovery remains active');
+    await sendHeartbeat();
 
     setUltrafixDeps(createUltrafixDeps());
     logger.info('Ultrafix dependencies initialized for worker');
@@ -296,6 +297,7 @@ async function startWorker(options: WorkerOptions = {}): Promise<StartedWorker> 
                 // Handle agent config updates by refreshing the registry
                 if (event.subtype === 'agents_update' || event.subtype === 'synthetic_agents_update') {
                     await refreshAgentRegistryForConfigUpdate(event.subtype);
+                    await sendHeartbeat();
                 }
 
                 if (event.subtype === 'settings_update') {
@@ -329,10 +331,13 @@ async function startWorker(options: WorkerOptions = {}): Promise<StartedWorker> 
             processSystemTaskJob,
             processMergeConflictJob,
         },
+        startPaused: true,
         beforeRun: configuredWorker => {
             taskStateFinalizers = attachPRCommentTaskStateFinalizers(configuredWorker, stateManager);
         },
     });
+    mainWorker.current = worker;
+    await sendHeartbeat();
     if (!taskStateFinalizers) throw new Error('PR comment task state finalizers were not attached');
     const attachedTaskStateFinalizers = taskStateFinalizers;
     const backgroundTasks = await startWorkerBackgroundTasks({ stateManager });
@@ -349,6 +354,7 @@ async function startWorker(options: WorkerOptions = {}): Promise<StartedWorker> 
             }
             await job.updateProgress(90);
             await AgentRegistry.getInstance().refresh();
+            await sendHeartbeat();
             await job.updateProgress(100);
             logger.info({ buildId: job.data.buildId, imageCount: Object.keys(state.images).length }, 'Agent runtime package profile activated');
             return state;
@@ -374,6 +380,7 @@ async function startWorker(options: WorkerOptions = {}): Promise<StartedWorker> 
         await closeStateManager();
         await runtimeBuildWorker.close();
         await heartbeatRedis.srem('system:status:workers', workerId);
+        await heartbeatRedis.del(`${WORKER_HEALTH_PREFIX}${workerId}`);
         await subscriberRedis.quit();
         await heartbeatRedis.quit();
     };

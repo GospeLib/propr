@@ -758,3 +758,23 @@ test('/api/status projects exact configured model IDs without config paths, secr
  assert.deepEqual((body.agents as Array<Record<string,unknown>>)[0],{id:config.id,type:config.type,alias:config.alias,status:'connected',supportedModels:['gpt-5.6-sol']});
  const fallback=await readStatus({loadAgents:async()=>[]});assert.equal((fallback.agents as Array<Record<string,unknown>>)[0].supportedModels,undefined);
 });
+
+test('/api/status exposes worker-owned missing tag and fallback even when API registry is ready', async () => {
+  const imageTag = 'propr/agent:bundle-331acabaa4d7-ef8b1e';
+  const fallbackImage = 'propr/agent:bundle-331acabaa4d7-1ab927';
+  const redisClient = {
+    ...createRedisClient(),
+    sMembers: async () => ['worker:test'],
+    get: async (key: string) => key === 'system:status:worker:worker:test'
+      ? JSON.stringify({ workerId: 'worker:test', status: 'degraded', canExecute: true,
+        unifiedAgentImage: { status: 'degraded', imageTag, fallbackImage, error: 'BuildKit unavailable' } })
+      : null,
+  };
+  const registry = createRegistry();
+  registry.ensureInitialized = () => new Promise<void>(() => {});
+  const body = await readStatus({ redisClient: redisClient as never, agentRegistry: registry, agentHealthTimeoutMs: 5 });
+  assert.equal(body.worker, 'degraded');
+  assert.equal(body.workerCount, 1);
+  assert.equal((body.workerRuntime as Array<{ unifiedAgentImage: { imageTag: string } }>)[0].unifiedAgentImage.imageTag, imageTag);
+  assert.ok((body.warnings as Array<{ message: string }>).some(warning => warning.message.includes(imageTag) && warning.message.includes(fallbackImage)));
+});

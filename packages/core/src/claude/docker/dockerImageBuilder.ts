@@ -15,6 +15,8 @@ const PROJECT_ROOT = process.env.PROPR_ROOT
     || (fs.existsSync(path.join(process.cwd(), 'Dockerfile.agent')) ? process.cwd() : '/usr/src/app');
 const AGENT_DOCKERFILE = 'Dockerfile.agent';
 const SAFE_BUILD_VERSION = /^[0-9A-Za-z][0-9A-Za-z.!+_-]*$/;
+const DOCKER_PROBE_TIMEOUT_MS = 10_000;
+const IMAGE_PULL_TIMEOUT_MS = 30_000;
 const pendingImagePreparations = new Map<string, Promise<VersionedImageBuildResult>>();
 
 export interface VersionedImageBuildResult {
@@ -50,12 +52,12 @@ function bundleBuildArgs(versions: AgentCliVersionMatrix): string[] {
 }
 
 export async function agentDockerImageExists(image: string): Promise<boolean> {
-    const result = await executeDockerCommand('docker', ['images', '-q', image]);
+    const result = await executeDockerCommand('docker', ['images', '-q', image], { timeout: DOCKER_PROBE_TIMEOUT_MS });
     return result.exitCode === 0 && Boolean(result.stdout.trim());
 }
 
 async function pullImage(image: string): Promise<boolean> {
-    const result = await executeDockerCommand('docker', ['pull', image], { timeout: 10 * 60 * 1000 });
+    const result = await executeDockerCommand('docker', ['pull', image], { timeout: IMAGE_PULL_TIMEOUT_MS });
     return result.exitCode === 0;
 }
 
@@ -69,9 +71,16 @@ async function buildBundle(
         return { success: false, imageTag, error: `Unified agent Dockerfile not found: ${dockerfile}` };
     }
 
+    // Dockerfile.agent uses COPY --chmod; the legacy builder cannot build it.
+    const buildkit = process.env.DOCKER_BUILDKIT === '0' ? undefined
+        : await executeDockerCommand('docker', ['buildx', 'inspect', '--bootstrap'], { timeout: DOCKER_PROBE_TIMEOUT_MS });
+    if (!buildkit || buildkit.exitCode !== 0) {
+        return { success: false, imageTag, error: 'Agent image build unavailable: BuildKit/buildx is required. Build the pinned image on the host with scripts/build-images.sh --only agent.' };
+    }
+
     logger.info({ imageTag, versions, dockerfile }, 'Building unified agent Docker image...');
     const result = await executeDockerCommand('docker', [
-        'build',
+        'buildx', 'build', '--load',
         '-f', dockerfile,
         ...bundleBuildArgs(versions),
         '-t', imageTag,

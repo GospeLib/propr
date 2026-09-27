@@ -1,3 +1,5 @@
+import { findLocalBundleFallback } from './localBundleFallback.js';
+import logger from '../utils/logger.js';
 import os from 'node:os';
 import path from 'node:path';
 import { AGENT_DEFAULTS } from '../config/modelDefinitions.js';
@@ -19,6 +21,7 @@ export interface AgentImageResolution {
     image?: string;
     imageTag?: string;
     error?: string;
+    fallbackImage?: string;
 }
 
 /** Prepare one coherent replacement without racing runtime-package state saves. */
@@ -44,15 +47,17 @@ async function resolveBundleBaseImage(
     const versions = getAgentCliVersionMatrix(configs);
     const contentHash = computeContentHash();
     const imageTag = generateAgentBundleImageTag(versions, contentHash);
-    if (prepareImages) {
-        const result = await ensureAgentBundleImage(versions, contentHash);
-        return result.success
-            ? { image: result.imageTag, imageTag: result.imageTag }
-            : { imageTag: result.imageTag, error: result.error || 'Unified agent image is unavailable' };
+    const result = prepareImages
+        ? await ensureAgentBundleImage(versions, contentHash)
+        : { success: await agentDockerImageExists(imageTag), imageTag, error: 'Image has not been prepared by the worker' };
+    if (result.success) return { image: imageTag, imageTag };
+    const error = result.error || 'Unified agent image is unavailable';
+    const fallbackImage = await findLocalBundleFallback(imageTag);
+    if (fallbackImage) {
+        logger.warn({ imageTag, fallbackImage, error }, 'Using newest local bundle from the same CLI family; agent runtime is degraded');
+        return { image: fallbackImage, imageTag, fallbackImage, error };
     }
-    return await agentDockerImageExists(imageTag)
-        ? { image: imageTag, imageTag }
-        : { imageTag, error: `Unified agent image ${imageTag} has not been prepared by the worker` };
+    return { imageTag, error };
 }
 
 export async function resolveUnifiedAgentImage(
@@ -65,6 +70,8 @@ export async function resolveUnifiedAgentImage(
         return {
             image: await resolveAgentRuntimeImage(base.image, { buildMissing: prepareImages }),
             imageTag: base.imageTag,
+            fallbackImage: base.fallbackImage,
+            error: base.error,
         };
     } catch (error) {
         return { error: (error as Error).message };
@@ -94,7 +101,7 @@ async function resolveConfiguredDefaultImage(
 
 export async function resolveDefaultAgentConfig(
     prepareImages: boolean,
-): Promise<{ config?: AgentConfig; imageTag?: string; error?: string }> {
+): Promise<AgentImageResolution & { config?: AgentConfig }> {
     const configuredImage = process.env.AGENT_DOCKER_IMAGE;
     let resolution: AgentImageResolution;
     try {
@@ -120,5 +127,7 @@ export async function resolveDefaultAgentConfig(
             cliVersionResolved: AGENT_DEFAULT_VERSIONS.claude,
         },
         imageTag: resolution.imageTag,
+        fallbackImage: resolution.fallbackImage,
+        error: resolution.error,
     };
 }

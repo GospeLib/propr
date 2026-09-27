@@ -84,6 +84,8 @@ export function requireTypedArtifactCorrection(value: unknown): TypedArtifactCor
 
 /** Stop authority targets one already verified execution and one actual owner comment. */
 export interface StopAdmissionBinding {
+    /** Ezer's durable owner-act acceptance time, covered by the admission signature. */
+    ownerActAcceptedAt?: string;
     kind: 'stop'; taskId: string; executionAdmissionId: string; executionOperationId: string;
     containerId: string; unitId: string; ownerAccountId: string; commentId: number; bodyDigest: string;
 }
@@ -94,7 +96,8 @@ export function parseStopBinding(value: unknown): StopAdmissionBinding {
     return {kind:'stop',taskId:requiredString(v.taskId,'invalid-stop-task'),executionAdmissionId:requiredString(v.executionAdmissionId,'invalid-stop-execution'),
         executionOperationId:requiredString(v.executionOperationId,'invalid-stop-operation'),containerId:requiredString(v.containerId,'invalid-stop-container'),
         unitId:requiredString(v.unitId,'invalid-stop-unit'),ownerAccountId:requiredString(v.ownerAccountId,'invalid-stop-owner'),
-        commentId:Number(v.commentId),bodyDigest:requiredString(v.bodyDigest,'invalid-stop-comment')};
+        commentId:Number(v.commentId),bodyDigest:requiredString(v.bodyDigest,'invalid-stop-comment'),
+        ...(v.ownerActAcceptedAt === undefined ? {} : {ownerActAcceptedAt:requireIsoTimestamp(v.ownerActAcceptedAt,'invalid-stop-acceptance-time')})};
 }
 
 export interface ExecutionRouteBinding {selectionId:string;routeId:string;agentId:string;agentAlias:string;provider:string;model:string;attemptOrdinal:number;}

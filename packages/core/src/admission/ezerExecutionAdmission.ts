@@ -240,6 +240,16 @@ function validateClaims(claims: ExecutionAdmissionClaims, expected: ExpectedExec
     return Math.max(1, Math.ceil((expiresAtMs - nowMs) / MILLISECONDS_PER_SECOND));
 }
 
+/** Authenticates claims without consuming authority; callers must still consume before acting. */
+export function readSignedExecutionAdmission(input: {token: string; signingSecret: string}): ExecutionAdmissionClaims {
+    const tokenParts = input.token.split('.');
+    if (tokenParts.length !== TOKEN_PART_COUNT) refuse('malformed-admission');
+    const [encodedPayload, signature] = tokenParts;
+    verifySignature(encodedPayload, signature, input.signingSecret);
+    const claims = parseClaims(encodedPayload);
+    return claims;
+}
+
 export async function consumeExecutionAdmission(input: {
     token: string;
     signingSecret: string;
@@ -250,11 +260,7 @@ export async function consumeExecutionAdmission(input: {
     preConsumePolicy?: (claims: ExecutionAdmissionClaims) => Promise<void>;
     claimClient?: AdmissionClaimClient;
 }): Promise<{ claims: ExecutionAdmissionClaims; receipt: WorkerAdmissionReceipt }> {
-    const tokenParts = input.token.split('.');
-    if (tokenParts.length !== TOKEN_PART_COUNT) refuse('malformed-admission');
-    const [encodedPayload, signature] = tokenParts;
-    verifySignature(encodedPayload, signature, input.signingSecret);
-    const claims = parseClaims(encodedPayload);
+    const claims = readSignedExecutionAdmission(input);
     validateClaims(claims, input.expected, input.nowMs ?? Date.now());
     await input.preConsumePolicy?.(claims);
     // V1 never resolves callback configuration or invokes a claim client.

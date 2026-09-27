@@ -26,7 +26,7 @@ async function fixture(repository=MAIN_REPOSITORY,requestRepository=repository,s
  await verifyWorkerAdmissionReceipt({receipt,store,expected:{repository,issueNumber:7,target:'stage'}});
  const stops:Array<{taskId:string;options:Parameters<AdmittedStopPorts['stop']>[1]}>=[];let userId=123,started=true;
  const ports={store,signingSecret:SECRET,readServedRepositories:async()=>[MAIN_REPOSITORY,SECONDARY_REPOSITORY],readTask:async()=>({repository,issueNumber:7}),readComment:async()=>({id:42,body,issue_url:`https://api.github.com/repos/${repository}/issues/7`,created_at:new Date(now-1000).toISOString(),updated_at:new Date(now-1000).toISOString(),user:{id:userId,login:'owner'}}),readState:async()=>JSON.stringify({history:[{state:started?'claude_execution':'processing',metadata:{admissionId:'execution-a',operationId:'operation-a',containerId:'container-a'}}]}),stop:async(taskId:string,options:Parameters<AdmittedStopPorts['stop']>[1])=>{stops.push({taskId,options});return {success:true,taskId,containerStopped:true,removedQueuedJobs:0,message:'stopped'};}};
- return {token,ports,control,stops,values,receipt,setUser:(v:number)=>userId=v,setStarted:(v:boolean)=>started=v};
+ return {now,claims,sign,token,ports,control,stops,values,receipt,setUser:(v:number)=>userId=v,setStarted:(v:boolean)=>started=v};
 }
 test('requires exact actual owner comment and current execution before existing stop helper',async()=>{
  const f=await fixture();f.setUser(456);await assert.rejects(()=>stopAdmittedTask({taskId:'task-a',commentId:42,token:f.token},f.ports),/wrong-stop-control/);assert.equal(f.stops.length,0);
@@ -111,4 +111,94 @@ test('retained admission authorizes a ceiling stop after the execution lease exp
   const result=await stopAdmittedTask({taskId:'task-a',commentId:42,token:f.token},f.ports);
   assert.equal(result.containerStopped,true);assert.equal(f.stops.length,1);
  }finally{redis.disconnect();}
+});
+
+const TWO_HOURS_MS=2*60*60*1000;
+const COMMENT_MAX_AGE_MS=300_000;
+const ACCEPTANCE_SKEW_MS=30_000;
+const ONE_MILLISECOND=1;
+const STOP_REQUEST={taskId:'task-a',commentId:42};
+async function acceptanceFixture(acceptanceOffsetMs=-TWO_HOURS_MS,commentAgeMs=1000){
+ const f=await fixture();
+ const accepted=f.now+acceptanceOffsetMs,created=new Date(accepted-commentAgeMs).toISOString();
+ const comment=await f.ports.readComment();
+ f.ports.readComment=async()=>({...comment,created_at:created,updated_at:created});
+ const ownerActAcceptedAt=new Date(accepted).toISOString();
+ return {...f,ports:{...f.ports,nowMs:f.now},ownerActAcceptedAt,
+  signedClaims:{...f.claims,control:{...f.control,ownerActAcceptedAt}}};
+}
+test('signed acceptance allows delivery two hours later, persists the time, and remains single-use',async()=>{
+ const f=await acceptanceFixture(),token=f.sign(f.signedClaims);
+ const result=await stopAdmittedTask({...STOP_REQUEST,token},f.ports);
+ assert.equal(result.containerStopped,true);assert.equal(f.stops.length,1);
+ const consumed=JSON.parse((await f.ports.store.get('ezer:execution-admission:consumed:stop-admission'))!);
+ assert.equal(consumed.control.ownerActAcceptedAt,f.ownerActAcceptedAt);
+ await assert.rejects(()=>stopAdmittedTask({...STOP_REQUEST,token},f.ports),/replayed-admission/);
+ assert.equal(f.stops.length,1);
+});
+test('adding or changing acceptance without re-signing fails signature verification',async()=>{
+ const f=await acceptanceFixture();
+ for(const original of [f.token,f.sign(f.signedClaims)]){
+  const [payload,signature]=original.split('.');
+  const forged=JSON.parse(Buffer.from(payload,'base64url').toString());
+  forged.control.ownerActAcceptedAt=new Date(f.now).toISOString();
+  const token=Buffer.from(JSON.stringify(forged)).toString('base64url')+'.'+signature;
+  await assert.rejects(()=>stopAdmittedTask({...STOP_REQUEST,token},f.ports),/bad-signature/);
+ }
+ assert.equal(f.stops.length,0);assert.equal(await f.ports.store.get('ezer:execution-admission:consumed:stop-admission'),null);
+});
+test('unsigned request acceptance cannot revive an expired legacy comment',async()=>{
+ const f=await acceptanceFixture();
+ const request={...STOP_REQUEST,token:f.token,ownerActAcceptedAt:f.ownerActAcceptedAt,control:{ownerActAcceptedAt:f.ownerActAcceptedAt}};
+ await assert.rejects(()=>stopAdmittedTask(request,f.ports),/owner-comment-expired/);
+ assert.equal(f.stops.length,0);
+});
+test('future acceptance beyond clock skew is rejected without consuming admission',async()=>{
+ const f=await acceptanceFixture(ACCEPTANCE_SKEW_MS+ONE_MILLISECOND);
+ const token=f.sign(f.signedClaims);
+ await assert.rejects(()=>stopAdmittedTask({...STOP_REQUEST,token},f.ports),/owner-acceptance-in-future/);
+ assert.equal(f.stops.length,0);assert.equal(await f.ports.store.get('ezer:execution-admission:consumed:stop-admission'),null);
+ // The same admission remains usable once the clock catches up.
+ f.ports.nowMs+=ONE_MILLISECOND;
+ assert.equal((await stopAdmittedTask({...STOP_REQUEST,token},f.ports)).containerStopped,true);
+});
+test('acceptance has no age ceiling and preserves the exact five-minute comment boundary',async()=>{
+ const oldAcceptanceMs=-365*24*TWO_HOURS_MS;
+ const f=await acceptanceFixture(oldAcceptanceMs,COMMENT_MAX_AGE_MS);
+ assert.equal((await stopAdmittedTask({...STOP_REQUEST,token:f.sign(f.signedClaims)},f.ports)).containerStopped,true);
+});
+for(const age of [COMMENT_MAX_AGE_MS+ONE_MILLISECOND,-ONE_MILLISECOND]){
+ test(`comment age at acceptance ${age}ms is refused before consumption`,async()=>{
+  const f=await acceptanceFixture(-TWO_HOURS_MS,age);
+  await assert.rejects(()=>stopAdmittedTask({...STOP_REQUEST,token:f.sign(f.signedClaims)},f.ports),/owner-comment-expired/);
+  assert.equal(f.stops.length,0);assert.equal(await f.ports.store.get('ezer:execution-admission:consumed:stop-admission'),null);
+ });
+}
+for(const age of [COMMENT_MAX_AGE_MS,COMMENT_MAX_AGE_MS+ONE_MILLISECOND,-ONE_MILLISECOND]){
+ test(`absent acceptance preserves legacy processing-time boundary at ${age}ms`,async()=>{
+  const f=await acceptanceFixture(0,age);
+  const invoke=()=>stopAdmittedTask({...STOP_REQUEST,token:f.token},f.ports);
+  if(age===COMMENT_MAX_AGE_MS)assert.equal((await invoke()).containerStopped,true);
+  else {await assert.rejects(invoke,/owner-comment-expired/);assert.equal(f.stops.length,0);}
+ });
+}
+for(const ownerActAcceptedAt of [null,42,'invalid-date']){
+ test(`malformed signed acceptance ${ownerActAcceptedAt} is rejected`,async()=>{
+  const f=await acceptanceFixture();
+  const token=f.sign({...f.signedClaims,control:{...f.control,ownerActAcceptedAt}});
+  await assert.rejects(()=>stopAdmittedTask({...STOP_REQUEST,token},f.ports),/invalid-stop-acceptance-time/);
+  assert.equal(f.stops.length,0);
+ });
+}
+test('signed acceptance still binds owner, issue, body, and execution',async()=>{
+ for(const changed of [{ownerAccountId:'456'},{bodyDigest:'sha256:forged'},{containerId:'other'},{executionAdmissionId:'other'},{executionOperationId:'other'}]){
+  const f=await acceptanceFixture();
+  const token=f.sign({...f.signedClaims,control:{...f.signedClaims.control,...changed}});
+  await assert.rejects(()=>stopAdmittedTask({...STOP_REQUEST,token},f.ports),/wrong-stop-control/);
+  assert.equal(f.stops.length,0);
+ }
+ const f=await acceptanceFixture();
+ const token=f.sign({...f.signedClaims,issueNumber:8});
+ await assert.rejects(()=>stopAdmittedTask({...STOP_REQUEST,token},f.ports),/wrong-issue/);
+ assert.equal(f.stops.length,0);
 });

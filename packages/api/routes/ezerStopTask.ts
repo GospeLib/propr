@@ -1,8 +1,9 @@
 import {createHash} from 'node:crypto';
-import {consumeExecutionAdmission,readAdmittedExecutionBinding,type AdmissionStore,type StopAdmissionBinding} from '@propr/core';
+import {consumeExecutionAdmission,readSignedExecutionAdmission,readAdmittedExecutionBinding,type AdmissionStore,type StopAdmissionBinding} from '@propr/core';
 import type {StopTaskExecutionOptions,StopTaskExecutionResult} from './dockerRoutes.js';
 const STOP_COMMAND=/^\/ezer stop ([^\s]+)\s*$/;
 const STOP_OWNER_ACT_MAX_AGE_MS=300_000;
+const STOP_ACCEPTANCE_CLOCK_SKEW_MS=30_000;
 const STOP_REASON='ezer_owner_stop';
 export interface StopTaskBinding {repository:string;issueNumber:number;}
 export interface StopOwnerComment {id:number;body:string;issue_url:string;created_at:string;updated_at:string;user:{id:number;login:string}|null;}
@@ -14,7 +15,16 @@ export interface AdmittedStopPorts {
  readState(taskId:string):Promise<string|null>;
  stop(taskId:string,options:Omit<StopTaskExecutionOptions,'redisClient'>):Promise<StopTaskExecutionResult>;
 }
-/** Existing stop handler only; no queue dispatch, owner impersonation or alternate executor. */
+/**
+ * Ezer may sign control.ownerActAcceptedAt (ISO-8601) with the durable acceptance time
+ * of the owner's stop. Preserve that time and operationId when re-signing an admission
+ * after downtime: the comment must be at most five minutes old at acceptance, and must
+ * not postdate acceptance. Acceptance may be at most 30 seconds ahead of ProPR's clock;
+ * it has no maximum age. The admission itself still needs a current delivery lease.
+ * Omit the field for the legacy five-minute freshness check at processing time.
+ * Only signed claims supply this time; request fields cannot override it. All owner,
+ * comment, issue, execution and single-use checks still apply before the existing stop.
+ */
 export async function stopAdmittedTask(input:{taskId:string;commentId:number;token:string},ports:AdmittedStopPorts){
  if(!input.taskId||!Number.isSafeInteger(input.commentId)||input.commentId<1||!input.token)throw new Error('ezer-stop-refused:invalid-request');
  const task=await ports.readTask(input.taskId);if(!task)throw new Error('ezer-stop-refused:task-not-found');
@@ -27,12 +37,16 @@ export async function stopAdmittedTask(input:{taskId:string;commentId:number;tok
  if(task.repository!==execution.repository||task.issueNumber!==execution.issueNumber)throw new Error('ezer-stop-refused:execution-task-mismatch');
  const comment=await ports.readComment(task.repository,input.commentId);
  const unit=STOP_COMMAND.exec(comment.body.trim())?.[1],created=Date.parse(comment.created_at),now=ports.nowMs??Date.now();
- if(!Number.isFinite(created)||created>now||now-created>STOP_OWNER_ACT_MAX_AGE_MS)throw new Error('ezer-stop-refused:owner-comment-expired');
+ const {ownerActAcceptedAt}=readSignedExecutionAdmission({token:input.token,signingSecret:ports.signingSecret}).control??{};
+ const accepted=ownerActAcceptedAt===undefined?now:Date.parse(ownerActAcceptedAt);
+ if(ownerActAcceptedAt!==undefined&&accepted>now+STOP_ACCEPTANCE_CLOCK_SKEW_MS)throw new Error('ezer-stop-refused:owner-acceptance-in-future');
+ if(!Number.isFinite(created)||created>accepted||accepted-created>STOP_OWNER_ACT_MAX_AGE_MS)throw new Error('ezer-stop-refused:owner-comment-expired');
  if(!unit||comment.id!==input.commentId||!comment.user||comment.created_at!==comment.updated_at||
  comment.issue_url!==`https://api.github.com/repos/${task.repository}/issues/${task.issueNumber}`)throw new Error('ezer-stop-refused:owner-comment-changed');
  const control:StopAdmissionBinding={kind:'stop',taskId:input.taskId,unitId:unit,executionAdmissionId:meta.admissionId,
  executionOperationId:meta.operationId,containerId:meta.containerId,ownerAccountId:String(comment.user.id),commentId:comment.id,
- bodyDigest:`sha256:${createHash('sha256').update(comment.body).digest('hex')}`};
+ bodyDigest:`sha256:${createHash('sha256').update(comment.body).digest('hex')}`,
+ ...(ownerActAcceptedAt===undefined?{}:{ownerActAcceptedAt})};
  const admitted=await consumeExecutionAdmission({token:input.token,signingSecret:ports.signingSecret,store:ports.store,nowMs:ports.nowMs,
  expected:{repository:execution.repository,issueNumber:execution.issueNumber,control}});
  // This receipt is consumed here and is categorically refused by the worker receipt verifier.

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
@@ -408,4 +409,33 @@ describe('build-images publication reconciliation', () => {
     assert.match(result.stderr, /GHCR publishing is no longer supported/);
     assert.deepEqual(readDockerLog(root), []);
   });
+});
+
+
+test('freezes regenerated notice bytes and overridden versions into app and launcher bundle metadata', () => {
+  const root = createFixture();
+  writeFileSync(join(root, 'THIRD_PARTY_LICENSES.md'), 'old notices');
+  writeFileSync(join(root, 'scripts/generate-notices.sh'), '#!/bin/sh\nprintf "new notices" > THIRD_PARTY_LICENSES.md\n');
+  chmodSync(join(root, 'scripts/generate-notices.sh'), 0o755);
+  const result = runBuild(root, ['--only', 'app,agent'], { CODEX_CLI_VERSION: '0.152.0' });
+  assert.equal(result.status, 0, result.stderr);
+  const manifest = JSON.parse(readFileSync(join(root, 'docker/launcher/manifest.json'), 'utf8'));
+  const contentHash = crypto.createHash('sha256').update('new notices').digest('hex').slice(0, 6);
+  assert.equal(manifest.agentBundle.contentHash, contentHash);
+  assert.equal(manifest.agentBundle.versions.codex, '0.152.0');
+  const builds = readDockerLog(root).filter(args => args[0] === 'build');
+  const appBuild = builds.find(args => args.includes('docker/Dockerfile.app.prod'));
+  const metadata = JSON.parse(appBuild.find(arg => arg.startsWith('PROPR_AGENT_BUNDLE_METADATA=')).split('=').slice(1).join('='));
+  assert.deepEqual(metadata, manifest.agentBundle);
+  const agentBuild = builds.find(args => args.includes('Dockerfile.agent'));
+  assert.ok(agentBuild.includes(manifest.images.agent));
+  assert.ok(manifest.images.agent.endsWith(`:${metadata.tag}`));
+});
+
+test('rejects floating deployment versions before attempting a Docker build', () => {
+  const root = createFixture();
+  const result = runBuild(root, ['--only', 'app,agent'], { CODEX_CLI_VERSION: 'latest' });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /must be pinned/);
+  assert.equal(readDockerLog(root).length, 0);
 });

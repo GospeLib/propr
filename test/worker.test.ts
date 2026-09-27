@@ -109,6 +109,7 @@ describe('worker behavioral contracts', () => {
         const startupOrder: string[] = [];
         const fakeWorker = {
             close: mock.fn(async () => {}),
+            pause: mock.fn(async () => { startupOrder.push('pause'); }),
             run: mock.fn(async () => { startupOrder.push('run'); }),
             emit: mock.fn(),
         };
@@ -126,13 +127,14 @@ describe('worker behavioral contracts', () => {
             concurrency: 7,
             workerFactory: workerFactory as never,
             processors: processors as unknown as MainJobProcessors,
+            startPaused: true,
             beforeRun: () => { startupOrder.push('listeners'); },
         });
 
         assert.equal(worker, fakeWorker);
         assert.equal(workerFactory.mock.calls.length, 1);
         assert.ok(capturedProcessor);
-        assert.deepEqual(startupOrder, ['listeners', 'run']);
+        assert.deepEqual(startupOrder, ['listeners', 'pause', 'run']);
         assert.deepEqual(await capturedProcessor({ name: 'processSystemTask' } as never), { status: 'constructed' });
     });
 });

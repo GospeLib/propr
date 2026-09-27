@@ -250,6 +250,9 @@ test('AgentRegistry automatically retries an unavailable unified image', async (
 
     t.mock.timers.tick(60_000);
     await registry.waitForPendingRefresh();
+    assert.strictEqual(attempts, 2, 'the second retry backs off to 120 seconds');
+    t.mock.timers.tick(60_000);
+    await registry.waitForPendingRefresh();
 
     assert.strictEqual(attempts, 3);
     assert.deepStrictEqual(preparationModes, [false, true, true]);

@@ -103,6 +103,9 @@ COPY THIRD_PARTY_LICENSES.md ./THIRD_PARTY_LICENSES.md
 COPY NOTICE /usr/share/licenses/propr/NOTICE
 COPY THIRD_PARTY_LICENSES.md /usr/share/licenses/propr/THIRD_PARTY_LICENSES.md
 
+# Immutable deployment contract from build-images.sh (after all context generation).
+ARG PROPR_AGENT_BUNDLE_METADATA
+ENV PROPR_AGENT_BUNDLE_METADATA=$PROPR_AGENT_BUNDLE_METADATA
 ENV NODE_ENV=production
 
 # Use tini as PID 1 so SIGTERM propagates cleanly to node.

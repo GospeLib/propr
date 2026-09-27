@@ -51,7 +51,7 @@ describe('agent bundle content files', () => {
         ).trim();
 
         const runtimeTag = generateAgentBundleImageTag({ ...AGENT_DEFAULT_VERSIONS }, computeContentHash(repoRoot));
-        assert.equal(scriptTag, runtimeTag.split(':')[1]);
+        assert.equal(JSON.parse(scriptTag).tag, runtimeTag.split(':')[1]);
     });
 
     test('app production image copies every agent bundle content file', () => {

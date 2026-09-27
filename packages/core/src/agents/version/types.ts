@@ -2,6 +2,7 @@
  * Version management types and constants for agent CLI tools.
  */
 
+import { deployedAgentBundle } from '../deployedAgentBundle.js';
 import { AGENT_IMAGE_NAME } from '../constants.js';
 import type { AgentType } from '../types.js';
 
@@ -36,7 +37,7 @@ export const AGENT_CLI_TAGS: Record<AgentType, string[]> = {
  * Default CLI versions for each agent type.
  * These are used when cliVersionType is 'default'.
  */
-export const AGENT_DEFAULT_VERSIONS: Record<AgentType, string> = {
+export const AGENT_DEFAULT_VERSIONS: Record<AgentType, string> = deployedAgentBundle?.versions ?? {
     claude: '2.1.220',
     codex: '0.151.0',
     antigravity: '1.1.13',

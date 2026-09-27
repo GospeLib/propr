@@ -1,7 +1,8 @@
+import { deployedAgentBundle } from './deployedAgentBundle.js';
 import type { AgentType } from './types.js';
 
 export const AGENT_TYPES = ['claude', 'codex', 'antigravity', 'opencode', 'vibe'] as const satisfies readonly AgentType[];
-export const AGENT_IMAGE_NAME = 'propr/agent';
+export const AGENT_IMAGE_NAME = deployedAgentBundle?.repository ?? 'propr/agent';
 export const DEFAULT_AGENT_EXECUTION_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 /** Leaves one minute for teardown before Ezer's ten-minute planning lease. */
 export const PLANNING_ARTIFACT_TIMEOUT_MS = 9 * 60 * 1000;

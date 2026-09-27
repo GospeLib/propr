@@ -3,6 +3,7 @@
  * Handles version resolution, content hashing, and available versions retrieval.
  */
 
+import { deployedAgentBundle } from '../deployedAgentBundle.js';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -303,6 +304,7 @@ const PROJECT_ROOT = process.env.PROPR_ROOT
  * @returns First 6 characters of SHA256 hash
  */
 export function computeContentHash(basePath: string = PROJECT_ROOT): string {
+    if (basePath === PROJECT_ROOT && deployedAgentBundle) return deployedAgentBundle.contentHash;
     const files = AGENT_BUNDLE_CONTENT_FILES;
     const hash = crypto.createHash('sha256');
 

@@ -55,6 +55,7 @@ export async function createConfiguredMainWorker(options: {
     workerFactory: MainWorkerFactory;
     processors: MainJobProcessors;
     beforeRun?: (worker: MainWorker) => void;
+    startPaused?: boolean;
 }): Promise<MainWorker> {
     const worker = await options.workerFactory(
         options.queueName,
@@ -62,6 +63,7 @@ export async function createConfiguredMainWorker(options: {
         { concurrency: options.concurrency, autorun: false },
     );
     options.beforeRun?.(worker);
+    if (options.startPaused) await worker.pause(true);
     void worker.run().catch(error => worker.emit('error', error));
     return worker;
 }

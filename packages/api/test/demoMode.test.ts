@@ -16,6 +16,7 @@ import { createQueueRoutes } from '../routes/queueRoutes.js';
 import { createStatusRoutes } from '../routes/statusRoutes.js';
 import { normalizeRepoConfig } from '../routes/configRepoValidation.js';
 import type { FlatRequest } from '../requestTypes.js';
+import { createApiRequestRateLimiter } from '../requestRateLimits.js';
 
 const originalDemoMode = process.env.PROPR_DEMO_MODE;
 const originalFrontendUrl = process.env.FRONTEND_URL;
@@ -185,6 +186,7 @@ test('demo Express GET routes work with the in-memory Redis facade', async () =>
     getDelayedCount: async () => 0,
   } as never;
   const app = express();
+  app.use('/api', createApiRequestRateLimiter());
   app.use(express.json());
   app.use('/api', demoModeReadOnlyMiddleware);
   setupAuth(app);

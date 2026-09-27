@@ -74,6 +74,11 @@ resolve_agent_bundle_tag() {
         type,
         process.env[`${type.toUpperCase()}_CLI_VERSION`]
       ]));
+      for (const [type, version] of Object.entries(versions)) {
+        if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+          throw new Error(`${type} must be pinned to an exact CLI version, got ${version}`);
+        }
+      }
       const content = crypto.createHash("sha256");
       for (const file of process.argv.slice(1)) {
         if (fs.existsSync(file)) content.update(fs.readFileSync(file, "utf8"));
@@ -81,7 +86,7 @@ resolve_agent_bundle_tag() {
       const contentHash = content.digest("hex").slice(0, 6);
       const matrix = types.map(type => `${type}=${versions[type]}`).join("\n");
       const matrixHash = crypto.createHash("sha256").update(matrix).digest("hex").slice(0, 12);
-      process.stdout.write(`bundle-${matrixHash}-${contentHash}`);
+      process.stdout.write(JSON.stringify({ versions, contentHash, tag: `bundle-${matrixHash}-${contentHash}` }));
     ' "${AGENT_BUNDLE_CONTENT_FILES[@]}"
 }
 
@@ -490,11 +495,12 @@ write_manifest() {
   "version": "$VERSION",
   "git_sha": "$GIT_SHA",
   "registry": "$runtime_ns",
+  "agentBundle": $AGENT_BUNDLE_METADATA,
   "images": {
     "app": "$runtime_ns/${runtime_prefix}app:$VERSION",
     "ui": "$runtime_ns/${runtime_prefix}ui:$VERSION",
     "docs": "$runtime_ns/${runtime_prefix}docs:$VERSION",
-    "agent": "$runtime_ns/${runtime_prefix}agent:$VERSION",
+    "agent": "$runtime_ns/${runtime_prefix}agent:$AGENT_BUNDLE_TAG",
     "redis": "redis:7-alpine",
     "cloudflared": "cloudflare/cloudflared:2024.12.2"
   }
@@ -534,6 +540,9 @@ build_image() {
   fi
 
   case "$name" in
+    app)
+      build_args+=("--build-arg" "PROPR_AGENT_BUNDLE_METADATA=$AGENT_BUNDLE_METADATA")
+      ;;
     agent)
       build_args+=(
         "--build-arg" "CLAUDE_CLI_VERSION=$CLAUDE_CLI_VERSION"
@@ -575,7 +584,13 @@ build_image() {
 }
 
 # --- Main ---------------------------------------------------------------------
-AGENT_BUNDLE_TAG="$(resolve_agent_bundle_tag)"
+# Notices are build inputs: freeze them BEFORE computing the tag or building app.
+if ! $PROMOTE_LATEST && ! $PUSH_ONLY; then
+  refresh_notices
+fi
+AGENT_BUNDLE_METADATA="$(resolve_agent_bundle_tag)"
+AGENT_BUNDLE_TAG="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).tag)' "$AGENT_BUNDLE_METADATA")"
+AGENT_BUNDLE_METADATA="$(node -e 'const m = JSON.parse(process.argv[1]); m.repository = process.argv[2]; process.stdout.write(JSON.stringify(m))' "$AGENT_BUNDLE_METADATA" "$(manifest_ns)/$(manifest_prefix)agent")"
 RELEASE_IMAGES=("${IMAGES[@]}" "launcher|docker/Dockerfile.launcher|.")
 
 echo "Propr image build"
@@ -620,7 +635,6 @@ if $PUSH_ONLY; then
   exit 0
 fi
 
-refresh_notices
 write_manifest
 
 for entry in "${IMAGES[@]}"; do

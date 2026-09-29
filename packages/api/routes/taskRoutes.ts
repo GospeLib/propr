@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { enqueueAdmittedSource, parseSourceReference } from "@propr/core";
 import { enqueueAdmittedComment } from './ezerCommentFollowup.js';
 import { EZER_INTERNAL_SECRET_HEADER, verifyEzerInternalRequest } from '../ezerInternalAuth.js';
 import { Knex } from 'knex';
@@ -313,6 +314,34 @@ export function createTaskRoutes(deps: TaskRoutesDeps) {
         return;
       }
 
+      if (process.env.EZER_INTERNAL_API_SECRET && !verifyEzerInternalRequest(req)) {
+        res.status(403).json({ error: 'Followups require an authenticated Ezer admission' });
+        return;
+      }
+      const typedSource = req.body.contract === 2;
+      if (req.body.contract !== undefined && !typedSource) {
+        res.status(400).json({ error: 'Unsupported followup contract' });
+        return;
+      }
+      if (typedSource) {
+        if (!verifyEzerInternalRequest(req) || typeof req.body.admissionId !== 'string' ||
+            Object.keys(req.body).some(key => !['contract', 'admissionId', 'source'].includes(key))) {
+          res.status(403).json({ error: 'An exact typed source and authenticated Ezer admission are required' });
+          return;
+        }
+        let source;
+        try { source = parseSourceReference(req.body.source); }
+        catch { res.status(400).json({ error: 'Invalid source reference' }); return; }
+        const task = await db('tasks').where({ task_id: taskId }).first() as TaskRecord | undefined;
+        if (!task) { res.status(404).json({ error: 'Task not found' }); return; }
+        const prNumber = taskFollowupPullRequest(task);
+        if (!prNumber) { res.status(403).json({ error: 'An existing task PR is required' }); return; }
+        try {
+          res.json(await enqueueAdmittedSource({ repository: task.repository, prNumber, admissionId: req.body.admissionId, source }));
+        } catch (error) { res.status(403).json({ error: (error as Error).message }); }
+        return;
+      }
+      if (req.body.source !== undefined) { res.status(400).json({ error: 'Source requires contract 2' }); return; }
       // Validate comment body
       const bodyValidation = validateStringLength(body, 'Comment body', { required: true, minLength: 1, maxLength: 65536 });
       if (!bodyValidation.valid) {

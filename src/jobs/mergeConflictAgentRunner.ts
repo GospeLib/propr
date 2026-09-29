@@ -1,3 +1,4 @@
+import { buildAdmittedWorkerEnvironment } from './ezerAdmittedWorkerEnvironment.js';
 import type { Logger } from 'pino';
 import type { Redis } from 'ioredis';
 import {
@@ -113,6 +114,9 @@ async function verifyNoConflictMarkers(worktreeInfo: WorktreeInfo, pullRequestNu
 }
 
 export async function handleMergeWithAgent(options: {
+    executionAdmissionReceipt?: import('@propr/core').WorkerAdmissionReceipt;
+    beforePublish?: () => Promise<void>;
+    onPushed?: (head: string) => void;
     conflictedFiles?: string[];
     worktreeInfo: WorktreeInfo;
     branchName: string;
@@ -150,14 +154,17 @@ export async function handleMergeWithAgent(options: {
     }, 'Executing merge conflict resolution with agent');
     const wasCleanMerge = !conflictedFiles || conflictedFiles.length === 0;
 
+    await options.beforePublish?.();
     const agentResult = await agent.executeTask({
+        environment: buildAdmittedWorkerEnvironment({ repoOwner, repoName, number: pullRequestNumber,
+            baseBranch, executionAdmissionReceipt: options.executionAdmissionReceipt }, taskId, Boolean(options.executionAdmissionReceipt)),
         worktreePath: worktreeInfo.worktreePath,
         issueRef: { number: pullRequestNumber, repoOwner, repoName },
         prompt,
         model: resolvedModel,
         githubToken: githubToken.token,
         branchName,
-        onSessionId: createSessionIdCallbackForPR(taskId, { pullRequestNumber, repoOwner, repoName }, { llm: resolvedModel, stateManager, correlatedLogger, redisClient }),
+        onSessionId: createSessionIdCallbackForPR(taskId, { pullRequestNumber, repoOwner, repoName }, { llm: resolvedModel, stateManager, correlatedLogger, redisClient, verifiedExecutionCorrelation: options.executionAdmissionReceipt }),
         onContainerId: createContainerIdCallbackForPR(taskId, stateManager),
         taskId,
         prNumber: pullRequestNumber,
@@ -185,11 +192,14 @@ export async function handleMergeWithAgent(options: {
         baseBranch, headBranch: branchName, pullRequestNumber, conflictedFiles,
         model: claudeResult.model || resolvedModel, wasCleanMerge,
     });
+    await options.beforePublish?.();
     const commitResult = await commitChanges(worktreeInfo.worktreePath, commitMessage, AI_COMMIT_AUTHOR, { issueNumber: pullRequestNumber, issueTitle: wasCleanMerge ? 'Verify clean merge' : 'Resolve merge conflicts' });
-    await pushBranch(worktreeInfo.worktreePath, branchName, { repoUrl, authToken: githubToken.token });
-
     const { simpleGit } = await import('simple-git');
     const finalCommitHash = commitResult?.commitHash || (await simpleGit({ baseDir: worktreeInfo.worktreePath }).revparse(['HEAD'])).trim();
+    await options.beforePublish?.();
+    await pushBranch(worktreeInfo.worktreePath, branchName, { repoUrl, authToken: githubToken.token });
+    options.onPushed?.(finalCommitHash);
+
     const taskUrl = `${process.env.WEB_UI_URL || process.env.FRONTEND_URL || 'https://gitfix.dev'}/tasks/${taskId}`;
     const comment = buildMergeConflictComment({
         wasCleanMerge,
@@ -198,6 +208,7 @@ export async function handleMergeWithAgent(options: {
         executionTimeMs: claudeResult.executionTime, taskUrl,
     });
 
+    await options.beforePublish?.();
     await octokit.request('PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}', {
         owner: repoOwner, repo: repoName, comment_id: startingCommentId, body: comment,
     });
@@ -214,6 +225,7 @@ export async function handleMergeWithAgent(options: {
                     model: claudeResult.model || resolvedModel, commitHash: finalCommitHash, correlatedLogger,
                 }),
                 agentOutcome: buildAgentOutcome(claudeResult),
+                ...(options.executionAdmissionReceipt ? { admissionId: options.executionAdmissionReceipt.admissionId, settlement: 'published', pushedHead: finalCommitHash } : {}),
             },
         },
     });

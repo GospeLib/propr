@@ -1,3 +1,4 @@
+import * as cancellation from '../packages/core/src/admission/executionAdmissionCancellation.js';
 import { test, mock, describe, beforeEach } from 'node:test';
 import { completionCoreExports, completionDatabase } from './helpers/completionCoreDoubles.js';
 import assert from 'node:assert';
@@ -56,6 +57,7 @@ await mock.module('bullmq', {
         Worker: function Worker() {
             return { on: mock.fn(), close: mock.fn() };
         },
+        DelayedError: class extends Error {},
         Job: class {}
     }
 });
@@ -160,7 +162,7 @@ const mockRegistry = {
 await mock.module('@propr/core', {
     namedExports: {
         ...(await import('../packages/core/src/agents/executionFailure.js')),
-        ...completionCoreExports,
+        ...completionCoreExports, ...cancellation,
         logger: {
             info: mock.fn(),
             warn: mock.fn(),
@@ -233,6 +235,13 @@ await mock.module('../src/jobs/prCommentJobUtils.js', {
         })),
     }
 });
+
+// Worker receipt/live-source validation is exercised with real Redis in ezerTypedSourceAdmission.
+// Keep the real publication fence here so races execute the production merge path.
+const sourceFence = await import('../src/jobs/ezerSourceAdmission.js');
+await mock.module('../src/jobs/ezerSourceAdmission.js', { namedExports: {
+    ...sourceFence, verifyAdmittedSourceJob: async () => undefined,
+} });
 
 // Import the module under test
 const { processMergeConflictJob } = await import('../src/jobs/processMergeConflictJob.js');
@@ -547,4 +556,26 @@ describe('processMergeConflictJob', () => {
         assert.deepStrictEqual(settled, [],
             'a task whose completion may already be durable must not be settled as failed');
     });
+});
+
+for (const cancelAt of ['worker-start', 'before-push', 'after-push'] as const) test(`admitted merge cancellation at ${cancelAt} suppresses GitHub publication and records settlement`, async () => {
+    resetAllMocks(); mockMergeResult = { outcome: 'clean' as const };
+    const key = cancellation.cancelledExecutionAdmissionKey('merge-admission');
+    mockStateManager.getTaskState.mock.mockImplementation(async () => ({ claudeResult: { success: true, resultPhase: 'final' } }) as never);
+    mockOctokit.request.mock.mockImplementation(async () => ({ data: { id: 100, html_url: 'https://github.com/test' } }));
+    mockAgent.executeTask.mock.mockImplementation(async () => {
+        if (cancelAt === 'before-push') mockRedisStore.set(key, 'cancelled');
+        return mockAgentResult;
+    });
+    mockPushBranch.mock.mockImplementation(async () => { if (cancelAt === 'after-push') mockRedisStore.set(key, 'cancelled'); });
+    if (cancelAt === 'worker-start') mockRedisStore.set(key, 'cancelled');
+    const job: any = createMockJob(); job.data.executionAdmissionReceipt = { admissionId: 'merge-admission' };
+    const result = await processMergeConflictJob(job);
+    assert.equal(result.status, cancelAt === 'after-push' ? 'published-before-cancel' : 'cancelled');
+    assert.equal(mockPushBranch.mock.callCount(), cancelAt === 'after-push' ? 1 : 0);
+    assert.equal(mockOctokit.request.mock.calls.filter(c => c.arguments[0]?.startsWith('PATCH')).length, 0);
+    if (cancelAt === 'worker-start') assert.equal(mockOctokit.request.mock.calls.filter(c => c.arguments[0]?.startsWith('POST')).length, 0);
+    const terminal: any = mockStateManager.updateTaskState.mock.calls.at(-1)?.arguments[2];
+    assert.equal(terminal.historyMetadata.settlement, result.status);
+    if (cancelAt === 'after-push') { assert.equal(result.pushedHead, 'abc1234567890'); assert.equal(terminal.historyMetadata.pushedHead, result.pushedHead); }
 });

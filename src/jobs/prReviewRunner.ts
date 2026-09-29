@@ -31,6 +31,7 @@ export interface ReviewResult {
 }
 
 export interface RunReviewsContext {
+    beforePublish?: () => Promise<void>;
     registry: AgentRegistry;
     octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>>;
     pullRequestNumber: number;
@@ -92,6 +93,7 @@ export async function runSingleReview(
     }
 
     try {
+        await ctx.beforePublish?.();
         const analyzeOptions: AnalyzeOptions = {
             model: executionModel,
             taskId,
@@ -123,6 +125,7 @@ export async function runSingleReview(
             },
         );
 
+        await ctx.beforePublish?.();
         const reviewComment = await octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', {
             owner: repoOwner, repo: repoName, issue_number: pullRequestNumber, body: reviewCommentBody,
         });
@@ -135,6 +138,7 @@ export async function runSingleReview(
 
         let errorComment: { data: { id: number; html_url: string } } | undefined;
         try {
+            await ctx.beforePublish?.();
             errorComment = await octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', {
                 owner: repoOwner, repo: repoName, issue_number: pullRequestNumber,
                 body: buildReviewErrorComment(label, model, errorMsg),

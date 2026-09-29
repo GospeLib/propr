@@ -123,3 +123,7 @@ export { preserveExecutionCheckpoint, restoreExecutionCheckpoint, executionCheck
 export { publishPinnedExecutionCheckpoint, pinExecutionCheckpoint, resolveRepositoryGitDir, snapshotWorktreeToLocalRef, readLocalRef, executionCheckpointPinRef, LOCAL_CHECKPOINT_PIN_PREFIX, LOCAL_WORKTREE_SNAPSHOT_PREFIX } from './git/executionCheckpointRetention.js';
 export { requireExecutionRecoveryCheckpoint } from './admission/executionRecoveryContext.js';
 export { type ExecutionRecoveryCheckpoint, type ExecutionRecoveryContext } from './admission/executionRecoveryContext.js';
+
+export { parseSourceBinding, requireExactSource, type SourceAdmissionBinding, type SourceAdmissionStep } from "./admission/admissionBindings.js";
+export { cancelledExecutionAdmissionKey, executionAdmissionJobKey, sourceAdmissionJobId, AdmissionCancelledError, requireAdmissionNotCancelled, cancelExecutionAdmission } from "./admission/executionAdmissionCancellation.js";
+export { buildAdmittedSourceInstructions, enqueueAdmittedSource, readLiveAdmissionSource, parseSourceReference } from './admission/admittedSource.js';

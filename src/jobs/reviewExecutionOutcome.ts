@@ -42,7 +42,7 @@ export function reviewExecutionOutcome(reviewResults: ReviewResult[]): ReviewExe
 export async function publishReviewCompletion(options: {
     stateManager: WorkerStateManager;
     taskId: string;
-    job: Pick<Job, 'id'>;
+    job: Pick<Job, 'id'> & { data?: { commandMode?: string; executionAdmissionReceipt?: { admissionId: string } } };
     reviewResults: ReviewResult[];
     ultrafixHistoryMeta: Record<string, unknown> | undefined;
     correlatedLogger: Logger;
@@ -55,7 +55,8 @@ export async function publishReviewCompletion(options: {
         metadata: {
             reason: 'Review processing completed successfully',
             historyMetadata: {
-                commandMode: 'review',
+                commandMode: job.data?.commandMode || 'review',
+                ...(job.data?.executionAdmissionReceipt ? { admissionId: job.data.executionAdmissionReceipt.admissionId, settlement: 'published' } : {}),
                 reviewResults: reviewResults.map(result => ({
                     model: result.assignment.model, label: result.assignment.label, success: result.analysisResult.success,
                     commentId: result.commentId, commentUrl: result.commentUrl, error: result.error,

@@ -44,7 +44,7 @@ const TERMINAL_STATES = new Set<TaskState>([
     TaskStates.CANCELLED,
 ]);
 /** Job result statuses that report an executed run, and so may only ever be relayed. */
-const EXECUTED_COMPLETION_STATUSES = new Set(['complete', 'completed', 'partial']);
+const EXECUTED_COMPLETION_STATUSES = new Set(['complete', 'completed', 'partial', 'published-before-cancel']);
 
 type TaskStateStore = Pick<
     WorkerStateManager,

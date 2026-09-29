@@ -4,7 +4,7 @@ import type { ConversationStep, TokenUsage } from '../utils/llmMetrics.types.js'
 import type { SubscriptionUsageMetrics } from '../utils/github/formatSubscriptionUsage.js';
 import type { CommandMeta, UltrafixCommandMeta } from '../webhook/slashCommandParser.js';
 import type { ReasoningLevel } from '@propr/shared';
-import type { CommentAdmissionBinding, WorkerAdmissionReceipt } from '../admission/ezerExecutionAdmission.js';
+import type { CommentAdmissionBinding, SourceAdmissionBinding, SourceAdmissionStep, WorkerAdmissionReceipt } from '../admission/ezerExecutionAdmission.js';
 
 export interface IssueJobData {
     repoOwner: string;
@@ -44,6 +44,8 @@ export interface AutoResolveContext {
 export interface CommentJobData {
     executionAdmissionReceipt?: WorkerAdmissionReceipt;
     executionAdmissionComment?: CommentAdmissionBinding;
+    executionAdmissionSource?: SourceAdmissionBinding;
+    executionAdmissionStep?: SourceAdmissionStep;
     executionAdmissionTarget?: string;
     pullRequestNumber: number;
     commentId?: number;
@@ -62,7 +64,7 @@ export interface CommentJobData {
     /** Structured slash-command metadata (e.g. /review, /fix) */
     commandMeta?: CommandMeta;
     /** Flattened command mode for queue serialization; defaults to 'default' when absent */
-    commandMode?: 'default' | 'review' | 'fix' | 'switch' | 'use' | 'ultrafix';
+    commandMode?: 'default' | 'owner-review' | 'review' | 'fix' | 'switch' | 'use' | 'ultrafix';
     /** Explicit model selections from /review or /use commands */
     requestedModels?: string[];
     /** Extra instructions from the slash command body */
@@ -91,7 +93,7 @@ export interface UnprocessedComment {
     type: 'review' | 'issue';
     hasCodeContext?: boolean;
     commandMeta?: CommandMeta;
-    commandMode?: 'default' | 'review' | 'fix' | 'switch' | 'use' | 'ultrafix';
+    commandMode?: 'default' | 'owner-review' | 'review' | 'fix' | 'switch' | 'use' | 'ultrafix';
     /** Explicit model selections from /review or /use commands */
     requestedModels?: string[];
     commandInstructions?: string;
@@ -145,6 +147,9 @@ export interface IndexingJobData {
 }
 
 export interface MergeConflictJobData {
+    executionAdmissionReceipt?: WorkerAdmissionReceipt;
+    executionAdmissionSource?: SourceAdmissionBinding;
+    executionAdmissionTarget?: string;
     pullRequestNumber: number;
     repoOwner: string;
     repoName: string;

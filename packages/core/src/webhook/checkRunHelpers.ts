@@ -4,6 +4,7 @@ import { getAuthenticatedOctokit } from '../auth/githubAuth.js';
 import logger from '../utils/logger.js';
 import { db } from '../db/connection.js';
 import { getIssueQueue } from '../queue/taskQueue.js';
+import { isFailingCheckRunConclusion } from './ciFailureFollowup.js';
 
 export interface MergePROptions {
     owner: string;
@@ -196,6 +197,7 @@ export async function getCurrentPRHead(owner: string, repoName: string, prNumber
 interface CommitStatusInfo {
     state: string;
     totalCount: number;
+    statuses: { context: string; state: string; description?: string | null }[];
 }
 
 interface GitHubApiError extends Error {
@@ -208,16 +210,47 @@ function isIntegrationAccessError(error: unknown): boolean {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function getCommitStatusInfo(octokit: any, owner: string, repoName: string, ref: string): Promise<CommitStatusInfo> {
+async function getCommitStatusInfo(octokit: any, owner: string, repoName: string, ref: string, page = 1): Promise<CommitStatusInfo> {
     const statusResponse = await octokit.request('GET /repos/{owner}/{repo}/commits/{ref}/status', {
         owner,
         repo: repoName,
-        ref
+        ref, per_page: 100, page
     });
     return {
+        statuses: statusResponse.data.statuses ?? [],
         state: statusResponse.data.state as string,
         totalCount: (statusResponse.data.total_count ?? statusResponse.data.statuses?.length ?? 0) as number,
     };
+}
+
+async function getCommitCheckRuns(octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>>, owner: string, repo: string, ref: string, page = 1) {
+    return octokit.request('GET /repos/{owner}/{repo}/commits/{ref}/check-runs', {
+        owner, repo, ref, per_page: 100, page,
+    });
+}
+
+/** Read failure evidence for an exact commit, including every page of both CI signal types. */
+export async function getFailingCheckEvidence(owner: string, repo: string, ref: string): Promise<string> {
+    const octokit = await getAuthenticatedOctokit();
+    const evidence: string[] = [];
+    for (let page = 1; ; page++) {
+        const { data } = await getCommitCheckRuns(octokit, owner, repo, ref, page);
+        for (const run of data.check_runs) {
+            if (run.status !== 'completed' || !isFailingCheckRunConclusion(run.conclusion)) continue;
+            evidence.push(`Check: ${run.name}\nConclusion: ${run.conclusion}\nTitle: ${run.output?.title ?? ''}\nSummary: ${run.output?.summary ?? ''}`);
+        }
+        if (page * 100 >= data.total_count || data.check_runs.length === 0) break;
+    }
+    for (let page = 1; ; page++) {
+        const status = await getCommitStatusInfo(octokit, owner, repo, ref, page);
+        for (const entry of status.statuses) {
+            if (entry.state === 'failure' || entry.state === 'error') {
+                evidence.push(`Commit status: ${entry.context}\nState: ${entry.state}\nDescription: ${entry.description ?? ''}`);
+            }
+        }
+        if (page * 100 >= status.totalCount || status.statuses.length === 0) break;
+    }
+    return evidence.join('\n\n') || 'No failing checks or commit statuses reported for this head.';
 }
 
 export interface CheckRunsStatus {
@@ -236,11 +269,7 @@ export async function getCheckRunsStatus(owner: string, repoName: string, ref: s
     try {
         const octokit = await getAuthenticatedOctokit();
         const [checkRunsResult, commitStatusResult] = await Promise.allSettled([
-            octokit.request('GET /repos/{owner}/{repo}/commits/{ref}/check-runs', {
-                owner,
-                repo: repoName,
-                ref
-            }),
+            getCommitCheckRuns(octokit, owner, repoName, ref),
             getCommitStatusInfo(octokit, owner, repoName, ref)
         ]);
 
@@ -300,11 +329,7 @@ export async function areAllChecksPassing(owner: string, repoName: string, ref: 
         const octokit = await getAuthenticatedOctokit();
 
         const [checkRunsResult, commitStatusResult] = await Promise.allSettled([
-            octokit.request('GET /repos/{owner}/{repo}/commits/{ref}/check-runs', {
-                owner,
-                repo: repoName,
-                ref
-            }),
+            getCommitCheckRuns(octokit, owner, repoName, ref),
             getCommitStatusInfo(octokit, owner, repoName, ref)
         ]);
 

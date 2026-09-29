@@ -1,4 +1,8 @@
-import { Job } from 'bullmq';
+import { execFileSync } from 'node:child_process';
+import { AdmissionCancelledError, requireAdmissionNotCancelled } from '@propr/core';
+import { verifyAdmittedSourceJob, requireSourcePublication } from './ezerSourceAdmission.js';
+import { settleAdmissionCancellation } from './settleAdmissionCancellation.js';
+import { Job, DelayedError } from 'bullmq';
 import type { Logger } from 'pino';
 import { logger } from '@propr/core';
 import { getAuthenticatedOctokit } from '@propr/core';
@@ -54,6 +58,7 @@ async function acquireMergeJobLock(
         if (currentLock !== correlationId) {
             correlatedLogger.info({ lockOwner: currentLock }, 'PR is currently being processed by another job. Rescheduling merge conflict job.');
             const { issueQueue } = await import('@propr/core');
+            if (job.data.executionAdmissionReceipt) { await job.moveToDelayed(Date.now() + 10000, job.token); throw new DelayedError(); }
             await issueQueue.add(job.name, job.data, { delay: 10000 });
             return { acquired: false, result: { status: 'rescheduled', reason: 'pr_locked_by_other_job' } };
         }
@@ -281,12 +286,15 @@ export async function processMergeConflictJob(job: Job<MergeConflictJobData>): P
     let prDescription: string | null | undefined;
     let recentComments: Awaited<ReturnType<typeof fetchAllComments>> = [];
     let jobSucceeded = false;
+    let pushedHead: string | undefined;
 
     try {
+        if (job.data.executionAdmissionReceipt || job.data.executionAdmissionSource) await verifyAdmittedSourceJob(job.data, redisClient);
         octokit = await withRetry(() => getAuthenticatedOctokit(), { ...retryConfigs.githubApi, correlationId }, 'get_authenticated_octokit');
         const githubToken = await octokit.auth({ type: "installation" }) as GitHubToken;
         const repoUrl = getRepoUrl({ repoOwner, repoName });
 
+        await requireSourcePublication(job.data, redisClient);
         const startingComment = await octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', {
             owner: repoOwner, repo: repoName, issue_number: pullRequestNumber,
             body: `🔀 **Auto-resolving merge conflicts** — merging \`${baseBranch}\` into \`${headBranch}\`\n\nThis is a system-triggered action to keep the PR branch up to date.`,
@@ -312,6 +320,9 @@ export async function processMergeConflictJob(job: Job<MergeConflictJobData>): P
 
         correlatedLogger.info({ worktreePath: worktreeInfo.worktreePath, branchName: worktreeInfo.branchName }, 'Created worktree for merge conflict resolution');
 
+        if (job.data.executionAdmissionSource && execFileSync('git', ['rev-parse', 'HEAD'], { cwd: worktreeInfo.worktreePath, encoding: 'utf8' }).trim() !== headSha) {
+            throw new Error('ezer-source-refused:worktree-head-changed');
+        }
         const mergeResult = await mergeBaseIntoBranch(worktreeInfo.worktreePath, baseBranch);
 
         if (mergeResult.outcome === 'failed') {
@@ -339,6 +350,9 @@ export async function processMergeConflictJob(job: Job<MergeConflictJobData>): P
         }
 
         const result = await handleMergeWithAgent({
+            executionAdmissionReceipt: job.data.executionAdmissionReceipt,
+            beforePublish: () => requireSourcePublication(job.data, redisClient, pushedHead),
+            onPushed: head => { pushedHead = head; },
             conflictedFiles: mergeResult.conflictedFiles,
             worktreeInfo, branchName: headBranch, baseBranch,
             pullRequestNumber, repoUrl, repoOwner, repoName,
@@ -350,9 +364,16 @@ export async function processMergeConflictJob(job: Job<MergeConflictJobData>): P
         jobSucceeded = result.status === 'complete';
         return result;
 
-    } catch (error) {
+    } catch (caught) {
+        if (isCompletionDurabilityUnverifiable(caught)) throw caught;
+        let error = caught;
+        if (!(error instanceof AdmissionCancelledError) && job.data.executionAdmissionReceipt) {
+            try { await requireAdmissionNotCancelled(redisClient, job.data.executionAdmissionReceipt.admissionId, pushedHead); }
+            catch (cancelled) { if (cancelled instanceof AdmissionCancelledError) error = cancelled; else throw cancelled; }
+        }
+        if (error instanceof AdmissionCancelledError) return await settleAdmissionCancellation(error, taskId, stateManager, correlatedLogger);
         return await handleMergeJobError(error as Error, {
-            octokit, startingCommentId, stateManager, taskId,
+            octokit: job.data.executionAdmissionReceipt ? null : octokit, startingCommentId, stateManager, taskId,
             repoOwner, repoName, baseBranch, headBranch, pullRequestNumber, correlatedLogger,
         });
     } finally {

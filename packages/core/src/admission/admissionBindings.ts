@@ -40,6 +40,63 @@ export function requireExactComment(actual: CommentAdmissionBinding | undefined,
     if (JSON.stringify(actual) !== JSON.stringify(expected)) refuse('wrong-comment');
 }
 
+export interface SourceAdmissionBinding {
+    kind: 'issue_comment' | 'review_comment' | 'review';
+    id: number;
+    authorId: number;
+    generation: number;
+    bodyDigest: string;
+    revisionAt: string;
+    headSha: string;
+    headBranch: string;
+    mode: 'fix' | 'review' | 'ultrafix' | 'merge';
+    model?: string;
+}
+
+export interface SourceAdmissionStep { loopId: string; ordinal: number }
+
+export function parseSourceBinding(value: unknown): SourceAdmissionBinding {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) refuse('invalid-source');
+    const v = value as Record<string, unknown>;
+    const keys = ['kind', 'id', 'authorId', 'generation', 'bodyDigest', 'revisionAt', 'headSha', 'headBranch', 'mode', 'model'];
+    if (Object.keys(v).some(key => !keys.includes(key)) ||
+        !['issue_comment', 'review_comment', 'review'].includes(String(v.kind)) ||
+        !['fix', 'review', 'ultrafix', 'merge'].includes(String(v.mode))) refuse('invalid-source');
+    for (const key of ['id', 'authorId', 'generation']) {
+        if (!Number.isSafeInteger(v[key]) || Number(v[key]) < 1) refuse('invalid-source');
+    }
+    if (typeof v.bodyDigest !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(v.bodyDigest) ||
+        typeof v.headSha !== 'string' || !/^[a-f0-9]{40}$/.test(v.headSha)) refuse('invalid-source');
+    if (v.model !== undefined && (!['fix', 'review'].includes(String(v.mode)) ||
+        typeof v.model !== 'string' || !v.model || /\s/.test(v.model))) refuse('invalid-source-model');
+    return { kind: v.kind as SourceAdmissionBinding['kind'], id: Number(v.id), authorId: Number(v.authorId),
+        generation: Number(v.generation), bodyDigest: v.bodyDigest, revisionAt: requireIsoTimestamp(v.revisionAt, 'invalid-source-revision'),
+        headSha: v.headSha, headBranch: requiredString(v.headBranch, 'invalid-source-branch'),
+        mode: v.mode as SourceAdmissionBinding['mode'], ...(v.model === undefined ? {} : { model: v.model as string }) };
+}
+
+export function parseSourceStep(value: unknown): SourceAdmissionStep {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) refuse('invalid-source-step');
+    const v = value as Record<string, unknown>;
+    if (Object.keys(v).some(key => !['loopId', 'ordinal'].includes(key)) ||
+        typeof v.loopId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(v.loopId) ||
+        !Number.isSafeInteger(v.ordinal) || Number(v.ordinal) < 1) refuse('invalid-source-step');
+    return { loopId: v.loopId, ordinal: Number(v.ordinal) };
+}
+
+export function requireExactSource(actual: SourceAdmissionBinding | undefined, expected: SourceAdmissionBinding | undefined): void {
+    if (!actual || !expected) { if (actual !== expected) refuse('wrong-source'); return; }
+    const a = parseSourceBinding(actual), b = parseSourceBinding(expected);
+    for (const key of Object.keys(a) as Array<keyof SourceAdmissionBinding>) if (a[key] !== b[key]) refuse(`wrong-source-${key}`);
+    if (a.model !== b.model) refuse('wrong-source-model');
+}
+
+export function requireExactSourceStep(actual: SourceAdmissionStep | undefined, expected: SourceAdmissionStep | undefined): void {
+    if (!actual || !expected) { if (actual !== expected) refuse('wrong-source-step'); return; }
+    const a = parseSourceStep(actual), b = parseSourceStep(expected);
+    if (a.loopId !== b.loopId || a.ordinal !== b.ordinal) refuse('wrong-source-step');
+}
+
 export interface TypedInvestigationAdmission {
   kind: 'research' | 'design' | 'spike';
   provider?: 'claude' | 'codex' | 'ollama';

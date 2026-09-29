@@ -175,7 +175,7 @@ export function buildDeterministicPrTaskSubtitle(workflow: PrTaskWorkflow, branc
 export function resolvePrTaskWorkflow(commandMode: string | undefined, hasUltrafixMeta = false): PrTaskWorkflow {
     if (hasUltrafixMeta || commandMode === 'ultrafix') return 'ultrafix';
     if (commandMode === 'fix') return 'fix';
-    if (commandMode === 'review') return 'review';
+    if (commandMode === 'review' || commandMode === 'owner-review') return 'review';
     return 'followup';
 }
 

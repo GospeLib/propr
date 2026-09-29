@@ -1,3 +1,4 @@
+import { requireSourcePublication } from './ezerSourceAdmission.js';
 import { Job } from 'bullmq';
 import type { Logger } from 'pino';
 import type { Redis } from 'ioredis';
@@ -40,6 +41,7 @@ import {
 } from '../github/visualPreviewAttachments.js';
 
 interface PostExecutionState {
+    pushedHead?: string;
     artifactCorrection?: import('@propr/core').TypedArtifactCorrection;
     octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>> | null;
     worktreeInfo: WorktreeInfo | undefined;
@@ -89,7 +91,8 @@ interface UndoContextParams {
 async function commitAndPush(
     state: ReadyPostExecutionState,
     issueRef: { repoOwner: string; repoName: string; pullRequestNumber: number },
-    llm: string | null | undefined
+    llm: string | null | undefined,
+    beforePush?: () => Promise<void>
 ) {
     const changesSummary = state.claudeResult.summary || state.claudeResult.finalResult?.result || '';
     const commitMessage = buildCommitMessage({ changesSummary, unprocessedComments: state.unprocessedComments, pullRequestNumber: issueRef.pullRequestNumber, claudeResult: state.claudeResult, llm, authorsText: state.authorsText });
@@ -98,10 +101,11 @@ async function commitAndPush(
     if (commitResult) {
         const repoUrl = getRepoUrl({ repoOwner: issueRef.repoOwner, repoName: issueRef.repoName });
         const githubToken = await state.octokit.auth({ type: "installation" }) as GitHubToken;
+        await beforePush?.();
         const pushResult = await pushBranch(state.worktreeInfo.worktreePath, state.worktreeInfo.branchName, {
             repoUrl,
             authToken: githubToken.token,
-            rebaseOnNonFastForward: true,
+            rebaseOnNonFastForward: !beforePush,
         });
         if (pushResult.rebased && pushResult.commitHash) {
             commitResult.commitHash = pushResult.commitHash;
@@ -151,6 +155,7 @@ interface CompletionCommentPublicationOptions {
     llm: string | null | undefined;
     taskUrl: string;
     unprocessedReviewComments: AIReviewComment[];
+    beforePublish?: () => Promise<void>;
     visualPreviewEvidence?: Awaited<ReturnType<typeof prepareVisualPreviewEvidence>>['evidence'];
 }
 
@@ -177,7 +182,9 @@ async function publishCompletionComment(options: CompletionCommentPublicationOpt
     }, state.claudeResult);
     const prCommentBody = appendVisualPreviewSection(prCommentTemplate, visualPreviewSection);
 
+    await options.beforePublish?.();
     if (visualPreviewEvidence.assets.length === 0) {
+        await options.beforePublish?.();
         return state.octokit.request('PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}', {
             owner: repoOwner,
             repo: repoName,
@@ -200,6 +207,7 @@ async function publishCompletionComment(options: CompletionCommentPublicationOpt
         return { data: published };
     } catch (previewError) {
         correlatedLogger.warn({ pullRequestNumber, error: (previewError as Error).message }, 'Could not upload visual previews; publishing a text-only explanation');
+        await options.beforePublish?.();
         return state.octokit.request('PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}', {
             owner: repoOwner,
             repo: repoName,
@@ -255,7 +263,11 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
             settings: await loadRepositoryVisualPreviewSettings(`${repoOwner}/${repoName}`),
             taskId
         });
-        const { commitResult, changesSummary, commitMessage } = await commitAndPush(state, { repoOwner, repoName, pullRequestNumber }, llm);
+        await requireSourcePublication(job.data, redisClient);
+        const { commitResult, changesSummary, commitMessage } = await commitAndPush(state, { repoOwner, repoName, pullRequestNumber }, llm,
+            job.data.executionAdmissionReceipt ? () => requireSourcePublication(job.data, redisClient) : undefined);
+        state.pushedHead = commitResult?.commitHash;
+        if (commitResult?.commitHash) await persistCommitHash(taskId, commitResult.commitHash, correlatedLogger);
         if (partial && !commitResult) {
             throw new Error(`Agent execution ${terminationReason === 'timeout' ? 'timed out' : 'reached the maximum turn limit'} before producing changes to publish`);
         }
@@ -270,6 +282,7 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
             llm,
             taskUrl,
             unprocessedReviewComments,
+            beforePublish: () => requireSourcePublication(job.data, redisClient, commitResult?.commitHash),
             visualPreviewEvidence: preparedVisualPreview?.evidence
         });
         correlatedLogger.info({ pullRequestNumber, commitHash: commitResult?.commitHash, commentUrl: completionComment.data.html_url, partial, terminationReason }, partial ? 'Published partial follow-up changes after interrupted execution' : 'Successfully applied follow-up changes');
@@ -286,7 +299,7 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
             });
         }
 
-        const ultrafixHistoryMeta = await resolveUltrafixHistoryMeta(job, { repoOwner, repoName, pullRequestNumber }, redisClient);
+        const ultrafixHistoryMeta = job.data.executionAdmissionReceipt ? undefined : await resolveUltrafixHistoryMeta(job, { repoOwner, repoName, pullRequestNumber }, redisClient);
 
         // `completed` is published only once the final execution evidence is durable; the
         // evidence rides on the completed entry itself. See completedExecutionDurability.ts.
@@ -309,6 +322,7 @@ export async function handlePostExecution(params: PostExecutionParams, taskUrl: 
                 }),
                 historyMetadata: {
                     commandMode: job.data.commandMode || 'default',
+                    ...(job.data.executionAdmissionReceipt ? { admissionId: job.data.executionAdmissionReceipt.admissionId, settlement: 'published', pushedHead: commitResult?.commitHash } : {}),
                     githubComment: { url: completionComment.data.html_url, body: completionComment.data.body },
                     ...(unprocessedReviewComments.length > 0 && { consumedReviewCommentIds: unprocessedReviewComments.map(c => c.id) }),
                     ...(partial && { incompleteExecution: { reason: terminationReason } }),

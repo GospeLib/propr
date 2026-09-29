@@ -270,21 +270,21 @@ type ManualCommandFenceOptions = Pick<SlashCommandHandlerOptions, 'comment' | 'e
 async function fenceManualCommand(opts: ManualCommandFenceOptions): Promise<ManualCommandTakeover | null> {
     const { commandMeta, comment, eventContext, config, correlatedLogger } = opts;
     if (commandMeta.mode !== 'fix' && commandMeta.mode !== 'review') return null;
-
-    const { owner, repo, prNumber } = eventContext;
     const commentRevisionIdentity = getCommentRevisionIdentity(comment, eventContext.eventType);
-    const takeover = await loadUltrafixDeps().invalidateAutomaticWork(config.redisClient, {
-        owner,
-        repo,
-        pr: prNumber,
-        sourceCommentId: comment.id,
-        sourceCommentRevision: commentRevisionIdentity,
-    });
-    correlatedLogger.info(
-        { pullRequestNumber: prNumber, commentId: comment.id, command: commandMeta.mode, workEpoch: takeover.workEpoch },
-        'Manual command invalidated deferred and queued Ultrafix actions',
-    );
+    const takeover = await fenceAdmittedManualCommand({ owner: eventContext.owner, repo: eventContext.repo,
+        pr: eventContext.prNumber, sourceCommentId: comment.id, sourceCommentRevision: commentRevisionIdentity,
+        redis: config.redisClient });
+    correlatedLogger.info({ pullRequestNumber: eventContext.prNumber, commentId: comment.id, command: commandMeta.mode,
+        workEpoch: takeover.workEpoch }, 'Manual command invalidated deferred and queued Ultrafix actions');
     return { ...takeover, commentRevisionIdentity };
+}
+
+/** The same manual-command fence for typed sources and legacy slash commands. */
+export async function fenceAdmittedManualCommand(input: {
+    owner: string; repo: string; pr: number; sourceCommentId: number; sourceCommentRevision: string; redis: Redis;
+}): Promise<{ workEpoch: number; hadAutomaticWork: boolean }> {
+    const { redis, ...identity } = input;
+    return loadUltrafixDeps().invalidateAutomaticWork(redis, identity);
 }
 
 async function handleSlashCommand(opts: SlashCommandHandlerOptions): Promise<void> {

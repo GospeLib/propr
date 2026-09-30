@@ -1,3 +1,4 @@
+import * as cancellation from '../packages/core/src/admission/executionAdmissionCancellation.js';
 import assert from 'node:assert/strict';
 import { completionCoreExports } from './helpers/completionCoreDoubles.js';
 import { mock, test } from 'node:test';
@@ -15,7 +16,7 @@ const updateTaskState = mock.fn(async () => undefined);
 const patchComment = mock.fn(async () => ({ data: { html_url: 'https://example.test/comment/1', body: 'completion' } }));
 
 await mock.module('@propr/core', {
-    namedExports: { ...publicationPolicy, ...visualPreview, ...completionCoreExports,
+    namedExports: { ...cancellation, ...publicationPolicy, ...visualPreview, ...completionCoreExports,
         loadRepositoryVisualPreviewSettings: async () => ({ enabled: false, types: [] }),
         prepareVisualPreviewEvidence: async () => ({ evidence: { assets: [], toolSuggestions: [] } }),
         cleanupPreparedVisualPreviewEvidence: async () => undefined,
@@ -157,3 +158,31 @@ test('legacy unsigned follow-up semantics still publish explicitly partial work'
     assert.equal(updateTaskState.mock.callCount(), 1);
 });
 import * as publicationPolicy from '../packages/core/src/publication/index.js';
+
+for (const cancelAt of ['before-commit', 'before-push', 'after-push'] as const) test(`actual publication ${cancelAt} honours tombstone without a result comment`, async () => {
+    resetPublicationCalls();
+    let cancelled = cancelAt === 'before-commit';
+    commitChanges.mock.mockImplementation(async () => {
+        if (cancelAt === 'before-push') cancelled = true;
+        return { commitHash: 'a'.repeat(40), commitMessage: 'change', filesChanged: ['file.ts'] };
+    });
+    pushBranch.mock.mockImplementation(async () => {
+        if (cancelAt === 'after-push') cancelled = true;
+        return { rebased: false };
+    });
+    const state = { ...baseState, claudeResult: { success: true } };
+    await assert.rejects(() => handlePostExecution({
+        state, job: { id: 'admitted', data: { executionAdmissionReceipt: { admissionId: 'admission' } } },
+        taskId: 'admitted', stateManager: { updateTaskState },
+        context: { repoOwner: 'owner', repoName: 'repo', pullRequestNumber: 41, correlatedLogger: { info: mock.fn(), warn: mock.fn() } },
+        unprocessedReviewComments: [], redisClient: { get: async () => cancelled ? 'tombstone' : null },
+        prProcessingLockKey: 'lock', prProcessingLockToken: 'token', ezerAdmissionVerified: true,
+    } as never, 'https://example.test/task'), (error: unknown) => {
+        assert.ok(error instanceof cancellation.AdmissionCancelledError);
+        assert.equal(error.pushedHead, cancelAt === 'after-push' ? 'a'.repeat(40) : undefined);
+        return true;
+    });
+    assert.equal(commitChanges.mock.callCount(), cancelAt === 'before-commit' ? 0 : 1);
+    assert.equal(pushBranch.mock.callCount(), cancelAt === 'after-push' ? 1 : 0);
+    assert.equal(patchComment.mock.callCount(), 0);
+});

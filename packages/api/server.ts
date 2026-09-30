@@ -1,3 +1,4 @@
+import { postEzerAdmissionCancel } from './routes/ezerAdmissionCancel.js';
 /* eslint-disable max-lines -- route registration and coordinated shutdown share startup state */
 import express, { Request, Response } from 'express';
 import { postEzerIntegration, getEzerIntegration } from './routes/ezerIntegration.js';
@@ -296,6 +297,7 @@ function setupRoutes(): void {
   const operationalRoutes: RouteEntry[] = [
     ['post', '/api/tasks/integration', postEzerIntegration], ['get', '/api/tasks/integration/:digest', getEzerIntegration],
     ['get', '/api/status', statusRoutes.getStatus], ['get', '/api/tasks', taskRoutes.getTasks], ['get', '/api/tasks/revert-preview', taskRoutes.getRevertPreview], ['post', '/api/tasks/revert', taskRoutes.revertChanges],
+    ['post', '/api/ezer/admissions/:admissionId/cancel', postEzerAdmissionCancel],
     ['post', '/api/tasks/:taskId/followup', taskRoutes.postFollowup], ...createTaskDeleteRouteEntries({ taskRoutes }), ['get', '/api/task/:taskId/history', taskHistoryRoutes.getTaskHistory], ['get', '/api/task/:taskId/live-details', liveDetailsRoutes.getLiveDetails],
     ['get', '/api/task/:taskId/file-changes', fileChangesRoutes.getFileChanges], ['get', '/api/queue/stats', queueRoutes.getQueueStats], ['get', '/api/activity', queueRoutes.getActivity], ['get', '/api/metrics', queueRoutes.getMetrics],
     ['get', '/api/llm-metrics', llmMetricsRoutes.getSummary], ['get', '/api/llm-metrics/:correlationId', llmMetricsRoutes.getByCorrelationId], ['get', '/api/llm-logs', llmLogsRoutes.getLlmLogs], ['get', '/api/execution/:sessionId/prompt', executionRoutes.getPrompt],

@@ -1,8 +1,13 @@
+import { verifyAdmittedSourceJob } from './ezerSourceAdmission.js';
 import { createHash } from 'node:crypto';
 import { createRedisAdmissionStore, requiresEzerExecutionAdmission, verifyWorkerAdmissionReceipt, getAuthenticatedOctokit, requireReviewRequestMode, type TypedArtifactCorrection, type CommentJobData } from '@propr/core';
 import type { Redis } from 'ioredis';
 
 export async function verifyAdmittedPRComment(data: CommentJobData, redis: Redis, onArtifactCorrection?: (binding: TypedArtifactCorrection) => void): Promise<boolean> {
+  if (data.executionAdmissionSource || data.executionAdmissionReceipt?.source) {
+    await verifyAdmittedSourceJob(data, redis, onArtifactCorrection);
+    return true;
+  }
   const repository = `${data.repoOwner}/${data.repoName}`;
   if (!data.executionAdmissionReceipt && !requiresEzerExecutionAdmission({ repository, protectedRepositories: process.env.EZER_ADMISSION_PROTECTED_REPOSITORIES })) return false;
   requireReviewRequestMode({ body: data.comments?.[0]?.body || '', admissionId: data.executionAdmissionReceipt?.admissionId || '',

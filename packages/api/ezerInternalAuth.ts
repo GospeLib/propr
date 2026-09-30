@@ -20,6 +20,7 @@ export const EZER_ADMISSION_CAPABILITIES = {
 } as const;
 
 const EZER_INTERNAL_ELIGIBLE_ROUTES: ReadonlyArray<{ method: string; pattern: RegExp }> = [
+  { method: 'POST', pattern: /^\/ezer\/admissions\/[^/]+\/cancel$/ },
   { method: 'POST', pattern: /^\/tasks\/integration$/ },
   { method: 'GET', pattern: /^\/tasks\/integration\/[a-f0-9]{64}$/ },
   { method: 'GET', pattern: /^\/status$/ },

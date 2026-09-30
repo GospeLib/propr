@@ -25,7 +25,7 @@ interface PullRequest {
 interface PRComment {
     id: number;
     body: string | null;
-    user: { login: string };
+    user: { id?: number; login: string };
     created_at: string;
     pull_request_review_id?: number;
     path?: string;
@@ -224,6 +224,7 @@ async function collectUnprocessedComments(
     let selectedLlm: string | null = extractModelFromPRLabels(pr, MODEL_LABEL_PATTERN, correlationId);
 
     for (const comment of commentsByTime) {
+        if (comment.user.id !== undefined && comment.user.id === Number(process.env.EZER_OWNER_GITHUB_USER_ID)) continue;
         const commentAuthor = comment.user.login;
         const filterResult = filterCommentByAuthor(commentAuthor, correlationId);
         if (filterResult.shouldFilter) continue;

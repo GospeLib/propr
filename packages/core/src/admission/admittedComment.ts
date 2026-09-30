@@ -1,3 +1,4 @@
+import { requireAdmissionNotCancelled, executionAdmissionJobKey } from './executionAdmissionCancellation.js';
 import { createHash } from 'node:crypto';
 import { Redis } from 'ioredis';
 import { consumeExecutionAdmission, createRedisAdmissionStore, pendingExecutionAdmissionKey, getAuthenticatedOctokit, issueQueue, generateCorrelationId, extractLlmFromLabels, logger } from '../index.js';
@@ -33,15 +34,16 @@ export async function enqueueAdmittedComment(input: {
   }
   const binding = { commentId: comment.id, bodyDigest: `sha256:${createHash('sha256').update(input.body).digest('hex')}`,
     headSha: pr.head.sha, headBranch: pr.head.ref };
-  const jobId = admittedCommentJobId(input.admissionId);
-  const existing = await issueQueue.getJob(jobId);
-  if (existing) {
-    if (!('commandMode' in existing.data) || existing.data.commandMode !== (review ? 'review' : 'default') || existing.data.executionAdmissionReceipt?.admissionId !== input.admissionId ||
-        JSON.stringify('executionAdmissionComment' in existing.data ? existing.data.executionAdmissionComment : undefined) !== JSON.stringify(binding)) throw new Error('ezer-comment-refused:replay-mismatch');
-    return { jobId, commentId: comment.id };
-  }
   const redis = new Redis({ host: process.env.REDIS_HOST || '127.0.0.1', port: Number(process.env.REDIS_PORT || '6379') });
   try {
+    await requireAdmissionNotCancelled(redis, input.admissionId);
+    const jobId = admittedCommentJobId(input.admissionId);
+    const existing = await issueQueue.getJob(jobId);
+    if (existing) {
+      if (!('commandMode' in existing.data) || existing.data.commandMode !== (review ? 'review' : 'default') || existing.data.executionAdmissionReceipt?.admissionId !== input.admissionId ||
+          JSON.stringify('executionAdmissionComment' in existing.data ? existing.data.executionAdmissionComment : undefined) !== JSON.stringify(binding)) throw new Error('ezer-comment-refused:replay-mismatch');
+      return { jobId, commentId: comment.id };
+    }
     const store = createRedisAdmissionStore(redis);
     const token = await store.get(pendingExecutionAdmissionKey(input.repository, input.prNumber));
     if (!token) throw new Error('ezer-comment-refused:missing-pending-admission');
@@ -49,7 +51,9 @@ export async function enqueueAdmittedComment(input: {
       signingSecret: process.env.EZER_ADMISSION_HMAC_SECRET || '', store,
       expected: { repository: input.repository, issueNumber: input.prNumber, comment: binding } });
     if (claims.admissionId !== input.admissionId || claims.target !== pr.base.ref) throw new Error('ezer-comment-refused:wrong-admission-or-base');
-    await issueQueue.add('processPullRequestComment', {
+    await redis.set(executionAdmissionJobKey(input.admissionId), jobId);
+    await requireAdmissionNotCancelled(redis, input.admissionId);
+    const job = await issueQueue.add('processPullRequestComment', {
       repoOwner: owner, repoName: repo, pullRequestNumber: input.prNumber, branchName: pr.head.ref,
       correlationId: generateCorrelationId(), commandMode: review ? 'review' : 'default',
       ...(review ? { requestedModels: [review[2]!], commandInstructions: review[3]!, commandCommentId: comment.id,
@@ -58,6 +62,8 @@ export async function enqueueAdmittedComment(input: {
       comments: [{ id: comment.id, body: input.body, author: comment.user!.login, type: 'issue' }],
       executionAdmissionReceipt: receipt, executionAdmissionComment: binding, executionAdmissionTarget: claims.target,
     }, { jobId, attempts: 1, removeOnComplete: false, removeOnFail: false });
+    try { await requireAdmissionNotCancelled(redis, input.admissionId); }
+    catch (error) { if (await job.getState() !== 'active') await job.remove(); throw error; }
     return { jobId, commentId: comment.id };
   } finally { redis.disconnect(); }
 }

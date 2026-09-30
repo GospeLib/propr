@@ -1,3 +1,4 @@
+import { requireSourcePublication } from './ezerSourceAdmission.js';
 import type { Logger } from 'pino';
 import type { Job } from 'bullmq';
 import { getAuthenticatedOctokit, retryConfigs, TaskStates, withRetry } from '@propr/core';
@@ -236,7 +237,7 @@ async function handleUltrafixContinuation(
     action: UltrafixAction,
     params: { job: Job<CommentJobData>; stateManager: WorkerStateManager; taskId: string; redisClient: Redis; repoOwner: string; repoName: string; pullRequestNumber: number; correlatedLogger: Logger; correlationId: string; currentReviewCommentIds: number[]; currentReviewResultCount: number }
 ): Promise<void> {
-    if (!params.job.data.ultrafixMeta) return;
+    if (params.job.data.executionAdmissionReceipt || !params.job.data.ultrafixMeta) return;
     const { job, stateManager, taskId, redisClient, repoOwner, repoName, pullRequestNumber, correlatedLogger, correlationId } = params;
     try {
         const continuationResult = await continueUltrafixLoop({
@@ -255,7 +256,7 @@ async function handleUltrafixContinuation(
 async function resolveUltrafixHistoryMeta(
     job: Job<CommentJobData>, redisClient: Redis, issueRef: { repoOwner: string; repoName: string; pullRequestNumber: number }
 ): Promise<Record<string, unknown> | undefined> {
-    if (!job.data.ultrafixMeta) return undefined;
+    if (job.data.executionAdmissionReceipt || !job.data.ultrafixMeta) return undefined;
     return buildUltrafixHistoryMeta(job.data.ultrafixMeta, await loadUltrafixState(redisClient, issueRef.repoOwner, issueRef.repoName, issueRef.pullRequestNumber));
 }
 
@@ -328,6 +329,7 @@ export async function executeReviewProcessing(params: ExecuteReviewParams): Prom
         : '';
     const modelList = assignments.map(a => `\`${a.label}\``).join(', ');
     const startedEvidence = buildWorkEvidenceMarker('started', realComments.map(comment => comment.id));
+    await requireSourcePublication(job.data, redisClient);
     state.startingWorkComment = await state.octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', { owner: repoOwner, repo: repoName, issue_number: pullRequestNumber, body: `🔍 **Starting AI Code Review** requested by ${state.authorsText}\n\nAnalyzing the pull request with ${modelList}...\n\n[View Task Progress](${taskUrl})${commentIdsSuffix}${startedEvidence ? `\n${startedEvidence}` : ''}` });
 
     const workflow = resolvePrTaskWorkflow(job.data.commandMode, Boolean(job.data.ultrafixMeta));
@@ -355,7 +357,7 @@ export async function executeReviewProcessing(params: ExecuteReviewParams): Prom
     });
 
     let originalTaskSpec = linkedIssueResult.context || prData!.data.body || '';
-    if (job.data.ultrafixMeta) {
+    if (!job.data.executionAdmissionReceipt && job.data.ultrafixMeta) {
         originalTaskSpec = await retainOriginalScope(redisClient, {
             owner: repoOwner,
             repo: repoName,
@@ -397,6 +399,7 @@ export async function executeReviewProcessing(params: ExecuteReviewParams): Prom
     }
 
     const reviewCtx: RunReviewsContext = {
+        beforePublish: () => requireSourcePublication(job.data, redisClient),
         registry, octokit: state.octokit, pullRequestNumber, repoOwner, repoName,
         taskId, taskUrl, combinedCommentBody,
         // Prior review prose must never become an expanded Ultrafix objective.
@@ -422,6 +425,7 @@ export async function executeReviewProcessing(params: ExecuteReviewParams): Prom
     );
 
     await recordReviewMetrics(reviewResults, { pullRequestNumber, repoOwner, repoName, correlationId, taskId });
+    await requireSourcePublication(job.data, redisClient);
     await updateReviewCompletionComment(state, reviewResults, { repoOwner, repoName, taskUrl, correlatedLogger });
 
     const successCount = reviewResults.filter(r => r.analysisResult.success).length;
@@ -435,7 +439,7 @@ export async function executeReviewProcessing(params: ExecuteReviewParams): Prom
 
     correlatedLogger.info({ pullRequestNumber, successCount, failCount, totalReviews: assignments.length }, 'Review processing completed');
     const currentReviewCommentIds = reviewResults.flatMap(result => result.commentId === undefined ? [] : [result.commentId]);
-    await handleUltrafixContinuation('review', { job, stateManager, taskId, redisClient, repoOwner, repoName, pullRequestNumber, correlatedLogger, correlationId, currentReviewCommentIds, currentReviewResultCount: reviewResults.length });
+    if (!job.data.executionAdmissionReceipt) await handleUltrafixContinuation('review', { job, stateManager, taskId, redisClient, repoOwner, repoName, pullRequestNumber, correlatedLogger, correlationId, currentReviewCommentIds, currentReviewResultCount: reviewResults.length });
 
     return { status: 'complete', pullRequestNumber, reviewsPosted: successCount, reviewsFailed: failCount,
         // The identity the barrier claimed for this completion, so the finalizer can verify the

@@ -1,3 +1,5 @@
+import { requireAdmissionNotCancelled, cancelledExecutionAdmissionKey } from './executionAdmissionCancellation.js';
+import { parseSourceBinding, parseSourceStep, requireExactSource, requireExactSourceStep, type SourceAdmissionBinding, type SourceAdmissionStep } from './admissionBindings.js';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { Redis } from 'ioredis';
 import { requireStoryExecutionContract, type StoryExecutionContract } from './storyExecutionContract.js';
@@ -12,6 +14,8 @@ import { admissionTokenDigest, requireEzerAdmissionClaim, type AdmissionClaimCli
 import { admissionUnitId, requireAdmissionUnitId, requireUnitWithinAdmission } from './admissionUnit.js';
 
 export { requireTypedArtifactCorrection, requireTypedInvestigation };
+export { parseSourceBinding, requireExactSource };
+export type { SourceAdmissionBinding, SourceAdmissionStep };
 export type { CommentAdmissionBinding, ExecutionRouteBinding, StopAdmissionBinding, TypedArtifactCorrection, TypedInvestigationAdmission };
 export type { ExecutionDelegation, ExecutionDelegationScope } from './executionDelegation.js';
 export { admissionUnitId } from './admissionUnit.js';
@@ -27,6 +31,7 @@ const REPOSITORY_LIST_SEPARATOR = ',';
 // Stop authorization must outlive the execution lease; this never extends worker authority.
 const CONSUMED_ADMISSION_RETENTION_SECONDS = 24 * 60 * 60;
 const REDIS_CONSUME_AND_ISSUE_SCRIPT = `
+if redis.call('EXISTS', KEYS[3]) == 1 then return 0 end
 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
 redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
 redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
@@ -41,6 +46,8 @@ export interface ExecutionAdmissionClaims {
     artifactCorrection?: TypedArtifactCorrection;
     typedWork?: TypedInvestigationAdmission;
     comment?: CommentAdmissionBinding;
+    source?: SourceAdmissionBinding;
+    step?: SourceAdmissionStep;
     version: 1 | 2;
     /** Required positive per-unit generation under v2; ignored under v1. */
     generation?: number;
@@ -75,6 +82,8 @@ export interface WorkerAdmissionReceipt {
     /** Exact signed story identity. Older persisted receipts may omit it and fail closed at publication. */
     storyId?: string;
     receiptKey: string;
+    source?: SourceAdmissionBinding;
+    step?: SourceAdmissionStep;
 }
 
 export function pendingExecutionAdmissionKey(repository: string, issueNumber: number): string {
@@ -98,7 +107,7 @@ export function requiresEzerExecutionAdmission(input: {
 export function createRedisAdmissionStore(redis: Redis): AdmissionStore {
     return {
         async consumeAndIssue(consumedKey, receiptKey, value, ttlSeconds) {
-            const result = await redis.eval(REDIS_CONSUME_AND_ISSUE_SCRIPT, 2, consumedKey, receiptKey, value, String(ttlSeconds), String(ttlSeconds + CONSUMED_ADMISSION_RETENTION_SECONDS));
+            const result = await redis.eval(REDIS_CONSUME_AND_ISSUE_SCRIPT, 3, consumedKey, receiptKey, cancelledExecutionAdmissionKey(consumedKey.slice(CONSUMED_KEY_PREFIX.length)), value, String(ttlSeconds), String(ttlSeconds + CONSUMED_ADMISSION_RETENTION_SECONDS));
             return result === 1;
         },
         async get(key) {
@@ -150,6 +159,8 @@ export async function readAdmittedExecutionBinding(
 interface ExpectedExecution {
     control?: StopAdmissionBinding;
     comment?: CommentAdmissionBinding;
+    source?: SourceAdmissionBinding;
+    step?: SourceAdmissionStep;
     repository: string;
     issueNumber: number;
 }
@@ -164,6 +175,8 @@ function parseClaims(encodedPayload: string): ExecutionAdmissionClaims {
     if (!value || typeof value !== 'object' || Array.isArray(value)) refuse('malformed-admission');
     const candidate = value as Record<string, unknown>;
     if (candidate.version !== 1 && candidate.version !== 2) refuse('unsupported-version');
+    if (candidate.source !== undefined && candidate.comment !== undefined) refuse('source-authority-mismatch');
+    if (candidate.step !== undefined && (candidate.source === undefined || parseSourceBinding(candidate.source).mode !== 'fix')) refuse('source-step-authority-mismatch');
     const scope = candidate.scope;
     if (!Array.isArray(scope) || scope.length === 0 || scope.some(item => typeof item !== 'string' || item.trim() === '')) {
         refuse('ambiguous-scope');
@@ -177,6 +190,8 @@ function parseClaims(encodedPayload: string): ExecutionAdmissionClaims {
         ...(candidate.artifactCorrection === undefined ? {} : { artifactCorrection: requireTypedArtifactCorrection(candidate.artifactCorrection) }),
         ...(candidate.typedWork === undefined ? {} : { typedWork: requireTypedInvestigation(candidate.typedWork) }),
         ...(candidate.comment === undefined ? {} : { comment: parseCommentBinding(candidate.comment) }),
+        ...(candidate.source === undefined ? {} : { source: parseSourceBinding(candidate.source) }),
+        ...(candidate.step === undefined ? {} : { step: parseSourceStep(candidate.step) }),
         version: candidate.version,
         ...(candidate.version === 2 ? { generation: requirePositiveOrdinal(candidate.generation, 'invalid-unit-generation') } : {}),
         admissionId: requiredString(candidate.admissionId, 'missing-admission-id'),
@@ -211,25 +226,27 @@ function verifySignature(encodedPayload: string, presentedSignature: string, sig
 }
 
 function validateClaims(claims: ExecutionAdmissionClaims, expected: ExpectedExecution, nowMs: number): number {
-    if (claims.storyExecution && (claims.control || claims.comment || claims.typedWork || claims.artifactCorrection ||
+    if (claims.storyExecution && (claims.control || claims.comment || claims.source || claims.typedWork || claims.artifactCorrection ||
         claims.target !== claims.storyExecution.targetBranch || JSON.stringify(claims.scope) !== JSON.stringify(claims.storyExecution.allowedPaths)))
         refuse('story-execution-authority-mismatch');
     if(JSON.stringify(claims.control)!==JSON.stringify(expected.control===undefined?undefined:parseStopBinding(expected.control)))refuse('wrong-stop-control');
-    if(claims.route&&(claims.control||claims.comment||claims.artifactCorrection))refuse('route-authority-mismatch');
+    if(claims.route&&(claims.control||claims.comment||claims.source||claims.artifactCorrection))refuse('route-authority-mismatch');
     if(claims.route&&claims.attemptOrdinal!==undefined&&claims.route.attemptOrdinal!==claims.attemptOrdinal)refuse('route-attempt-mismatch');
     if(claims.route&&claims.typedWork&&(claims.typedWork.provider!==claims.route.provider||claims.typedWork.model!==claims.route.model))refuse('route-typed-mismatch');
-    if(claims.control && (claims.typedWork || claims.comment || claims.artifactCorrection))refuse('stop-authority-mismatch');
+    if(claims.control && (claims.typedWork || claims.comment || claims.source || claims.artifactCorrection))refuse('stop-authority-mismatch');
     requireUnitWithinAdmission(claims);
-    if (claims.typedWork && (claims.comment || claims.storyId !== `typed-work:${claims.typedWork.itemId}` ||
+    if (claims.typedWork && (claims.comment || claims.source || claims.storyId !== `typed-work:${claims.typedWork.itemId}` ||
         claims.scope.length !== 1 || claims.scope[0] !== claims.typedWork.outputPath || Date.parse(claims.expiresAt) > Date.parse(claims.typedWork.deadline))) refuse('typed-authority-mismatch');
     if (claims.repository !== expected.repository) refuse('wrong-repository');
     if (claims.issueNumber !== expected.issueNumber) refuse('wrong-issue');
-    if (claims.artifactCorrection && (claims.typedWork || !claims.comment ||
+    if (claims.artifactCorrection && (claims.typedWork || (claims.source && claims.source.mode !== 'fix') || (!claims.comment && !claims.source) ||
         claims.storyId !== `typed-output:${claims.artifactCorrection.itemId}` ||
         claims.scope.length !== 1 || claims.scope[0] !== claims.artifactCorrection.outputPath ||
-        claims.comment.headSha !== claims.artifactCorrection.priorRevision ||
+        (claims.source ?? claims.comment)?.headSha !== claims.artifactCorrection.priorRevision ||
         claims.expiresAt !== claims.artifactCorrection.deadline)) refuse('typed-correction-authority-mismatch');
     requireExactComment(claims.comment, expected.comment);
+    requireExactSource(claims.source, expected.source);
+    requireExactSourceStep(claims.step, expected.step);
     const issuedAtMs = Date.parse(claims.issuedAt);
     const expiresAtMs = Date.parse(claims.expiresAt);
     if (!Number.isFinite(issuedAtMs) || !Number.isFinite(expiresAtMs) || expiresAtMs <= issuedAtMs) refuse('invalid-expiry');
@@ -262,6 +279,7 @@ export async function consumeExecutionAdmission(input: {
 }): Promise<{ claims: ExecutionAdmissionClaims; receipt: WorkerAdmissionReceipt }> {
     const claims = readSignedExecutionAdmission(input);
     validateClaims(claims, input.expected, input.nowMs ?? Date.now());
+    await requireAdmissionNotCancelled(input.store, claims.admissionId);
     await input.preConsumePolicy?.(claims);
     // V1 never resolves callback configuration or invokes a claim client.
     const v2Claim = claims.version === 2 ? await requireEzerAdmissionClaim({
@@ -272,6 +290,7 @@ export async function consumeExecutionAdmission(input: {
         tokenDigest: admissionTokenDigest(input.token),
     }, input.claimClient) : undefined;
     const ttlSeconds = validateClaims(claims, input.expected, input.nowMs ?? Date.now());
+    await requireAdmissionNotCancelled(input.store, claims.admissionId);
     const consumedKey = `${CONSUMED_KEY_PREFIX}${claims.admissionId}`;
     const receiptKey = `${RECEIPT_KEY_PREFIX}${claims.admissionId}`;
     const receiptValue = JSON.stringify({
@@ -292,10 +311,12 @@ export async function consumeExecutionAdmission(input: {
         ...(claims.artifactCorrection === undefined ? {} : { artifactCorrection: claims.artifactCorrection }),
         ...(claims.typedWork === undefined ? {} : { typedWork: claims.typedWork }),
         ...(claims.comment === undefined ? {} : { comment: claims.comment }),
+        ...(claims.source === undefined ? {} : { source: claims.source }),
+        ...(claims.step === undefined ? {} : { step: claims.step }),
         ...(claims.startBy === undefined ? {} : { startBy: claims.startBy }),
     });
     if (!await input.store.consumeAndIssue(consumedKey, receiptKey, receiptValue, ttlSeconds)) refuse('replayed-admission');
-    return { claims, receipt: { ...(v2Claim === undefined ? {} : { version: 2 as const }), ...(claims.delegatedAuthority ? { delegatedAuthority: claims.delegatedAuthority } : {}), ...(claims.route ? {route:claims.route} : {}), admissionId: claims.admissionId, operationId: claims.operationId, storyId: claims.storyId, receiptKey } };
+    return { claims, receipt: { ...(claims.source ? { source: claims.source } : {}), ...(claims.step ? { step: claims.step } : {}), ...(v2Claim === undefined ? {} : { version: 2 as const }), ...(claims.delegatedAuthority ? { delegatedAuthority: claims.delegatedAuthority } : {}), ...(claims.route ? {route:claims.route} : {}), admissionId: claims.admissionId, operationId: claims.operationId, storyId: claims.storyId, receiptKey } };
 }
 
 interface WorkerReceiptVerification {
@@ -314,12 +335,15 @@ interface WorkerReceiptVerification {
 export async function inspectWorkerAdmissionReceipt(input: WorkerReceiptVerification & {
     store: Pick<AdmissionStore, 'get'>;
 }): Promise<TypedInvestigationAdmission | undefined> {
+    await requireAdmissionNotCancelled(input.store, input.receipt.admissionId);
     return validateWorkerAdmissionReceipt(await input.store.get(input.receipt.receiptKey), input);
 }
 
 export async function verifyWorkerAdmissionReceipt(input: WorkerReceiptVerification & {
     store: Pick<AdmissionStore, 'take'> & Partial<Pick<AdmissionStore, 'get'>>;
 }): Promise<TypedInvestigationAdmission | undefined> {
+    if (input.store.get) await requireAdmissionNotCancelled({ get: input.store.get.bind(input.store) }, input.receipt.admissionId);
+    else if (input.receipt.source) refuse('source-receipt-store-required');
     if (input.receipt.version === 2) {
         // Read/check first: an unavailable Ezer must leave the receipt retryable.
         if (!input.store.get) refuse('v2-receipt-store-required');
@@ -329,6 +353,7 @@ export async function verifyWorkerAdmissionReceipt(input: WorkerReceiptVerificat
         const { v2Claim } = JSON.parse(stored!) as { v2Claim: StoredAdmissionClaim };
         await requireEzerAdmissionClaim({ ...v2Claim.identity, version: 2, action: 'check',
             admissionToken: v2Claim.admissionToken, claimId: v2Claim.claimId }, input.claimClient);
+        await requireAdmissionNotCancelled({ get: input.store.get.bind(input.store) }, input.receipt.admissionId);
         const taken = await input.store.take(input.receipt.receiptKey);
         if (taken !== stored) refuse('missing-or-changed-worker-receipt');
         return validateWorkerAdmissionReceipt(taken, input);
@@ -356,6 +381,11 @@ function validateWorkerAdmissionReceipt(stored: string | null, input: WorkerRece
     if (value.issueNumber !== input.expected.issueNumber) refuse('wrong-issue');
     if (value.target !== input.expected.target) refuse('wrong-target');
     requireExactComment(value.comment as CommentAdmissionBinding | undefined, input.expected.comment);
+    requireExactSource(value.source as SourceAdmissionBinding | undefined, input.expected.source);
+    requireExactSource(value.source as SourceAdmissionBinding | undefined, input.receipt.source);
+    requireExactSourceStep(value.step as SourceAdmissionStep | undefined, input.expected.step);
+    requireExactSourceStep(value.step as SourceAdmissionStep | undefined, input.receipt.step);
+    if (value.source && value.comment) refuse('source-authority-mismatch');
     if(value.route!==undefined){
       const route=requireExecutionRoute(value.route),actual=input.expectedRoute;
       if(!actual||actual.agentId!==route.agentId||actual.agentAlias!==route.agentAlias||actual.provider!==route.provider||actual.model!==route.model)refuse('selected-route-mismatch');
@@ -364,7 +394,7 @@ function validateWorkerAdmissionReceipt(stored: string | null, input: WorkerRece
     const typed = value.typedWork === undefined ? undefined : requireTypedInvestigation(value.typedWork);
     if (value.storyExecution !== undefined) {
         const execution = requireStoryExecutionContract(value.storyExecution);
-        if (typed || value.comment || value.artifactCorrection || value.integrationDigest ||
+        if (typed || value.comment || value.source || value.artifactCorrection || value.integrationDigest ||
             typeof value.storyId !== 'string' || value.storyId.trim() === '' || execution.targetBranch !== value.target)
             refuse('story-execution-authority-mismatch');
         if (typeof value.executionDeadline !== 'string' || !Number.isFinite(Date.parse(value.executionDeadline)))
@@ -379,7 +409,7 @@ function validateWorkerAdmissionReceipt(stored: string | null, input: WorkerRece
     if (typed && Date.parse(typed.deadline) <= Date.now()) refuse('typed-deadline-exceeded');
     if (value.artifactCorrection !== undefined) {
         const correction = requireTypedArtifactCorrection(value.artifactCorrection);
-        if (!input.expected.comment || input.expected.comment.headSha !== correction.priorRevision || Date.parse(correction.deadline) <= Date.now()) refuse('typed-correction-expired-or-head-changed');
+        if (!(input.expected.source ?? input.expected.comment) || (input.expected.source ?? input.expected.comment)?.headSha !== correction.priorRevision || Date.parse(correction.deadline) <= Date.now()) refuse('typed-correction-expired-or-head-changed');
         input.onArtifactCorrection?.(correction);
     }
     return typed;

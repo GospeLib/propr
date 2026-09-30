@@ -1,7 +1,11 @@
+import { isCompletionDurabilityUnverifiable } from './completionDurabilityOutcome.js';
+import { AdmissionCancelledError, requireAdmissionNotCancelled } from '@propr/core';
+import { requireSourcePublication } from './ezerSourceAdmission.js';
+import { settleAdmissionCancellation } from './settleAdmissionCancellation.js';
 import { execFileSync } from 'node:child_process';
 import { verifyAdmittedPRComment } from './ezerCommentAdmission.js';
 import { buildAdmittedWorkerEnvironment } from './ezerAdmittedWorkerEnvironment.js';
-import { Job } from 'bullmq';
+import { Job, DelayedError } from 'bullmq';
 import type { Logger } from 'pino';
 import { findRunningDockerContainerForTask, getAuthenticatedOctokit, hashTaskAttemptToken, inspectLegacyDockerContainerLivenessForTask, logger, retryConfigs, runWithExecutionAbortSignal, withRetry } from '@propr/core';
 import { getStateManager, TaskStates } from '@propr/core';
@@ -97,6 +101,7 @@ interface LockParams {
 }
 
 interface ProcessingState {
+    pushedHead?: string;
     ezerAdmissionVerified?: boolean;
     artifactCorrection?: import('@propr/core').TypedArtifactCorrection;
     octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>> | null;
@@ -154,11 +159,15 @@ async function acquirePRLock(lockParams: LockParams): Promise<boolean> {
     }
 
     correlatedLogger.info({ lockKey }, 'PR is currently being processed by another execution. Rescheduling...');
+    if (job.data.executionAdmissionReceipt) {
+        await job.moveToDelayed(Date.now() + 10000, job.token);
+        throw new DelayedError();
+    }
     await issueQueue.add(job.name, job.data, { delay: 10000 });
     return false;
 }
 
-async function validatePRAndComments(octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>>, context: PRJobContext & { llm: string | null | undefined; admittedComment?: boolean }): Promise<ValidationResult> {
+async function validatePRAndComments(octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>>, context: PRJobContext & { llm: string | null | undefined; admittedComment?: boolean; sourceAdmission?: boolean }): Promise<ValidationResult> {
     const { commentsToProcess, pullRequestNumber, repoOwner, repoName, primaryProcessingLabels, correlatedLogger, llm: initialLlm } = context;
     const prData = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
         owner: repoOwner, repo: repoName, pull_number: pullRequestNumber,
@@ -169,11 +178,11 @@ async function validatePRAndComments(octokit: Awaited<ReturnType<typeof getAuthe
     const allCommentsForValidation = await fetchAllComments(octokit, repoOwner, repoName, pullRequestNumber);
     // Separate issue comments for unprocessed detection (issue comments are first in the array from fetchAllComments)
     const prCommentsForValidation = allCommentsForValidation.filter(c => !('diff_hunk' in c));
-    const validatedComments = await validateAndFilterComments(commentsToProcess, allCommentsForValidation, pullRequestNumber, correlatedLogger);
+    const validatedComments = context.sourceAdmission ? commentsToProcess : await validateAndFilterComments(commentsToProcess, allCommentsForValidation, pullRequestNumber, correlatedLogger);
     if (validatedComments.length === 0) return { skip: true, reason: 'all_comments_deleted' };
     // Check if PR has ANY of the primary processing labels (e.g., 'AI' or 'gitfix')
     if (!prData.data.labels.some(label => primaryProcessingLabels.includes(label.name))) return { skip: true, reason: 'missing_required_label' };
-    const llm = extractModelFromLabels(prData.data.labels, initialLlm, pullRequestNumber, correlatedLogger);
+    const llm = context.sourceAdmission && initialLlm ? initialLlm : extractModelFromLabels(prData.data.labels, initialLlm, pullRequestNumber, correlatedLogger);
     const unprocessedComments = context.admittedComment ? validatedComments : filterUnprocessedComments(validatedComments, prCommentsForValidation, botUsername, { pullRequestNumber, correlatedLogger });
     if (unprocessedComments.length === 0) return { skip: true, reason: 'already_processed' };
     return { skip: false, prData, validatedComments, unprocessedComments, llm, prCommentsForValidation };
@@ -221,7 +230,7 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
     const { pullRequestNumber, jobBranchName, repoOwner, repoName, correlationId, correlatedLogger } = context;
 
     state.octokit = await withRetry(() => getAuthenticatedOctokit(), { ...retryConfigs.githubApi, correlationId }, 'get_authenticated_octokit');
-    const validation = await validatePRAndComments(state.octokit, { ...context, llm, admittedComment: state.ezerAdmissionVerified });
+    const validation = await validatePRAndComments(state.octokit, { ...context, llm, admittedComment: state.ezerAdmissionVerified, sourceAdmission: Boolean(job.data.executionAdmissionSource) });
     if (validation.skip) {
         if (state.ezerAdmissionVerified) throw new Error(`Admitted PR comment cannot execute: ${validation.reason}`);
         correlatedLogger.info({ pullRequestNumber, reason: validation.reason }, 'Skipping PR comment processing');
@@ -282,13 +291,14 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
         return { status: 'skipped', reason: 'no_authorized_review_findings', pullRequestNumber, preExecutionSkip: true };
     }
 
-    await markSelectedUltrafixFindings(
+    if (!job.data.executionAdmissionReceipt) await markSelectedUltrafixFindings(
         job,
         redisClient,
         { owner: repoOwner, repo: repoName, pr: pullRequestNumber },
         selectedReviewComments,
     );
 
+    await requireSourcePublication(job.data, redisClient);
     state.startingWorkComment = await state.octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', {
         owner: repoOwner, repo: repoName, issue_number: pullRequestNumber,
         body: buildStartingWorkCommentBody(state.authorsText, state.unprocessedComments, taskUrl),
@@ -309,12 +319,14 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
     correlatedLogger.info({ worktreePath: state.worktreeInfo.worktreePath, branchName: state.worktreeInfo.branchName }, 'Created worktree from existing PR branch');
     if (state.ezerAdmissionVerified && execFileSync('git', ['rev-parse', 'HEAD'], {
         cwd: state.worktreeInfo.worktreePath, encoding: 'utf8',
-    }).trim() !== job.data.executionAdmissionComment?.headSha) {
+    }).trim() !== (job.data.executionAdmissionSource ?? job.data.executionAdmissionComment)?.headSha) {
         throw new Error('ezer-comment-refused:worktree-head-changed');
     }
 
 
-    const requestBody = isFixMode
+    const requestBody = state.ezerAdmissionVerified && job.data.executionAdmissionStep
+        ? job.data.commandInstructions!
+        : isFixMode
         ? (fixSelection.remainingInstructions || 'Apply only the selected review finding records below.')
         : combinedCommentBody;
     const localizedCombinedCommentBody = await localizeContentImages(requestBody, state.worktreeInfo.worktreePath, correlatedLogger, { bodyHtml: combinedBodyHtml, issueOrPrId: pullRequestNumber });
@@ -378,6 +390,7 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
 
     const correction = state.artifactCorrection;
     if (correction && Date.parse(correction.deadline) <= Date.now()) throw new Error('TYPED_CORRECTION_DEADLINE_EXCEEDED');
+    await requireSourcePublication(job.data, redisClient);
     const { claudeResult, agentType } = await resolveAndExecuteAgent({
         llm, worktreePath: state.worktreeInfo.worktreePath, branchName: state.worktreeInfo.branchName,
         prompt: correction ? `${prompt}\n\nThis is a separately admitted exact owner correction to typed artifact ${correction.itemId}, not a new investigation or implementation. Modify only ${correction.outputPath}. Preserve owner decisions and all other files. The original investigation budget remains consumed. This correction expires at ${correction.deadline}.` : prompt,
@@ -424,7 +437,7 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
         taskUrl,
     );
 
-    await handleUltrafixContinuation('fix', { job, stateManager, taskId, redisClient, repoOwner, repoName, pullRequestNumber, correlatedLogger, correlationId });
+    if (!job.data.executionAdmissionReceipt) await handleUltrafixContinuation('fix', { job, stateManager, taskId, redisClient, repoOwner, repoName, pullRequestNumber, correlatedLogger, correlationId });
 
     return { status: postResult.partial ? 'partial' : 'complete', commit: postResult.commitHash, pullRequestNumber,
         claudeResult: { success: state.claudeResult.success },
@@ -435,11 +448,11 @@ async function executeProcessing(params: ExecuteProcessingParams): Promise<JobRe
 }
 
 export async function processPullRequestCommentJob(job: Job<CommentJobData>): Promise<JobResult> {
-    if (await shouldDeferUltrafixReview(job, redisClient, logger.withCorrelation(job.data.correlationId))) return { status: 'deferred', reason: 'ultrafix_waiting_for_exact_head_checks' };
+    if (!job.data.executionAdmissionReceipt && await shouldDeferUltrafixReview(job, redisClient, logger.withCorrelation(job.data.correlationId))) return { status: 'deferred', reason: 'ultrafix_waiting_for_exact_head_checks' };
     const context = await initializePRJobContext(job);
     const { pullRequestNumber, repoOwner, repoName, correlationId, correlatedLogger, isBatchJob, commentsToProcess, jobBranchName, llm } = context;
     correlatedLogger.info({ pullRequestNumber, branchName: jobBranchName, llm, isBatchJob, commentsCount: commentsToProcess.length }, `Processing PR comment${isBatchJob ? 's batch' : ''} job...`);
-    if (await restorePendingCommentsIfUltrafixJobSuperseded(job, { repoOwner, repoName, pullRequestNumber, redisClient }, context.pickedUpComments, context.originalUltrafixMeta)) return { status: 'cancelled', reason: 'ultrafix_superseded' };
+    if (!job.data.executionAdmissionReceipt && await restorePendingCommentsIfUltrafixJobSuperseded(job, { repoOwner, repoName, pullRequestNumber, redisClient }, context.pickedUpComments, context.originalUltrafixMeta)) return { status: 'cancelled', reason: 'ultrafix_superseded' };
 
     const modelName = await resolvePRCommentModelName(llm, correlatedLogger);
 
@@ -454,6 +467,11 @@ export async function processPullRequestCommentJob(job: Job<CommentJobData>): Pr
     const runningContainer = await findRunningDockerContainerForTask(taskId);
     if (runningContainer || await inspectLegacyDockerContainerLivenessForTask(taskId) !== 'not_found') {
         correlatedLogger.warn({ taskId, containerId: runningContainer?.id, containerName: runningContainer?.name }, 'Agent execution for this task may already be running. Rescheduling without starting another attempt.');
+        if (job.data.executionAdmissionReceipt) {
+            await releasePRProcessingLock(redisClient, lockKey, lockToken);
+            await job.moveToDelayed(Date.now() + 60000, job.token);
+            throw new DelayedError();
+        }
         await issueQueue.add(job.name, job.data, { delay: 60000 });
         await releasePRProcessingLock(redisClient, lockKey, lockToken);
         return { status: 'rescheduled', reason: 'agent_container_already_running' };
@@ -479,12 +497,19 @@ export async function processPullRequestCommentJob(job: Job<CommentJobData>): Pr
     try {
         state.ezerAdmissionVerified = await verifyAdmittedPRComment(job.data, redisClient, binding => { state.artifactCorrection = binding; });
         // Branch early for review mode — read-only analysis, no commits or pushes
-        if (job.data.commandMode === 'review') {
-            return await runWithExecutionAbortSignal(executionController.signal, () => executeReviewProcessing({ job, context, llm, taskId, stateManager, state, redisClient, validatePRAndComments }), hashTaskAttemptToken(lockToken));
+        if (job.data.commandMode === 'review' || job.data.commandMode === 'owner-review') {
+            return await runWithExecutionAbortSignal(executionController.signal, () => executeReviewProcessing({ job, context, llm, taskId, stateManager, state, redisClient, validatePRAndComments: (octokit, context) => validatePRAndComments(octokit, { ...context, admittedComment: state.ezerAdmissionVerified, sourceAdmission: Boolean(job.data.executionAdmissionSource) }) }), hashTaskAttemptToken(lockToken));
         }
         return await runWithExecutionAbortSignal(executionController.signal, () => executeProcessing({ job, context, llm, taskId, stateManager, state, lockKey, lockToken }), hashTaskAttemptToken(lockToken));
-    } catch (error) {
-        await handleJobError(error as Error, job, { pullRequestNumber, repoOwner, repoName, authorsText: state.authorsText, unprocessedComments: state.unprocessedComments, octokit: state.octokit, startingWorkComment: state.startingWorkComment, claudeResult: state.claudeResult, correlationId, correlatedLogger, stateManager, taskId });
+    } catch (caught) {
+        if (isCompletionDurabilityUnverifiable(caught)) throw caught;
+        let error = caught;
+        if (!(error instanceof AdmissionCancelledError) && job.data.executionAdmissionReceipt) {
+            try { await requireAdmissionNotCancelled(redisClient, job.data.executionAdmissionReceipt.admissionId, state.pushedHead); }
+            catch (cancelled) { if (cancelled instanceof AdmissionCancelledError) error = cancelled; else throw cancelled; }
+        }
+        if (error instanceof AdmissionCancelledError) return await settleAdmissionCancellation(error, taskId, stateManager, correlatedLogger);
+        await handleJobError(error as Error, job, { pullRequestNumber, repoOwner, repoName, authorsText: state.authorsText, unprocessedComments: state.unprocessedComments, octokit: job.data.executionAdmissionSource ? null : state.octokit, startingWorkComment: state.startingWorkComment, claudeResult: state.claudeResult, correlationId, correlatedLogger, stateManager, taskId });
         // Don't re-throw for user cancellations (not an error, just cancelled)
         const isUserCancelled = (error as Error).message?.includes('aborted by user');
         if (isUserCancelled) {

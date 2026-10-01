@@ -157,7 +157,13 @@ interface EzerControlRoutesDeps {
   wait?: (ms: number) => Promise<void>;
 }
 
-function fingerprintPayload(payload: unknown): string {
+/**
+ * The idempotency fingerprint of a command payload. Exported because the S04
+ * failure/recovery ledger keys on exactly the same fingerprint: a replayed key
+ * has to mean the same thing on both surfaces or one of them would accept a
+ * conflicting payload the other rejects.
+ */
+export function ezerPayloadFingerprint(payload: unknown): string {
   return createHash('sha256').update(stableStringify(payload)).digest('hex');
 }
 
@@ -223,7 +229,7 @@ function parseControlRequest(
   const binding = parseControlBinding(source);
   if ('error' in binding) return binding;
   const payload = source.payload ?? null;
-  const payloadFingerprint = fingerprintPayload(payload);
+  const payloadFingerprint = ezerPayloadFingerprint(payload);
   const declaredFingerprint = readIdentifier(source, 'payloadFingerprint');
   if (declaredFingerprint && declaredFingerprint !== payloadFingerprint) {
     return { error: 'The supplied "payloadFingerprint" does not match the supplied payload.' };
@@ -256,17 +262,15 @@ function parseControlRequest(
 class EzerControlService {
   private readonly states = new Map<string, OperationControlState>();
   private readonly now: () => number;
-  private readonly wait: (ms: number) => Promise<void>;
   private readonly stopTask: typeof stopTaskExecution;
-  private readonly observeContainerStatus: (containerId: string) => string;
+  private readonly cessation: EzerCessationObserver;
   private detachEnvelopeListener: (() => void) | null = null;
   private listenerStreaming: EzerStreamingService | null = null;
 
   constructor(private readonly deps: EzerControlRoutesDeps) {
     this.now = deps.now ?? Date.now;
-    this.wait = deps.wait ?? ((ms: number) => new Promise<void>(resolve => { setTimeout(resolve, ms); }));
     this.stopTask = deps.stopTaskExecution ?? stopTaskExecution;
-    this.observeContainerStatus = deps.observeContainerStatus ?? getDockerContainerStatus;
+    this.cessation = createEzerCessationObserver(deps);
   }
 
   /**
@@ -643,7 +647,7 @@ class EzerControlService {
         evidence: { ...base, stopped: true, cessation: { jobPresence: stop.notFound ? 'absent' : 'inactive' } },
       });
     }
-    const cessation = await this.observeCessation(taskId, stop.abortSignalled === true, receivedAt);
+    const cessation = await this.cessation.observe(taskId, stop.abortSignalled === true, receivedAt);
     if (cessation.stopped) {
       return this.settle('cancel', receivedAt, {
         status: 'confirmed',
@@ -659,70 +663,6 @@ class EzerControlService {
       recovery: `Inspect task ${taskId} and its container directly; the abort signal and the publication fence both remain in place.`,
       evidence: { ...base, stopped: false, cessation },
     });
-  }
-
-  /**
-   * Observes the real cancellation markers rather than trusting the stop call:
-   * the worker state must have left its active states, any recorded container
-   * must no longer be up, and an abort marker set by this stop must have been
-   * consumed by the worker. An unreadable container is never read as stopped.
-   */
-  private async observeCessation(
-    taskId: string,
-    requireMarkerCleared: boolean,
-    receivedAt: number,
-  ): Promise<Record<string, unknown> & { stopped: boolean; reason?: string }> {
-    let last: Record<string, unknown> & { stopped: boolean; reason?: string } = {
-      stopped: false, reason: 'No cessation observation completed.',
-    };
-    for (;;) {
-      last = await this.observeCessationOnce(taskId, requireMarkerCleared);
-      if (last.stopped) return { ...last, observedAfterMs: this.now() - receivedAt };
-      if (this.now() - receivedAt >= CESSATION_CONFIRM_TARGET_MS) {
-        return { ...last, observedAfterMs: this.now() - receivedAt, deadlineMs: CESSATION_CONFIRM_TARGET_MS };
-      }
-      await this.wait(CESSATION_POLL_INTERVAL_MS);
-    }
-  }
-
-  private async observeCessationOnce(
-    taskId: string,
-    requireMarkerCleared: boolean,
-  ): Promise<Record<string, unknown> & { stopped: boolean; reason?: string }> {
-    const [stateData, marker] = await Promise.all([
-      this.deps.redisClient.get(`worker:state:${taskId}`),
-      this.deps.redisClient.get(`worker:abort:${taskId}`),
-    ]);
-    const workerState = readWorkerState(stateData);
-    const workerActive = workerState.currentState !== null && ACTIVE_WORKER_STATES.has(workerState.currentState);
-    const container = this.observeContainer(workerState.containerId);
-    const markerCleared = marker === null;
-    const blockers: string[] = [];
-    if (workerActive) blockers.push(`the worker is still in state "${workerState.currentState}"`);
-    if (container.status === 'running') blockers.push(`container ${workerState.containerId} is still up`);
-    if (container.status === 'unobservable') blockers.push(`container ${workerState.containerId} could not be inspected`);
-    if (requireMarkerCleared && !markerCleared) blockers.push('the worker has not yet consumed the abort marker');
-    const evidence = {
-      workerState: workerState.currentState,
-      containerId: workerState.containerId,
-      containerEvidence: container.status,
-      containerStatus: container.detail,
-      abortMarkerCleared: markerCleared,
-      abortMarkerRequired: requireMarkerCleared,
-    };
-    if (blockers.length === 0) return { ...evidence, stopped: true };
-    return { ...evidence, stopped: false, reason: `Cessation is not confirmed because ${blockers.join(', and ')}.` };
-  }
-
-  private observeContainer(containerId: string | null): { status: string; detail: string | null } {
-    if (!containerId) return { status: 'not-applicable', detail: null };
-    try {
-      const detail = this.observeContainerStatus(containerId);
-      if (!detail) return { status: 'absent', detail: null };
-      return { status: /\bUp\b/.test(detail) ? 'running' : 'exited', detail };
-    } catch (error) {
-      return { status: 'unobservable', detail: (error as Error).message };
-    }
   }
 
   /**
@@ -902,21 +842,124 @@ function summarizeRevisions(revisions: SteeringRevision[]): Record<string, unkno
   }));
 }
 
-function readWorkerState(stateData: string | null): { currentState: string | null; containerId: string | null } {
-  if (!stateData) return { currentState: null, containerId: null };
+/** What was actually observed about an attempt's cessation, or why it is unconfirmed. */
+export interface EzerCessationEvidence extends Record<string, unknown> {
+  /** True only when every applicable cessation signal was positively observed. */
+  stopped: boolean;
+  /** Present only when `stopped` is false: which signal is still outstanding. */
+  reason?: string;
+}
+
+export interface EzerCessationObserverDeps {
+  redisClient: Pick<RedisClientType, 'get'>;
+  /** Container observation seam; defaults to the real `docker ps` lookup. */
+  observeContainerStatus?: (containerId: string) => string;
+  now?: () => number;
+  wait?: (ms: number) => Promise<void>;
+}
+
+export interface EzerCessationObserver {
+  /**
+   * Poll the real cessation markers until they agree that the attempt stopped
+   * or the 10s design target expires, then report exactly what was observed.
+   */
+  observe(taskId: string, requireMarkerCleared: boolean, startedAt: number): Promise<EzerCessationEvidence>;
+}
+
+/**
+ * Observes the real cancellation markers rather than trusting the stop call:
+ * the worker state must have left its active states, any recorded container
+ * must no longer be up, and an abort marker set by this stop must have been
+ * consumed by the worker. An unreadable container is never read as stopped.
+ *
+ * Shared with S04, whose timeout path has to prove the same cessation from the
+ * same evidence — a second implementation would be a second, divergent answer
+ * to "did it actually stop".
+ */
+export function createEzerCessationObserver(deps: EzerCessationObserverDeps): EzerCessationObserver {
+  const now = deps.now ?? Date.now;
+  const wait = deps.wait ?? ((ms: number) => new Promise<void>(resolve => { setTimeout(resolve, ms); }));
+  const observeContainerStatus = deps.observeContainerStatus ?? getDockerContainerStatus;
+
+  function observeContainer(containerId: string | null): { status: string; detail: string | null } {
+    if (!containerId) return { status: 'not-applicable', detail: null };
+    try {
+      const detail = observeContainerStatus(containerId);
+      if (!detail) return { status: 'absent', detail: null };
+      return { status: /\bUp\b/.test(detail) ? 'running' : 'exited', detail };
+    } catch (error) {
+      return { status: 'unobservable', detail: (error as Error).message };
+    }
+  }
+
+  async function observeOnce(taskId: string, requireMarkerCleared: boolean): Promise<EzerCessationEvidence> {
+    const [stateData, marker] = await Promise.all([
+      deps.redisClient.get(`worker:state:${taskId}`),
+      deps.redisClient.get(`worker:abort:${taskId}`),
+    ]);
+    const workerState = readWorkerState(stateData);
+    const workerActive = workerState.currentState !== null && ACTIVE_WORKER_STATES.has(workerState.currentState);
+    const container = observeContainer(workerState.containerId);
+    const markerCleared = marker === null;
+    const blockers: string[] = [];
+    if (workerActive) blockers.push(`the worker is still in state "${workerState.currentState}"`);
+    if (container.status === 'running') blockers.push(`container ${workerState.containerId} is still up`);
+    if (container.status === 'unobservable') blockers.push(`container ${workerState.containerId} could not be inspected`);
+    if (requireMarkerCleared && !markerCleared) blockers.push('the worker has not yet consumed the abort marker');
+    const evidence = {
+      workerState: workerState.currentState,
+      containerId: workerState.containerId,
+      containerEvidence: container.status,
+      containerStatus: container.detail,
+      abortMarkerCleared: markerCleared,
+      abortMarkerRequired: requireMarkerCleared,
+      // The executor's own child/container cessation report, when the worker
+      // has already written one. It is evidence, not a substitute for the
+      // observation above: an absent report never means "stopped".
+      ...(workerState.executionTerminal === null ? {} : { executionTerminal: workerState.executionTerminal }),
+    };
+    if (blockers.length === 0) return { ...evidence, stopped: true };
+    return { ...evidence, stopped: false, reason: `Cessation is not confirmed because ${blockers.join(', and ')}.` };
+  }
+
+  return {
+    async observe(taskId, requireMarkerCleared, startedAt) {
+      for (;;) {
+        const observed = await observeOnce(taskId, requireMarkerCleared);
+        if (observed.stopped) return { ...observed, observedAfterMs: now() - startedAt };
+        if (now() - startedAt >= CESSATION_CONFIRM_TARGET_MS) {
+          return { ...observed, observedAfterMs: now() - startedAt, deadlineMs: CESSATION_CONFIRM_TARGET_MS };
+        }
+        await wait(CESSATION_POLL_INTERVAL_MS);
+      }
+    },
+  };
+}
+
+interface ObservedWorkerState {
+  currentState: string | null;
+  containerId: string | null;
+  /** The executor-authored terminal/cessation evidence, when one was written. */
+  executionTerminal: Record<string, unknown> | null;
+}
+
+function readWorkerState(stateData: string | null): ObservedWorkerState {
+  if (!stateData) return { currentState: null, containerId: null, executionTerminal: null };
   try {
     const parsed = JSON.parse(stateData) as {
-      history?: Array<{ state?: string; metadata?: { containerId?: string } }>;
+      history?: Array<{ state?: string; metadata?: { containerId?: string; terminal?: Record<string, unknown> } }>;
     };
     const history = Array.isArray(parsed.history) ? parsed.history : [];
     const containerEntry = history.find(entry => entry.state === 'claude_execution' && entry.metadata?.containerId);
+    const terminalEntry = history.find(entry => entry.metadata?.terminal !== undefined);
     return {
       currentState: history[history.length - 1]?.state ?? null,
       containerId: containerEntry?.metadata?.containerId ?? null,
+      executionTerminal: terminalEntry?.metadata?.terminal ?? null,
     };
   } catch {
     // A corrupt state record must not be read as "stopped"; treat it as unknown.
-    return { currentState: null, containerId: null };
+    return { currentState: null, containerId: null, executionTerminal: null };
   }
 }
 

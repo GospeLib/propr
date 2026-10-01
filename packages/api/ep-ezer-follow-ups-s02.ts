@@ -228,6 +228,13 @@ interface OperationState {
   lastCursor: string | null;
   lastEnvelope: EzerEventEnvelope | null;
   lastActivityAt: number;
+  /**
+   * When the current silence began: the last time a real journal event was
+   * projected. Unlike `lastActivityAt` it is NOT reset by a heartbeat or by a
+   * locally authored control event, so it measures cumulative provider silence
+   * rather than the gap between two liveness pings.
+   */
+  silentSinceAt: number;
   heartbeatSeq: number;
   heartbeatTimer: unknown;
   executions: Map<string, ExecutionState>;
@@ -259,6 +266,7 @@ export class EzerStreamingService {
   private readonly onDrop: ((drop: EzerDropRecord) => void) | null;
   private journal: EzerJournalReader | null;
   private readonly envelopeListeners = new Set<(envelope: EzerEventEnvelope) => void>();
+  private readonly heartbeatListeners = new Set<(envelope: EzerEventEnvelope, silentForMs: number) => void>();
   private closed = false;
   private readonly metrics: EzerStreamingMetrics = { delivered: 0, dropped: 0, maxProjectionDelayMs: 0 };
 
@@ -287,6 +295,7 @@ export class EzerStreamingService {
     if (input.ownerUserId) operation.ownerUserId = input.ownerUserId;
     operation.pending = true;
     operation.lastActivityAt = this.now();
+    operation.silentSinceAt = this.now();
     this.armHeartbeat(operation);
   }
 
@@ -338,6 +347,17 @@ export class EzerStreamingService {
   onEnvelope(listener: (envelope: EzerEventEnvelope) => void): () => void {
     this.envelopeListeners.add(listener);
     return () => { this.envelopeListeners.delete(listener); };
+  }
+
+  /**
+   * Observe each synthesized heartbeat together with the cumulative silence it
+   * reports. A heartbeat says only "still pending"; S04 uses this to escalate a
+   * silence that outlasts its bounded budget into a structured, actionable
+   * error, so long silence is diagnosable rather than merely visible.
+   */
+  onHeartbeat(listener: (envelope: EzerEventEnvelope, silentForMs: number) => void): () => void {
+    this.heartbeatListeners.add(listener);
+    return () => { this.heartbeatListeners.delete(listener); };
   }
 
   /**
@@ -437,6 +457,9 @@ export class EzerStreamingService {
     operation.lastCursor = envelope.cursor;
     operation.lastEnvelope = envelope;
     operation.lastActivityAt = this.now();
+    // Only a real journal event ends a silence; an ack or a heartbeat must not
+    // be able to mask a provider that has stopped producing observable work.
+    operation.silentSinceAt = this.now();
     this.armHeartbeat(operation);
     for (const subscriber of operation.subscribers.values()) this.deliver(subscriber, envelope);
     this.notifyEnvelopeListeners(envelope);
@@ -522,6 +545,7 @@ export class EzerStreamingService {
   close(): void {
     this.closed = true;
     this.envelopeListeners.clear();
+    this.heartbeatListeners.clear();
     for (const operation of this.operations.values()) {
       if (operation.heartbeatTimer !== null) this.cancelTimer(operation.heartbeatTimer);
       operation.heartbeatTimer = null;
@@ -564,7 +588,7 @@ export class EzerStreamingService {
       operation = {
         operationId, requestId: null, sessionId: null, ownerUserId: null,
         pending: false, lastCursor: null, lastEnvelope: null, lastActivityAt: this.now(),
-        heartbeatSeq: 0, heartbeatTimer: null,
+        silentSinceAt: this.now(), heartbeatSeq: 0, heartbeatTimer: null,
         executions: new Map(), fencedAttempts: new Set(), subscribers: new Map(),
       };
       this.operations.set(operationId, operation);
@@ -584,7 +608,7 @@ export class EzerStreamingService {
 
   private fireHeartbeat(operation: OperationState): void {
     if (this.closed || !operation.pending) return;
-    const elapsedMs = this.now() - operation.lastActivityAt;
+    const silentForMs = this.now() - operation.silentSinceAt;
     operation.heartbeatSeq += 1;
     const last = operation.lastEnvelope;
     // A heartbeat is a projection-level liveness signal, not a journal event:
@@ -598,7 +622,7 @@ export class EzerStreamingService {
       attemptId: last?.attemptId ?? UNASSIGNED,
       cursor: operation.lastCursor ?? '0',
       ts: this.iso(),
-      summary: `No progress observed for ${elapsedMs}ms; the operation is still pending.`,
+      summary: `No progress observed for ${silentForMs}ms; the operation is still pending.`,
       diagnosticId: `hb-${operation.operationId}-${operation.heartbeatSeq}`,
     };
     for (const subscriber of operation.subscribers.values()) {
@@ -606,6 +630,13 @@ export class EzerStreamingService {
     }
     operation.lastActivityAt = this.now();
     this.armHeartbeat(operation);
+    for (const listener of this.heartbeatListeners) {
+      try {
+        listener(heartbeat, silentForMs);
+      } catch (error) {
+        console.error('[EzerStreaming] Heartbeat listener failed for %s:', operation.operationId, error);
+      }
+    }
   }
 
   private deliver(subscriber: SubscriberState, envelope: EzerEventEnvelope): void {

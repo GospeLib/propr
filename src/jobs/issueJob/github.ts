@@ -96,7 +96,10 @@ export async function fetchIssueComments(
       return !filterResult.shouldFilter;
     });
   } catch (commentError) {
-    correlatedLogger.warn({ issueNumber: issueRef.number, error: (commentError as Error).message }, 'Failed to fetch issue comments, continuing without them');
-    return [];
+    // FAIL CLOSED. An issue's comments are part of its instructions: Ezer posts a story's governing
+    // artifacts as comments when they exceed GitHub's body limit, and owner corrections arrive the
+    // same way. Running on the body alone would execute partial instructions as if complete.
+    correlatedLogger.error({ issueNumber: issueRef.number, error: (commentError as Error).message }, 'Failed to fetch issue comments; refusing to run on partial instructions');
+    throw new Error(`ISSUE_COMMENTS_UNREADABLE: ${(commentError as Error).message}`, { cause: commentError });
   }
 }

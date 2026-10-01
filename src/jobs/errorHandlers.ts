@@ -335,8 +335,14 @@ async function postErrorComment(issueRef: IssueJobData, error: Error, options: P
         const sanitizedStack = error.stack ? sanitizeErrorMessage(error.stack) : sanitizedMessage;
         const errorMessage = `❌ **Failed to process this issue**\n\n**Error Category:** ${errorCategory.replace('_', ' ')}\n**Error Message:** ${sanitizedMessage}\n\n${categoryHints[errorCategory] || ''}**Processing Stage:** ${claudeResult ? 'Post-processing (after AI analysis)' : 'Pre-processing (before AI analysis)'}\n${worktreeInfo ? `**Branch:** ${worktreeInfo.branchName}\n` : ''}\n<details><summary>Technical Details</summary>\n\n\`\`\`\n${sanitizedStack}\n\`\`\`\n</details>\n\n---\n*The system will automatically retry this task. If the issue persists, please contact support.*`;
         await octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', { owner: issueRef.repoOwner, repo: issueRef.repoName, issue_number: issueRef.number, body: errorMessage });
-        await safeRemoveLabel({ octokit, owner: issueRef.repoOwner, repo: issueRef.repoName, issueNumber: issueRef.number, logger: correlatedLogger }, AI_PROCESSING_TAG);
     } catch (commentError) {
         correlatedLogger.error({ error: (commentError as Error).message, issueNumber: issueRef.number }, 'Failed to post error comment to GitHub issue');
+    }
+    // The processing label comes off whether or not the notice could be posted: a failed task that
+    // still reads as processing misleads the owner and every reconciler.
+    try {
+        await safeRemoveLabel({ octokit, owner: issueRef.repoOwner, repo: issueRef.repoName, issueNumber: issueRef.number, logger: correlatedLogger }, AI_PROCESSING_TAG);
+    } catch (labelError) {
+        correlatedLogger.error({ error: (labelError as Error).message, issueNumber: issueRef.number }, 'Failed to remove the processing label after a failure');
     }
 }

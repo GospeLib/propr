@@ -24,6 +24,9 @@ export async function executeWorktreeOperations(params: ExecuteWorktreeParams): 
     // A signed recovery checkpoint resumes only work ProPR recorded for this very issue's task.
     await requireIssueRecordedCheckpoint(stateManager, issueRef, execution);
   }
+  // Read before any side effect: an issue whose comments cannot be read is refused before a
+  // worktree, a start notice or a pushed branch exists that a retry would then trip over.
+  const issueComments = await fetchIssueComments(octokit, issueRef, correlatedLogger);
   const worktreeInfo = await createWorktreeForIssue(localRepoPath, { issueId: issueRef.number, issueTitle: currentIssueData.data.title, owner: issueRef.repoOwner, repoName: issueRef.repoName }, { baseBranch: issueRef.baseBranch || null, octokit, modelName, execution });
   if (execution) {
     for (const artifact of execution.taskAssignment?.artifacts ?? []) {
@@ -55,7 +58,6 @@ export async function executeWorktreeOperations(params: ExecuteWorktreeParams): 
   await pushBranch(worktreeInfo.worktreePath, worktreeInfo.branchName, { repoUrl, authToken: githubToken.token, execution });
   await job.updateProgress(80);
 
-  const issueComments = await fetchIssueComments(octokit, issueRef, correlatedLogger);
   const claudeResult = await executeAgentAndRecordMetrics({ octokit, worktreeInfo, issueRef, githubToken, currentIssueData, issueComments }, context);
 
   // Check for cancellation after agent execution and before post-processing

@@ -19,7 +19,7 @@ import { buildAgentOutcome } from './executionOutcome.js';
 import { AI_COMMIT_AUTHOR } from './commitAuthor.js';
 import { agentResultToClaudeResponse, toClaudeResult } from './prCommentJobUtils.js';
 import {
-    buildConflictResolutionPrompt,
+    buildConflictResolutionPrompt, isWithinMergeScope,
     getAgentFailureDetail,
     buildMergeConflictComment,
     buildMergeConflictCommitMessage,
@@ -140,7 +140,10 @@ export async function handleMergeWithAgent(options: {
         repoOwner, repoName, githubToken, octokit, startingCommentId,
         stateManager, taskId, operationId, correlationId, correlatedLogger, redisClient } = options;
 
-    const prompt = buildConflictResolutionPrompt({
+    const maintenance = options.executionAdmissionReceipt?.maintenance;
+    const deadline = options.executionAdmissionReceipt?.executionDeadline;
+    const scope = options.executionAdmissionReceipt?.scope;
+    const prompt = (maintenance ? `Resolve conflicts only within these admitted paths: ${JSON.stringify(scope)}. Do not push, merge the PR, enable auto-merge, or run ultrafix.\n\n` : '') + buildConflictResolutionPrompt({
         pullRequestNumber, baseBranch, headBranch: branchName, conflictedFiles, worktreeInfo, repoOwner, repoName,
     });
     const registry = AgentRegistry.getInstance();
@@ -158,6 +161,7 @@ export async function handleMergeWithAgent(options: {
     const agentResult = await agent.executeTask({
         environment: buildAdmittedWorkerEnvironment({ repoOwner, repoName, number: pullRequestNumber,
             baseBranch, executionAdmissionReceipt: options.executionAdmissionReceipt }, taskId, Boolean(options.executionAdmissionReceipt)),
+        ...(deadline ? { timeoutMs: Math.max(1, Date.parse(deadline) - Date.now()) } : {}),
         worktreePath: worktreeInfo.worktreePath,
         issueRef: { number: pullRequestNumber, repoOwner, repoName },
         prompt,
@@ -188,6 +192,15 @@ export async function handleMergeWithAgent(options: {
     }
 
     await verifyNoConflictMarkers(worktreeInfo, pullRequestNumber, correlatedLogger);
+    if (maintenance) {
+        const { execFileSync } = await import('node:child_process');
+        const git = (args: string[]) => execFileSync('git', args, { cwd: worktreeInfo.worktreePath, encoding: 'utf8' });
+        const changed = new Set([...git(['diff', '--name-only', '--no-renames', '-z', maintenance.baseSha, '--']).split('\0'),
+            ...git(['diff', '--cached', '--name-only', '--no-renames', '-z', maintenance.baseSha, '--']).split('\0'),
+            ...git(['ls-files', '--others', '--exclude-standard', '-z']).split('\0')].filter(Boolean));
+        if (!scope?.length || [...changed].some(path => !isWithinMergeScope(path, scope))) throw new Error('maintenance-scope-changed');
+        git(['merge-base', '--is-ancestor', maintenance.headSha, 'HEAD']);
+    }
     const commitMessage = buildMergeConflictCommitMessage({
         baseBranch, headBranch: branchName, pullRequestNumber, conflictedFiles,
         model: claudeResult.model || resolvedModel, wasCleanMerge,
@@ -197,8 +210,9 @@ export async function handleMergeWithAgent(options: {
     const { simpleGit } = await import('simple-git');
     const finalCommitHash = commitResult?.commitHash || (await simpleGit({ baseDir: worktreeInfo.worktreePath }).revparse(['HEAD'])).trim();
     await options.beforePublish?.();
-    await pushBranch(worktreeInfo.worktreePath, branchName, { repoUrl, authToken: githubToken.token });
+    await pushBranch(worktreeInfo.worktreePath, branchName, { repoUrl, authToken: githubToken.token, ...(maintenance ? { expectedHeadSha: maintenance.headSha } : {}) });
     options.onPushed?.(finalCommitHash);
+    if (maintenance) await db('tasks').where({ task_id: taskId }).update({ commit_hash: finalCommitHash });
 
     const taskUrl = `${process.env.WEB_UI_URL || process.env.FRONTEND_URL || 'https://gitfix.dev'}/tasks/${taskId}`;
     const comment = buildMergeConflictComment({
@@ -225,7 +239,7 @@ export async function handleMergeWithAgent(options: {
                     model: claudeResult.model || resolvedModel, commitHash: finalCommitHash, correlatedLogger,
                 }),
                 agentOutcome: buildAgentOutcome(claudeResult),
-                ...(options.executionAdmissionReceipt ? { admissionId: options.executionAdmissionReceipt.admissionId, settlement: 'published', pushedHead: finalCommitHash } : {}),
+                ...(options.executionAdmissionReceipt ? { admissionId: options.executionAdmissionReceipt.admissionId, operationId: options.executionAdmissionReceipt.operationId, settlement: maintenance && finalCommitHash === maintenance.headSha ? 'no-change' : 'published', pushedHead: finalCommitHash } : {}),
             },
         },
     });

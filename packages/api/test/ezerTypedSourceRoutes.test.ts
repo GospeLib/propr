@@ -3,11 +3,12 @@ import { mock, test } from 'node:test';
 import { parseSourceReference } from '../../core/src/admission/admittedSource.js';
 
 const typed = mock.fn(async () => ({ mode: 'fix', jobId: 'pr-comments-batch-ezer-a' }));
+const maintenance = mock.fn(async () => ({ jobId: 'merge-ezer-a' }));
 const legacy = mock.fn(async () => ({ jobId: 'pr-comments-batch-ezer-a', commentId: 9 }));
 const cancel = mock.fn(async () => ({ state: 'not-started' }));
 await mock.module('ioredis', { namedExports: { Redis: class { disconnect() {} } } });
 await mock.module('@propr/core', { namedExports: {
-    enqueueAdmittedSource: typed, parseSourceReference, cancelExecutionAdmission: cancel, getStateManager: mock.fn(), TaskStates: { CANCELLED: 'cancelled' },
+    enqueueAdmittedMaintenance: maintenance, enqueueAdmittedSource: typed, parseSourceReference, cancelExecutionAdmission: cancel, getStateManager: mock.fn(), TaskStates: { CANCELLED: 'cancelled' },
     issueQueue: { add: mock.fn() }, COMMENT_BATCH_DELAY_MS: 1, getAuthenticatedOctokit: mock.fn(),
     generateCorrelationId: () => 'correlation', logger: { info: mock.fn(), error: mock.fn() },
 } });
@@ -51,4 +52,29 @@ test('cancel validates input and returns its state', async () => {
     let res = response(); await postEzerAdmissionCancel(request({ reason: 'edited' }) as never, res as never); assert.equal(res.value.code, 400);
     res = response(); await postEzerAdmissionCancel(request({ operationId: 'op', reason: 'edited' }) as never, res as never);
     assert.deepEqual(res.value, { code: 200, body: { state: 'not-started' } });
+});
+
+test('maintenance contract accepts exact request without an owner source', async () => {
+    const res = response(); await routes.postFollowup(request({ contract: 'ezer-pr-maintenance-v1', admissionId: 'a', requestId: 'r' }) as never, res as never);
+    assert.deepEqual(res.value, { code: 200, body: { jobId: 'merge-ezer-a' } });
+    assert.deepEqual(maintenance.mock.calls.at(-1)?.arguments[0], { repository: 'owner/repo', prNumber: 7, priorTaskId: 'task', admissionId: 'a', requestId: 'r' });
+});
+for (const extra of [{ source: { kind: 'review', id: 9 } }, { body: 'owner words' }, { model: 'opus' }, { existingCommentId: 9 }]) {
+    test(`maintenance rejects unsigned overrides ${JSON.stringify(extra)}`, async () => {
+        const count = maintenance.mock.callCount(); const res = response();
+        await routes.postFollowup(request({ contract: 'ezer-pr-maintenance-v1', admissionId: 'a', requestId: 'r', ...extra }) as never, res as never);
+        assert.equal(res.value.code, 403); assert.equal(maintenance.mock.callCount(), count);
+    });
+}
+for (const body of [{ contract: 'ezer-pr-maintenance-v2', admissionId: 'a', requestId: 'r' }, { requestId: 'r', body: 'legacy' }]) {
+    test(`unsupported maintenance never falls through: ${JSON.stringify(body)}`, async () => {
+        const before = legacy.mock.callCount(); const res = response();
+        await routes.postFollowup(request(body) as never, res as never);
+        assert.equal(res.value.code, 400); assert.equal(legacy.mock.callCount(), before);
+    });
+}
+test('maintenance requires internal authentication', async () => {
+    const count = maintenance.mock.callCount(); const res = response();
+    await routes.postFollowup(request({ contract: 'ezer-pr-maintenance-v1', admissionId: 'a', requestId: 'r' }, false) as never, res as never);
+    assert.equal(res.value.code, 403); assert.equal(maintenance.mock.callCount(), count);
 });

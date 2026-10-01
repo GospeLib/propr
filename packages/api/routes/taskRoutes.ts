@@ -1,3 +1,4 @@
+import { enqueueAdmittedMaintenance } from '@propr/core';
 import { Request, Response } from 'express';
 import { enqueueAdmittedSource, parseSourceReference } from "@propr/core";
 import { enqueueAdmittedComment } from './ezerCommentFollowup.js';
@@ -318,6 +319,20 @@ export function createTaskRoutes(deps: TaskRoutesDeps) {
         res.status(403).json({ error: 'Followups require an authenticated Ezer admission' });
         return;
       }
+      if (req.body.contract === 'ezer-pr-maintenance-v1') {
+        if (!verifyEzerInternalRequest(req) || typeof req.body.admissionId !== 'string' || typeof req.body.requestId !== 'string' ||
+            Object.keys(req.body).some(key => !['contract', 'admissionId', 'requestId'].includes(key))) {
+          res.status(403).json({ error: 'An exact authenticated maintenance request is required' }); return;
+        }
+        const task = await db('tasks').where({ task_id: taskId }).first() as TaskRecord | undefined;
+        if (!task) { res.status(404).json({ error: 'Task not found' }); return; }
+        const prNumber = taskFollowupPullRequest(task);
+        if (!prNumber) { res.status(403).json({ error: 'An existing task PR is required' }); return; }
+        try { res.json(await enqueueAdmittedMaintenance({ repository: task.repository, prNumber, priorTaskId: String(taskId),
+          admissionId: req.body.admissionId, requestId: req.body.requestId })); }
+        catch (error) { res.status(403).json({ error: (error as Error).message }); }
+        return;
+      }
       const typedSource = req.body.contract === 2;
       if (req.body.contract !== undefined && !typedSource) {
         res.status(400).json({ error: 'Unsupported followup contract' });
@@ -341,7 +356,7 @@ export function createTaskRoutes(deps: TaskRoutesDeps) {
         } catch (error) { res.status(403).json({ error: (error as Error).message }); }
         return;
       }
-      if (req.body.source !== undefined) { res.status(400).json({ error: 'Source requires contract 2' }); return; }
+      if (req.body.source !== undefined || req.body.maintenance !== undefined || req.body.requestId !== undefined) { res.status(400).json({ error: 'Source requires contract 2' }); return; }
       // Validate comment body
       const bodyValidation = validateStringLength(body, 'Comment body', { required: true, minLength: 1, maxLength: 65536 });
       if (!bodyValidation.valid) {

@@ -18,6 +18,7 @@ export interface MergeResult {
 export async function mergeBaseIntoBranch(
     worktreePath: string,
     baseBranch: string,
+    expectedBaseSha?: string,
 ): Promise<MergeResult> {
     const git: SimpleGit = createHooklessGit(worktreePath);
 
@@ -26,6 +27,8 @@ export async function mergeBaseIntoBranch(
         logger.info({ worktreePath, baseBranch }, 'Fetching latest base branch for merge');
         await git.raw(['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`, '--prune']);
 
+        if (expectedBaseSha && (await git.revparse([`origin/${baseBranch}`])).trim() !== expectedBaseSha)
+            throw new Error('maintenance-base-moved');
         // Configure merge author
         try {
             await git.raw(['config', 'user.name', AI_COMMIT_AUTHOR.name]);
@@ -38,7 +41,7 @@ export async function mergeBaseIntoBranch(
         logger.info({ worktreePath, baseBranch }, 'Merging base branch into current branch');
         let mergeError: Error | null = null;
         try {
-            await git.raw(['merge', `origin/${baseBranch}`, '--no-edit']);
+            await git.raw(['merge', expectedBaseSha ?? `origin/${baseBranch}`, '--no-edit']);
         } catch (err) {
             mergeError = err as Error;
         }

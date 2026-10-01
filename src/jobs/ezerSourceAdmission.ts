@@ -9,6 +9,11 @@ export async function requireSourcePublication(data: SourceJob, redis: Redis, pu
     const receipt = data.executionAdmissionReceipt;
     if (!receipt) return;
     await core.requireAdmissionNotCancelled(redis, receipt.admissionId, pushedHead);
+    if (receipt.maintenance) {
+        if (!('headBranch' in data)) throw new Error('maintenance-requires-merge-worker');
+        await core.requireMaintenanceJob(data, redis, pushedHead);
+        return;
+    }
     if (!data.executionAdmissionSource) return;
     core.requireExactSource(data.executionAdmissionSource, receipt.source);
     await core.readLiveAdmissionSource(`${data.repoOwner}/${data.repoName}`, data.pullRequestNumber,
@@ -18,6 +23,14 @@ export async function requireSourcePublication(data: SourceJob, redis: Redis, pu
 
 export async function verifyAdmittedSourceJob(data: SourceJob, redis: Redis, onArtifactCorrection?: (binding: TypedArtifactCorrection) => void): Promise<void> {
     const source = data.executionAdmissionSource, receipt = data.executionAdmissionReceipt;
+    if (receipt?.maintenance) {
+        if (!('headBranch' in data)) throw new Error('maintenance-requires-merge-worker');
+        await core.requireMaintenanceJob(data, redis);
+        await core.verifyWorkerAdmissionReceipt({ receipt, store: core.createRedisAdmissionStore(redis),
+            expected: { repository: `${data.repoOwner}/${data.repoName}`, issueNumber: data.pullRequestNumber,
+                target: data.baseBranch, maintenance: receipt.maintenance } });
+        return;
+    }
     if (!source || !receipt || !data.executionAdmissionTarget) throw new Error('ezer-source-refused:missing-worker-binding');
     await core.requireAdmissionNotCancelled(redis, receipt.admissionId);
     const live = await core.readLiveAdmissionSource(`${data.repoOwner}/${data.repoName}`, data.pullRequestNumber, source, data.executionAdmissionTarget);

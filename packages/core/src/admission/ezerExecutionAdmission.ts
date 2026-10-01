@@ -1,3 +1,4 @@
+import { parseMaintenanceBinding, requireExactMaintenance, requireMaintenanceAuthority, type PRMaintenanceBinding } from './admissionBindings.js';
 import { requireAdmissionNotCancelled, cancelledExecutionAdmissionKey } from './executionAdmissionCancellation.js';
 import { parseSourceBinding, parseSourceStep, requireExactSource, requireExactSourceStep, type SourceAdmissionBinding, type SourceAdmissionStep } from './admissionBindings.js';
 import { createHmac, timingSafeEqual } from 'node:crypto';
@@ -39,6 +40,7 @@ return 1
 `;
 
 export interface ExecutionAdmissionClaims {
+    maintenance?: PRMaintenanceBinding;
     delegatedAuthority?: ExecutionDelegation;
     storyExecution?: StoryExecutionContract;
   route?: ExecutionRouteBinding;
@@ -73,6 +75,9 @@ export interface ExecutionAdmissionClaims {
 }
 
 export interface WorkerAdmissionReceipt {
+    maintenance?: PRMaintenanceBinding;
+    executionDeadline?: string;
+    scope?: string[];
     /** Absent for byte-identical v1 receipts. V2 must match trusted receipt storage. */
     version?: 2;
     delegatedAuthority?: ExecutionDelegation;
@@ -157,6 +162,7 @@ export async function readAdmittedExecutionBinding(
 }
 
 interface ExpectedExecution {
+    maintenance?: PRMaintenanceBinding;
     control?: StopAdmissionBinding;
     comment?: CommentAdmissionBinding;
     source?: SourceAdmissionBinding;
@@ -174,6 +180,7 @@ function parseClaims(encodedPayload: string): ExecutionAdmissionClaims {
     }
     if (!value || typeof value !== 'object' || Array.isArray(value)) refuse('malformed-admission');
     const candidate = value as Record<string, unknown>;
+    requireMaintenanceAuthority(candidate);
     if (candidate.version !== 1 && candidate.version !== 2) refuse('unsupported-version');
     if (candidate.source !== undefined && candidate.comment !== undefined) refuse('source-authority-mismatch');
     if (candidate.step !== undefined && (candidate.source === undefined || parseSourceBinding(candidate.source).mode !== 'fix')) refuse('source-step-authority-mismatch');
@@ -183,6 +190,7 @@ function parseClaims(encodedPayload: string): ExecutionAdmissionClaims {
     }
     if (!Number.isSafeInteger(candidate.issueNumber) || Number(candidate.issueNumber) < 1) refuse('invalid-issue');
     return {
+        ...(candidate.maintenance === undefined ? {} : { maintenance: parseMaintenanceBinding(candidate.maintenance) }),
         ...(candidate.delegatedAuthority === undefined ? {} : { delegatedAuthority: parseDelegation(candidate.delegatedAuthority, candidate.version) }),
         ...(candidate.route === undefined ? {} : {route:requireExecutionRoute(candidate.route)}),
     ...(candidate.control === undefined ? {} : {control:parseStopBinding(candidate.control)}),
@@ -226,6 +234,7 @@ function verifySignature(encodedPayload: string, presentedSignature: string, sig
 }
 
 function validateClaims(claims: ExecutionAdmissionClaims, expected: ExpectedExecution, nowMs: number): number {
+    requireExactMaintenance(claims.maintenance, expected.maintenance);
     if (claims.storyExecution && (claims.control || claims.comment || claims.source || claims.typedWork || claims.artifactCorrection ||
         claims.target !== claims.storyExecution.targetBranch || JSON.stringify(claims.scope) !== JSON.stringify(claims.storyExecution.allowedPaths)))
         refuse('story-execution-authority-mismatch');
@@ -295,6 +304,7 @@ export async function consumeExecutionAdmission(input: {
     const receiptKey = `${RECEIPT_KEY_PREFIX}${claims.admissionId}`;
     const receiptValue = JSON.stringify({
         ...(v2Claim === undefined ? {} : { version: 2, v2Claim }),
+        ...(claims.maintenance === undefined ? {} : { maintenance: claims.maintenance, scope: claims.scope, executionDeadline: claims.expiresAt, maintenanceTokenDigest: admissionTokenDigest(input.token) }),
         ...(claims.delegatedAuthority === undefined ? {} : { delegatedAuthority: claims.delegatedAuthority }),
         admissionId: claims.admissionId,
         operationId: claims.operationId,
@@ -316,7 +326,7 @@ export async function consumeExecutionAdmission(input: {
         ...(claims.startBy === undefined ? {} : { startBy: claims.startBy }),
     });
     if (!await input.store.consumeAndIssue(consumedKey, receiptKey, receiptValue, ttlSeconds)) refuse('replayed-admission');
-    return { claims, receipt: { ...(claims.source ? { source: claims.source } : {}), ...(claims.step ? { step: claims.step } : {}), ...(v2Claim === undefined ? {} : { version: 2 as const }), ...(claims.delegatedAuthority ? { delegatedAuthority: claims.delegatedAuthority } : {}), ...(claims.route ? {route:claims.route} : {}), admissionId: claims.admissionId, operationId: claims.operationId, storyId: claims.storyId, receiptKey } };
+    return { claims, receipt: { ...(claims.maintenance ? { maintenance: claims.maintenance, scope: claims.scope, executionDeadline: claims.expiresAt } : {}), ...(claims.source ? { source: claims.source } : {}), ...(claims.step ? { step: claims.step } : {}), ...(v2Claim === undefined ? {} : { version: 2 as const }), ...(claims.delegatedAuthority ? { delegatedAuthority: claims.delegatedAuthority } : {}), ...(claims.route ? {route:claims.route} : {}), admissionId: claims.admissionId, operationId: claims.operationId, storyId: claims.storyId, receiptKey } };
 }
 
 interface WorkerReceiptVerification {
@@ -343,7 +353,7 @@ export async function verifyWorkerAdmissionReceipt(input: WorkerReceiptVerificat
     store: Pick<AdmissionStore, 'take'> & Partial<Pick<AdmissionStore, 'get'>>;
 }): Promise<TypedInvestigationAdmission | undefined> {
     if (input.store.get) await requireAdmissionNotCancelled({ get: input.store.get.bind(input.store) }, input.receipt.admissionId);
-    else if (input.receipt.source) refuse('source-receipt-store-required');
+    else if (input.receipt.source || input.receipt.maintenance) refuse('source-receipt-store-required');
     if (input.receipt.version === 2) {
         // Read/check first: an unavailable Ezer must leave the receipt retryable.
         if (!input.store.get) refuse('v2-receipt-store-required');
@@ -369,6 +379,13 @@ function validateWorkerAdmissionReceipt(stored: string | null, input: WorkerRece
     } catch {
         refuse('malformed-worker-receipt');
     }
+    requireMaintenanceAuthority(value);
+    requireExactMaintenance(value.maintenance, input.expected.maintenance);
+    requireExactMaintenance(value.maintenance, input.receipt.maintenance);
+    if (value.maintenance !== undefined && (value.executionDeadline !== input.receipt.executionDeadline ||
+        typeof value.executionDeadline !== 'string' || Date.parse(value.executionDeadline) <= Date.now() ||
+        !Number.isFinite(Date.parse(value.executionDeadline)) || !Array.isArray(value.scope) || value.scope.length === 0 ||
+        JSON.stringify(value.scope) !== JSON.stringify(input.receipt.scope))) refuse('maintenance-worker-binding-changed');
     if (value.version !== input.receipt.version) refuse('worker-receipt-version-mismatch');
     if (value.version === 2 && !value.v2Claim) refuse('missing-worker-claim');
     if(value.control!==undefined)refuse('stop-control-cannot-start-worker');

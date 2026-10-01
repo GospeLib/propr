@@ -122,6 +122,7 @@ export async function ensureBranchAndPush(worktreePath: string, branchName: stri
 }
 
 interface PushBranchOptions {
+    expectedHeadSha?: string;
     execution?: StoryExecutionContract;
     repoUrl?: string;
     authToken?: string;
@@ -161,8 +162,19 @@ export async function pushBranch(worktreePath: string, branchName: string, optio
     if (options.execution && (branchName !== options.execution.featureBranch || rebaseOnNonFastForward))
         throw Error('STORY_EXECUTION_BRANCH_CHANGED');
 
+    if (options.expectedHeadSha && (rebaseOnNonFastForward || options.execution || !/^[a-f0-9]{40}$/.test(options.expectedHeadSha))) throw Error('INVALID_PUSH_LEASE');
     const performPush = async (token: string | undefined): Promise<void> => {
         if (repoUrl && token) await setupAuthenticatedRemote(git, repoUrl, token);
+        if (options.expectedHeadSha) {
+            if ((await git.revparse(['--abbrev-ref', 'HEAD'])).trim() !== branchName) throw Error('MAINTENANCE_BRANCH_CHANGED');
+            // The lease checks the remote atomically. Ancestry independently forbids rewriting history.
+            if ((await git.raw(['merge-base', options.expectedHeadSha, 'HEAD'])).trim() !== options.expectedHeadSha)
+                throw Error('MAINTENANCE_HISTORY_CHANGED');
+            const head = (await git.revparse(['HEAD'])).trim();
+            const destination = `refs/heads/${branchName}`;
+            await git.push([`--force-with-lease=${destination}:${options.expectedHeadSha}`, remote, `${head}:${destination}`]);
+            return;
+        }
         if (options.execution) {
             await verifyStoryPublication(worktreePath, options.execution);
             const head = (await git.revparse(['HEAD'])).trim();

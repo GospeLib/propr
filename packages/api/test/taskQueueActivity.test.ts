@@ -11,7 +11,7 @@ await mock.module('../ezerInternalAuth.js', {
 
 await mock.module('@propr/core', {
   namedExports: {
-    enqueueAdmittedSource: mock.fn(), parseSourceReference: mock.fn(),
+    enqueueAdmittedMaintenance: mock.fn(), enqueueAdmittedSource: mock.fn(), parseSourceReference: mock.fn(),
     issueQueue: { add: mock.fn() },
     COMMENT_BATCH_DELAY_MS: 1,
     getAuthenticatedOctokit: mock.fn(),

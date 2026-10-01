@@ -163,6 +163,7 @@ await mock.module('@propr/core', {
     namedExports: {
         ...(await import('../packages/core/src/agents/executionFailure.js')),
         ...completionCoreExports, ...cancellation,
+        requireMaintenanceJob: async () => undefined,
         logger: {
             info: mock.fn(),
             warn: mock.fn(),
@@ -579,3 +580,56 @@ for (const cancelAt of ['worker-start', 'before-push', 'after-push'] as const) t
     assert.equal(terminal.historyMetadata.settlement, result.status);
     if (cancelAt === 'after-push') { assert.equal(result.pushedHead, 'abc1234567890'); assert.equal(terminal.historyMetadata.pushedHead, result.pushedHead); }
 });
+
+for (const outcome of ['published', 'no-change', 'outside-scope', 'conflict-outside-scope', 'published-before-cancel'] as const) {
+    test(`maintenance worker reports ${outcome} through existing settlement`, async () => {
+        const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+        const { execFileSync } = await import('node:child_process');
+        const root = await mkdtemp('/private/tmp/propr-maintenance-worker-');
+        const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+        try {
+            resetAllMocks();
+            git(['init', '-b', 'feature-branch']); git(['config', 'user.name', 'Test']); git(['config', 'user.email', 'test@example.com']);
+            await writeFile(`${root}/allowed.txt`, 'initial'); git(['add', '.']); git(['commit', '-m', 'initial']);
+            const head = git(['rev-parse', 'HEAD']);
+            const job: any = createMockJob();
+            job.data.headSha = head; job.data.baseSha = head; job.data.triggerSource = 'ezer'; job.data.executionAdmissionTarget = 'main';
+            job.data.executionAdmissionReceipt = { admissionId: 'maintenance', operationId: 'maintenance-op', storyId: 'story',
+                executionDeadline: new Date(Date.now() + 60000).toISOString(), scope: ['allowed.txt'],
+                maintenance: { issuer: 'ezer', kind: 'bring-up-to-date', headSha: head, baseSha: head, headBranch: 'feature-branch',
+                    requestId: 'request', priorTaskId: 'prior', deliveryEventId: 'event' } };
+            mockCreateWorktreeFromExistingBranch.mock.mockImplementation(async () => ({ worktreePath: root, branchName: 'feature-branch' }));
+            mockMergeBaseIntoBranch.mock.mockImplementation(async () => outcome === 'conflict-outside-scope'
+                ? { outcome: 'conflicts', conflictedFiles: ['forbidden.txt'] } as never : { outcome: 'clean' });
+            mockStateManager.getTaskState.mock.mockImplementation(async () => ({ claudeResult: { success: true, resultPhase: 'final' } }) as never);
+            mockAgent.executeTask.mock.mockImplementation(async () => {
+                if (outcome === 'outside-scope') await writeFile(`${root}/forbidden.txt`, 'unrelated');
+                else if (outcome !== 'no-change') await writeFile(`${root}/allowed.txt`, 'resolved');
+                return mockAgentResult;
+            });
+            mockCommitChanges.mock.mockImplementation(async () => {
+                if (outcome !== 'no-change') { git(['add', '.']); git(['commit', '-m', 'resolved']); }
+                return { commitHash: git(['rev-parse', 'HEAD']), commitMessage: 'resolved' };
+            });
+            mockPushBranch.mock.mockImplementation(async () => {
+                if (outcome === 'published-before-cancel') mockRedisStore.set(cancellation.cancelledExecutionAdmissionKey('maintenance'), 'cancelled');
+            });
+            if (outcome.endsWith('outside-scope')) {
+                await assert.rejects(() => processMergeConflictJob(job), /maintenance-(scope-changed|conflict-outside-scope)/);
+                assert.equal(mockPushBranch.mock.callCount(), 0);
+                if (outcome === 'conflict-outside-scope') assert.equal(mockAgent.executeTask.mock.callCount(), 0);
+            } else {
+                const result = await processMergeConflictJob(job);
+                assert.equal(result.status, outcome === 'published-before-cancel' ? outcome : 'complete');
+                assert.equal(mockPushBranch.mock.calls[0].arguments[2].expectedHeadSha, head);
+                const agentOptions = mockAgent.executeTask.mock.calls[0].arguments[0];
+                assert.ok(agentOptions.timeoutMs > 0 && agentOptions.timeoutMs <= 60000);
+                assert.match(agentOptions.prompt, /allowed.txt/);
+            }
+            const terminal: any = mockStateManager.updateTaskState.mock.calls.at(-1)?.arguments[2];
+            assert.equal(terminal.historyMetadata.settlement, outcome.endsWith('outside-scope') ? 'failed' : outcome);
+            assert.equal(terminal.historyMetadata.admissionId, 'maintenance');
+            assert.equal(terminal.historyMetadata.operationId, 'maintenance-op');
+        } finally { await rm(root, { recursive: true, force: true }); }
+    });
+}

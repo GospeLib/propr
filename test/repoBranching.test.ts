@@ -127,3 +127,28 @@ test('parallel-safe worktree creation and push do not require shared config writ
         await rm(tempDir, { recursive: true, force: true });
     }
 });
+
+test('maintenance push uses an exact head lease and preserves a competing commit', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'propr-maintenance-cas-'));
+    try {
+        const remote = path.join(root, 'remote.git'), local = path.join(root, 'local');
+        await git(root, ['init', '--bare', remote]);
+        await git(root, ['clone', remote, local]); await configureUser(local);
+        await git(local, ['checkout', '-b', 'feature']);
+        await writeFile(path.join(local, 'file'), 'admitted\n'); await git(local, ['add', '.']); await git(local, ['commit', '-m', 'admitted']);
+        const admitted = await git(local, ['rev-parse', 'HEAD']);
+        await git(local, ['push', 'origin', 'feature']);
+        await writeFile(path.join(local, 'file'), 'merged\n'); await git(local, ['commit', '-am', 'merge']);
+        const merged = await git(local, ['rev-parse', 'HEAD']);
+        await pushBranch(local, 'feature', { expectedHeadSha: admitted });
+        assert.equal(await git(remote, ['rev-parse', 'feature']), merged);
+        // Even a fast-forward candidate may not publish against a different admitted remote head.
+        await writeFile(path.join(local, 'file'), 'later\n'); await git(local, ['commit', '-am', 'later']);
+        await assert.rejects(() => pushBranch(local, 'feature', { expectedHeadSha: admitted }));
+        assert.equal(await git(remote, ['rev-parse', 'feature']), merged);
+        // A lease is not permission to rewrite the admitted history.
+        await git(local, ['reset', '--hard', admitted]);
+        await assert.rejects(() => pushBranch(local, 'feature', { expectedHeadSha: merged }));
+        assert.equal(await git(remote, ['rev-parse', 'feature']), merged);
+    } finally { await rm(root, { recursive: true, force: true }); }
+});

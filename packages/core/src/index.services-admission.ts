@@ -127,3 +127,7 @@ export { type ExecutionRecoveryCheckpoint, type ExecutionRecoveryContext } from 
 export { parseSourceBinding, requireExactSource, type SourceAdmissionBinding, type SourceAdmissionStep } from "./admission/admissionBindings.js";
 export { cancelledExecutionAdmissionKey, executionAdmissionJobKey, sourceAdmissionJobId, AdmissionCancelledError, requireAdmissionNotCancelled, cancelExecutionAdmission } from "./admission/executionAdmissionCancellation.js";
 export { buildAdmittedSourceInstructions, enqueueAdmittedSource, readLiveAdmissionSource, parseSourceReference } from './admission/admittedSource.js';
+
+export { parseMaintenanceBinding, requireExactMaintenance } from './admission/admissionBindings.js';
+export type { PRMaintenanceBinding } from './admission/admissionBindings.js';
+export { enqueueAdmittedMaintenance, requireMaintenanceJob, readLiveMaintenance } from './admission/admittedMaintenance.js';

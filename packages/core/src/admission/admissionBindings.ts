@@ -165,3 +165,26 @@ export function requireExecutionRoute(value:unknown):ExecutionRouteBinding {
  if(!Number.isSafeInteger(v.attemptOrdinal)||Number(v.attemptOrdinal)<1||v.routeId!==`${v.agentAlias}:${v.model}`)throw new Error('INVALID_EXECUTION_ROUTE');
  return {selectionId:String(v.selectionId),routeId:String(v.routeId),agentId:String(v.agentId),agentAlias:String(v.agentAlias),provider:String(v.provider),model:String(v.model),attemptOrdinal:Number(v.attemptOrdinal)};
 }
+
+/** Authority for Ezer to merge a pinned base into its own delivered PR. */
+export interface PRMaintenanceBinding {
+    issuer: 'ezer'; kind: 'bring-up-to-date'; requestId: string; deliveryEventId: string;
+    priorTaskId: string; headSha: string; headBranch: string; baseSha: string;
+}
+export function parseMaintenanceBinding(value: unknown): PRMaintenanceBinding {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) refuse('invalid-maintenance');
+    const v = value as Record<string, unknown>;
+    const keys = ['issuer', 'kind', 'requestId', 'deliveryEventId', 'priorTaskId', 'headSha', 'headBranch', 'baseSha'];
+    if (v.issuer !== 'ezer' || v.kind !== 'bring-up-to-date' || Object.keys(v).some(k => !keys.includes(k))) refuse('invalid-maintenance');
+    for (const key of keys) requiredString(v[key], 'invalid-maintenance');
+    if (!/^[a-f0-9]{40}$/.test(String(v.headSha)) || !/^[a-f0-9]{40}$/.test(String(v.baseSha))) refuse('invalid-maintenance-head');
+    return Object.fromEntries(keys.map(k => [k, v[k]])) as unknown as PRMaintenanceBinding;
+}
+export function requireExactMaintenance(actual: unknown, expected: unknown): void {
+    if (actual === undefined && expected === undefined) return;
+    if (JSON.stringify(parseMaintenanceBinding(actual)) !== JSON.stringify(parseMaintenanceBinding(expected))) refuse('wrong-maintenance');
+}
+export function requireMaintenanceAuthority(value: Record<string, unknown>): void {
+    if (value.maintenance !== undefined && ['source', 'comment', 'step', 'control', 'storyExecution', 'typedWork',
+        'artifactCorrection', 'route', 'delegatedAuthority'].some(key => value[key] !== undefined)) refuse('maintenance-authority-mismatch');
+}

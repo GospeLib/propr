@@ -189,3 +189,14 @@ describe('mergeConflictJobToCommentJob', () => {
         });
     });
 });
+
+
+test('maintenance scope matches directory boundaries with Ezer directory roots', async () => {
+    const { isWithinMergeScope } = await import('../src/jobs/mergeConflictHelpers.js');
+    assert.equal(isWithinMergeScope('services/ezer/file.ts', ['services/ezer']), true);
+    assert.equal(isWithinMergeScope('services/ezer/file.ts', ['services/ezer/']), true);
+    assert.equal(isWithinMergeScope('services/ezer-other/file.ts', ['services/ezer']), false);
+    assert.equal(isWithinMergeScope('file.ts', ['file.ts']), true);
+    assert.equal(isWithinMergeScope('other.ts', ['file.ts']), false);
+    assert.equal(isWithinMergeScope('file.ts', undefined), false);
+});

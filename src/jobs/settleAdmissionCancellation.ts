@@ -4,9 +4,9 @@ import { publishCompletedWithDurableExecutionEvidence } from './completedExecuti
 
 /** Cancellation acknowledgement is distinct from the terminal evidence Ezer observes in task history. */
 export async function settleAdmissionCancellation(error: AdmissionCancelledError, taskId: string, stateManager: WorkerStateManager,
-    correlatedLogger: Logger): Promise<JobResult> {
+    correlatedLogger: Logger, operationId?: string): Promise<JobResult> {
     const status = error.pushedHead ? 'published-before-cancel' : 'cancelled';
-    const historyMetadata = { admissionId: error.admissionId, settlement: status, jobResultStatus: status,
+    const historyMetadata = { ...(operationId ? { operationId } : {}), admissionId: error.admissionId, settlement: status, jobResultStatus: status,
         ...(error.pushedHead ? { pushedHead: error.pushedHead, commitHash: error.pushedHead } : {}) };
     if (error.pushedHead) {
         const state = await stateManager.getTaskState(taskId);

@@ -18,7 +18,7 @@ import { Redis } from 'ioredis';
 import { getDefaultModel, NoDefaultModelConfiguredError } from '@propr/core';
 import { cleanupWorktree } from '@propr/core';
 import {
-    fetchMergeTaskPRInfo,
+    fetchMergeTaskPRInfo, isWithinMergeScope,
     updateMergeTaskWithKnownPRInfo,
 } from './mergeConflictHelpers.js';
 import { handleMergeWithAgent } from './mergeConflictAgentRunner.js';
@@ -83,6 +83,7 @@ async function resolveModelForTask(correlatedLogger: Logger): Promise<string> {
 
 
 async function handleMergeJobError(error: Error, options: {
+    receipt?: import('@propr/core').WorkerAdmissionReceipt;
     octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>> | null;
     startingCommentId: number | undefined;
     stateManager: WorkerStateManager;
@@ -106,6 +107,7 @@ async function handleMergeJobError(error: Error, options: {
 
     await stateManager.updateTaskState(taskId, TaskStates.FAILED, {
         reason: 'Merge conflict resolution failed', error: { message: errorMessage },
+        ...(options.receipt?.maintenance ? { historyMetadata: { admissionId: options.receipt.admissionId, operationId: options.receipt.operationId, settlement: 'failed' }, requireDurableHistory: true } : {}),
     });
 
     if (octokit && startingCommentId) {
@@ -267,15 +269,22 @@ export async function processMergeConflictJob(job: Job<MergeConflictJobData>): P
     const lockStatus = await acquireMergeJobLock(lockKey, correlationId, job, correlatedLogger);
     if (!lockStatus.acquired) return lockStatus.result;
 
-    const modelName = await resolveModelForTask(correlatedLogger);
+    let modelName: string | undefined;
+    let maintenanceSetupError: unknown;
+    try { modelName = await resolveModelForTask(correlatedLogger); }
+    catch (error) {
+        if (!job.data.executionAdmissionReceipt?.maintenance) throw error;
+        maintenanceSetupError = error;
+    }
 
     try {
         await stateManager.createTaskState(taskId, {
             number: pullRequestNumber, repoOwner, repoName, modelName,
-            type: 'merge_conflict', pullRequestNumber,
+            type: 'merge_conflict', pullRequestNumber, executionAdmissionReceipt: job.data.executionAdmissionReceipt,
         } as unknown as Parameters<typeof stateManager.createTaskState>[1], correlationId);
     } catch (stateError) {
         correlatedLogger.warn({ taskId, error: (stateError as Error).message }, 'Failed to create initial task state');
+        if (job.data.executionAdmissionReceipt?.maintenance) maintenanceSetupError ??= stateError;
     }
 
     let localRepoPath: string | undefined;
@@ -289,6 +298,7 @@ export async function processMergeConflictJob(job: Job<MergeConflictJobData>): P
     let pushedHead: string | undefined;
 
     try {
+        if (maintenanceSetupError) throw maintenanceSetupError;
         if (job.data.executionAdmissionReceipt || job.data.executionAdmissionSource) await verifyAdmittedSourceJob(job.data, redisClient);
         octokit = await withRetry(() => getAuthenticatedOctokit(), { ...retryConfigs.githubApi, correlationId }, 'get_authenticated_octokit');
         const githubToken = await octokit.auth({ type: "installation" }) as GitHubToken;
@@ -308,7 +318,8 @@ export async function processMergeConflictJob(job: Job<MergeConflictJobData>): P
             prInfo, stateManager, taskId, pullRequestNumber, repoOwner, repoName, baseBranch, headBranch, correlatedLogger,
         });
 
-        await stateManager.updateTaskState(taskId, TaskStates.PROCESSING, { reason: 'Starting merge conflict resolution' });
+        await stateManager.updateTaskState(taskId, TaskStates.PROCESSING, { reason: 'Starting merge conflict resolution',
+            ...(job.data.executionAdmissionReceipt ? { historyMetadata: { admissionId: job.data.executionAdmissionReceipt.admissionId, operationId: job.data.executionAdmissionReceipt.operationId } } : {}) });
         await ensureGitRepository(correlatedLogger);
         localRepoPath = await ensureRepoCloned({ repoUrl, owner: repoOwner, repoName, authToken: githubToken.token });
 
@@ -320,10 +331,10 @@ export async function processMergeConflictJob(job: Job<MergeConflictJobData>): P
 
         correlatedLogger.info({ worktreePath: worktreeInfo.worktreePath, branchName: worktreeInfo.branchName }, 'Created worktree for merge conflict resolution');
 
-        if (job.data.executionAdmissionSource && execFileSync('git', ['rev-parse', 'HEAD'], { cwd: worktreeInfo.worktreePath, encoding: 'utf8' }).trim() !== headSha) {
+        if ((job.data.executionAdmissionSource || job.data.executionAdmissionReceipt?.maintenance) && execFileSync('git', ['rev-parse', 'HEAD'], { cwd: worktreeInfo.worktreePath, encoding: 'utf8' }).trim() !== headSha) {
             throw new Error('ezer-source-refused:worktree-head-changed');
         }
-        const mergeResult = await mergeBaseIntoBranch(worktreeInfo.worktreePath, baseBranch);
+        const mergeResult = await mergeBaseIntoBranch(worktreeInfo.worktreePath, baseBranch, job.data.executionAdmissionReceipt?.maintenance?.baseSha);
 
         if (mergeResult.outcome === 'failed') {
             throw new Error(`Merge failed: ${mergeResult.error}`);
@@ -349,6 +360,10 @@ export async function processMergeConflictJob(job: Job<MergeConflictJobData>): P
             });
         }
 
+        const maintenanceScope = job.data.executionAdmissionReceipt?.scope;
+        if (job.data.executionAdmissionReceipt?.maintenance && mergeResult.conflictedFiles?.some(path =>
+            !isWithinMergeScope(path, maintenanceScope)))
+            throw new Error('maintenance-conflict-outside-scope');
         const result = await handleMergeWithAgent({
             executionAdmissionReceipt: job.data.executionAdmissionReceipt,
             beforePublish: () => requireSourcePublication(job.data, redisClient, pushedHead),
@@ -371,8 +386,9 @@ export async function processMergeConflictJob(job: Job<MergeConflictJobData>): P
             try { await requireAdmissionNotCancelled(redisClient, job.data.executionAdmissionReceipt.admissionId, pushedHead); }
             catch (cancelled) { if (cancelled instanceof AdmissionCancelledError) error = cancelled; else throw cancelled; }
         }
-        if (error instanceof AdmissionCancelledError) return await settleAdmissionCancellation(error, taskId, stateManager, correlatedLogger);
+        if (error instanceof AdmissionCancelledError) return await settleAdmissionCancellation(error, taskId, stateManager, correlatedLogger, job.data.executionAdmissionReceipt?.maintenance ? job.data.executionAdmissionReceipt.operationId : undefined);
         return await handleMergeJobError(error as Error, {
+            receipt: job.data.executionAdmissionReceipt,
             octokit: job.data.executionAdmissionReceipt ? null : octokit, startingCommentId, stateManager, taskId,
             repoOwner, repoName, baseBranch, headBranch, pullRequestNumber, correlatedLogger,
         });

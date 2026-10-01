@@ -158,3 +158,16 @@ describe('mergeBaseIntoBranch', () => {
         assert.ok(abortCall, 'Expected a merge --abort call for non-conflict failures');
     });
 });
+
+test('maintenance merges only the admitted base and refuses a moved base', async () => {
+    const pinned = 'b'.repeat(40);
+    Object.assign(mockGitInstance, { revparse: async () => pinned });
+    mockGitInstance.raw.mock.mockImplementation(async () => '');
+    mockGitInstance.status.mock.mockImplementation(async () => ({ conflicted: [] }));
+    mockGitInstance.raw.mock.resetCalls();
+    assert.equal((await mergeBaseIntoBranch('/tmp/worktree', 'stage', pinned)).outcome, 'clean');
+    assert.ok(mockGitInstance.raw.mock.calls.some(call => JSON.stringify(call.arguments[0]) === JSON.stringify(['merge', pinned, '--no-edit'])));
+    mockGitInstance.raw.mock.resetCalls();
+    assert.equal((await mergeBaseIntoBranch('/tmp/worktree', 'stage', 'c'.repeat(40))).outcome, 'failed');
+    assert.ok(!mockGitInstance.raw.mock.calls.some(call => (call.arguments[0] as string[])[0] === 'merge'));
+});

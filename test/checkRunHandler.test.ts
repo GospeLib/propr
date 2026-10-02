@@ -1324,6 +1324,44 @@ describe('handleCheckRunEvent', () => {
         assert.ok(prCallCount >= 2, 'Should process multiple PRs');
     });
 
+    test('merges with a merge commit when the repository and base ruleset allow only merge commits', async () => {
+        resetMocks();
+        mockOctokit.request.mock.mockImplementation(async (endpoint: string) => {
+            if (endpoint === 'GET /repos/{owner}/{repo}') {
+                return { data: { allow_squash_merge: false, allow_merge_commit: true, allow_rebase_merge: false } };
+            }
+            if (endpoint.includes('rules/branches')) {
+                return { data: [{ type: 'pull_request', parameters: { allowed_merge_methods: ['merge'] } }] };
+            }
+            if (endpoint.includes('pulls') && !endpoint.includes('merge') && !endpoint.includes('commits')) {
+                return {
+                    data: {
+                        labels: [{ name: 'auto-merge' }],
+                        draft: false,
+                        mergeable: true,
+                        mergeable_state: 'clean',
+                        base: { ref: 'stage' },
+                        head: { ref: 'feature', sha: 'abc123sha', repo: { owner: { login: 'test-owner' } } },
+                        body: ''
+                    }
+                };
+            }
+            if (endpoint.includes('check-runs')) {
+                return { data: { check_runs: [{ name: 'CI', status: 'completed', conclusion: 'success' }] } };
+            }
+            if (endpoint.includes('merge')) return { data: { merged: true, sha: 'merge123' } };
+            return { data: {} };
+        });
+
+        await handleCheckRunEvent(createMockCheckRunPayload({ headSha: 'abc123sha' }), 'test-correlation-id');
+
+        const mergeCall = mockOctokit.request.mock.calls.find((call: { arguments: [string, Record<string, unknown>] }) =>
+            call.arguments[0].startsWith('PUT') && call.arguments[0].includes('/merge')
+        );
+        assert.ok(mergeCall, 'Should merge');
+        assert.strictEqual(mergeCall.arguments[1].merge_method, 'merge');
+    });
+
     test('updates plan issue status after successful merge', async () => {
         resetMocks();
         mockFindPlanIssueByRepoAndPR.mock.mockImplementation(async () => ({

@@ -159,15 +159,30 @@ describe('mergeBaseIntoBranch', () => {
     });
 });
 
-test('maintenance merges only the admitted base and refuses a moved base', async () => {
-    const pinned = 'b'.repeat(40);
-    Object.assign(mockGitInstance, { revparse: async () => pinned });
-    mockGitInstance.raw.mock.mockImplementation(async () => '');
+test('maintenance merges the base tip when the admitted base is its ancestor, and refuses a rewritten base', async () => {
+    const admitted = 'b'.repeat(40);
+    const tip = 'd'.repeat(40);
+    Object.assign(mockGitInstance, { revparse: async () => tip });
     mockGitInstance.status.mock.mockImplementation(async () => ({ conflicted: [] }));
+    // The base only moved forward: the admitted commit is an ancestor of the tip.
+    mockGitInstance.raw.mock.mockImplementation(async () => '');
     mockGitInstance.raw.mock.resetCalls();
-    assert.equal((await mergeBaseIntoBranch('/tmp/worktree', 'stage', pinned)).outcome, 'clean');
-    assert.ok(mockGitInstance.raw.mock.calls.some(call => JSON.stringify(call.arguments[0]) === JSON.stringify(['merge', pinned, '--no-edit'])));
+    assert.equal((await mergeBaseIntoBranch('/tmp/worktree', 'stage', admitted)).outcome, 'clean');
+    const calls = mockGitInstance.raw.mock.calls.map(call => JSON.stringify(call.arguments[0]));
+    assert.ok(calls.includes(JSON.stringify(['merge-base', '--is-ancestor', admitted, tip])));
+    assert.ok(calls.includes(JSON.stringify(['merge', tip, '--no-edit'])));
+    // The base was rewritten: the admitted commit is no longer in it.
+    mockGitInstance.raw.mock.mockImplementation(async (args: string[]) => {
+        if (args[0] === 'merge-base') throw new Error('not an ancestor');
+        return '';
+    });
     mockGitInstance.raw.mock.resetCalls();
-    assert.equal((await mergeBaseIntoBranch('/tmp/worktree', 'stage', 'c'.repeat(40))).outcome, 'failed');
+    assert.equal((await mergeBaseIntoBranch('/tmp/worktree', 'stage', admitted)).outcome, 'failed');
     assert.ok(!mockGitInstance.raw.mock.calls.some(call => (call.arguments[0] as string[])[0] === 'merge'));
+    // An unchanged base merges exactly the admitted commit, with no ancestry check.
+    Object.assign(mockGitInstance, { revparse: async () => admitted });
+    mockGitInstance.raw.mock.mockImplementation(async () => '');
+    mockGitInstance.raw.mock.resetCalls();
+    assert.equal((await mergeBaseIntoBranch('/tmp/worktree', 'stage', admitted)).outcome, 'clean');
+    assert.ok(mockGitInstance.raw.mock.calls.some(call => JSON.stringify(call.arguments[0]) === JSON.stringify(['merge', admitted, '--no-edit'])));
 });

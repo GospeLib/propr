@@ -17,7 +17,9 @@ export async function readLiveMaintenance(repository: string, prNumber: number, 
     const octokit = await getAuthenticatedOctokit();
     const { data: pr } = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', { owner, repo, pull_number: prNumber });
     if (pr.number !== prNumber || pr.state !== 'open' || pr.draft || pr.head.repo?.full_name !== repository ||
-        pr.base.repo.full_name !== repository || pr.base.ref !== target || pr.base.sha !== binding.baseSha ||
+        // After the maintenance push GitHub re-points the PR's base at the merged base commit, so the
+        // admitted base is compared only before publication.
+        pr.base.repo.full_name !== repository || pr.base.ref !== target || (!publishedHead && pr.base.sha !== binding.baseSha) ||
         pr.head.ref !== binding.headBranch || pr.head.sha !== (publishedHead ?? binding.headSha)) refuse('maintenance-pr-changed');
     if (publishedHead) return;
     if (pr.mergeable === false && pr.mergeable_state === 'dirty') return;

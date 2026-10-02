@@ -1,4 +1,4 @@
-import { maintenanceWrittenPaths } from './maintenanceWrittenPaths.js';
+import { changedSinceSnapshot, snapshotWorktree } from './maintenanceWrittenPaths.js';
 import { buildAdmittedWorkerEnvironment } from './ezerAdmittedWorkerEnvironment.js';
 import type { Logger } from 'pino';
 import type { Redis } from 'ioredis';
@@ -119,8 +119,6 @@ export async function handleMergeWithAgent(options: {
     beforePublish?: () => Promise<void>;
     onPushed?: (head: string) => void;
     conflictedFiles?: string[];
-    /** The base commit merged for an Ezer maintenance request (the base tip at merge time). */
-    mergedBaseSha?: string;
     worktreeInfo: WorktreeInfo;
     branchName: string;
     baseBranch: string;
@@ -160,6 +158,8 @@ export async function handleMergeWithAgent(options: {
     }, 'Executing merge conflict resolution with agent');
     const wasCleanMerge = !conflictedFiles || conflictedFiles.length === 0;
 
+    // The merge as Git left it, before the agent touches anything: the scope check measures from here.
+    const preAgentSnapshot = maintenance ? snapshotWorktree(worktreeInfo.worktreePath) : undefined;
     await options.beforePublish?.();
     const agentResult = await agent.executeTask({
         environment: buildAdmittedWorkerEnvironment({ repoOwner, repoName, number: pullRequestNumber,
@@ -198,7 +198,7 @@ export async function handleMergeWithAgent(options: {
     if (maintenance) {
         const { execFileSync } = await import('node:child_process');
         const git = (args: string[]) => execFileSync('git', args, { cwd: worktreeInfo.worktreePath, encoding: 'utf8' });
-        const written = maintenanceWrittenPaths(git, options.mergedBaseSha ?? maintenance.baseSha, maintenance.headSha);
+        const written = changedSinceSnapshot(worktreeInfo.worktreePath, preAgentSnapshot!);
         if (!scope?.length || written.some(path => !isWithinMergeScope(path, scope))) throw new Error('maintenance-scope-changed');
         git(['merge-base', '--is-ancestor', maintenance.headSha, 'HEAD']);
     }

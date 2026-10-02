@@ -41,6 +41,7 @@ export type { SubscriptionUsageRecord, SubscriptionUsageMetrics } from './utils/
 
 export { getGitHubInstallationToken, getAuthenticatedOctokit, validateGithubIntakePrerequisites } from './auth/githubAuth.js';
 export type { PaginatedOctokitInstance } from './auth/githubAuth.js';
+export { allowedMergeMethod, type MergeMethod } from './auth/mergeMethod.js';
 export { buildAuthPayload, generateAuthToken, verifyAuthToken, AUTH_TOKEN_MAX_AGE_MS, AUTH_TOKEN_MAX_CLOCK_SKEW_MS } from './auth/systemTaskAuth.js';
 export { readSignedExecutionAdmission, consumeExecutionAdmission, createRedisAdmissionStore, readExecutionAdmissionConsumption, readAdmittedExecutionBinding, pendingExecutionAdmissionKey, requiresEzerExecutionAdmission, inspectWorkerAdmissionReceipt, verifyWorkerAdmissionReceipt } from './admission/ezerExecutionAdmission.js';
 export type { AdmissionClaimIdentity, AdmissionClaimRequest, AdmissionClaimResponse, AdmissionClaimClient } from './admission/ezerAdmissionClaim.js';

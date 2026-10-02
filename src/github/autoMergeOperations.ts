@@ -1,4 +1,4 @@
-import { getAuthenticatedOctokit, logger, handleError } from '@propr/core';
+import { getAuthenticatedOctokit, logger, handleError, allowedMergeMethod } from '@propr/core';
 
 /**
  * Auto-merge method options supported by GitHub.
@@ -69,13 +69,21 @@ export async function enableAutoMerge(options: EnableAutoMergeOptions): Promise<
         owner,
         repoName,
         prNumber,
-        mergeMethod = 'SQUASH',
+        mergeMethod: requestedMergeMethod,
         commitHeadline,
         commitBody
     } = options;
 
     try {
         const octokit = await getAuthenticatedOctokit();
+        // The PR's base decides which methods its rulesets allow.
+        const prResponse = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+            owner,
+            repo: repoName,
+            pull_number: prNumber
+        });
+        const mergeMethod = requestedMergeMethod
+            ?? (await allowedMergeMethod(octokit, owner, repoName, prResponse.data.base.ref)).toUpperCase() as AutoMergeMethod;
 
         logger.info({
             owner,
@@ -83,13 +91,6 @@ export async function enableAutoMerge(options: EnableAutoMergeOptions): Promise<
             prNumber,
             mergeMethod
         }, 'Enabling auto-merge for PR...');
-
-        // First, get the PR's node ID using REST API
-        const prResponse = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
-            owner,
-            repo: repoName,
-            pull_number: prNumber
-        });
 
         const pullRequestId = prResponse.data.node_id;
 

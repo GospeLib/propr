@@ -1,4 +1,6 @@
 import logger from '../utils/logger.js';
+import { getAuthenticatedOctokit } from '../auth/githubAuth.js';
+import { allowedMergeMethod } from '../auth/mergeMethod.js';
 import { findPlanIssueByRepoAndPR, updatePlanIssueByPR, PlanIssueStatus } from '../config/planIssueManager.js';
 import { isEpicBranch } from '../services/taskExecutionService.js';
 import {
@@ -129,7 +131,8 @@ async function performMergeAndPostActions(ctx: PRMergeContext): Promise<void> {
         }
     }
 
-    const mergeResult = await mergePR({ owner, repoName, prNumber, mergeMethod: 'squash', commitTitle, commitMessage });
+    const mergeMethod = await allowedMergeMethod(await getAuthenticatedOctokit(), owner, repoName, prInfo.baseBranch);
+    const mergeResult = await mergePR({ owner, repoName, prNumber, mergeMethod, commitTitle, commitMessage });
 
     if (mergeResult.success && mergeResult.merged) {
         log.info({ owner, repoName, prNumber, sha: mergeResult.sha }, 'PR auto-merged successfully');

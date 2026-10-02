@@ -24,14 +24,48 @@ export async function allowedMergeMethod(
         merge: settings.allow_merge_commit !== false,
         rebase: settings.allow_rebase_merge !== false,
     };
-    const { data: rules } = await octokit.request('GET /repos/{owner}/{repo}/rules/branches/{branch}', {
-        owner, repo, branch: baseBranch,
-    }) as { data: BranchRule[] };
-    const restrictions = (Array.isArray(rules) ? rules : [])
+    const rules = await branchRules(octokit, owner, repo, baseBranch);
+    const restrictions = rules
         .filter((rule) => rule.type === 'pull_request' && Array.isArray(rule.parameters?.allowed_merge_methods))
         .map((rule) => new Set(rule.parameters!.allowed_merge_methods));
+    // Linear history (a ruleset rule or classic protection) forbids merge commits.
+    const linear = rules.some((rule) => rule.type === 'required_linear_history')
+        || await classicLinearHistory(octokit, owner, repo, baseBranch);
     const method = PREFERENCE.find((candidate) =>
-        enabled[candidate] && restrictions.every((allowed) => allowed.has(candidate)));
+        enabled[candidate] && !(linear && candidate === 'merge')
+        && restrictions.every((allowed) => allowed.has(candidate)));
     if (!method) throw new Error(`No merge method is allowed for ${owner}/${repo} into ${baseBranch}`);
     return method;
+}
+
+const RULES_PAGE_SIZE = 100;
+const NOT_FOUND = 404;
+/** An App without administration read cannot see classic protection; rulesets still apply. */
+const FORBIDDEN = 403;
+
+/** Every rule enforced on the branch, across all pages. */
+async function branchRules(octokit: Octokit, owner: string, repo: string, branch: string): Promise<BranchRule[]> {
+    const all: BranchRule[] = [];
+    for (let page = 1; ; page++) {
+        const { data } = await octokit.request('GET /repos/{owner}/{repo}/rules/branches/{branch}', {
+            owner, repo, branch, per_page: RULES_PAGE_SIZE, page,
+        }) as { data: BranchRule[] };
+        const batch = Array.isArray(data) ? data : [];
+        all.push(...batch);
+        if (batch.length < RULES_PAGE_SIZE) return all;
+    }
+}
+
+/** Classic branch protection's required linear history; an unprotected or unreadable branch has none. */
+async function classicLinearHistory(octokit: Octokit, owner: string, repo: string, branch: string): Promise<boolean> {
+    try {
+        const { data } = await octokit.request('GET /repos/{owner}/{repo}/branches/{branch}/protection', {
+            owner, repo, branch,
+        }) as { data: { required_linear_history?: { enabled?: boolean } } };
+        return data?.required_linear_history?.enabled === true;
+    } catch (error) {
+        const status = (error as { status?: number }).status;
+        if (status === NOT_FOUND || status === FORBIDDEN) return false;
+        throw error;
+    }
 }

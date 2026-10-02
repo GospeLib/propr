@@ -9,6 +9,8 @@ export interface MergeResult {
     outcome: MergeOutcome;
     conflictedFiles?: string[];
     error?: string;
+    /** The base commit actually merged when a maintenance base was admitted. */
+    mergedBaseSha?: string;
 }
 
 /**
@@ -71,7 +73,7 @@ export async function mergeBaseIntoBranch(
             }, 'Merge resulted in conflicts');
 
             return {
-                outcome: 'conflicts',
+                outcome: 'conflicts', ...(baseTip ? { mergedBaseSha: baseTip } : {}),
                 conflictedFiles
             };
         }
@@ -95,7 +97,7 @@ export async function mergeBaseIntoBranch(
         }
 
         logger.info({ worktreePath, baseBranch }, 'Merge completed cleanly');
-        return { outcome: 'clean' };
+        return { outcome: 'clean', ...(baseTip ? { mergedBaseSha: baseTip } : {}) };
     } catch (error) {
         const errorMessage = (error as Error).message || 'Unknown error';
         logger.error({ worktreePath, baseBranch, error: errorMessage }, 'Failed to execute merge operation');

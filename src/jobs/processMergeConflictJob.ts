@@ -369,6 +369,7 @@ export async function processMergeConflictJob(job: Job<MergeConflictJobData>): P
             beforePublish: () => requireSourcePublication(job.data, redisClient, pushedHead),
             onPushed: head => { pushedHead = head; },
             conflictedFiles: mergeResult.conflictedFiles,
+            ...(mergeResult.mergedBaseSha ? { mergedBaseSha: mergeResult.mergedBaseSha } : {}),
             worktreeInfo, branchName: headBranch, baseBranch,
             pullRequestNumber, repoUrl, repoOwner, repoName,
             githubToken, octokit, startingCommentId,

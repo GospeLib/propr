@@ -1,3 +1,4 @@
+import { maintenanceWrittenPaths } from './maintenanceWrittenPaths.js';
 import { buildAdmittedWorkerEnvironment } from './ezerAdmittedWorkerEnvironment.js';
 import type { Logger } from 'pino';
 import type { Redis } from 'ioredis';
@@ -118,6 +119,8 @@ export async function handleMergeWithAgent(options: {
     beforePublish?: () => Promise<void>;
     onPushed?: (head: string) => void;
     conflictedFiles?: string[];
+    /** The base commit merged for an Ezer maintenance request (the base tip at merge time). */
+    mergedBaseSha?: string;
     worktreeInfo: WorktreeInfo;
     branchName: string;
     baseBranch: string;
@@ -195,10 +198,8 @@ export async function handleMergeWithAgent(options: {
     if (maintenance) {
         const { execFileSync } = await import('node:child_process');
         const git = (args: string[]) => execFileSync('git', args, { cwd: worktreeInfo.worktreePath, encoding: 'utf8' });
-        const changed = new Set([...git(['diff', '--name-only', '--no-renames', '-z', maintenance.baseSha, '--']).split('\0'),
-            ...git(['diff', '--cached', '--name-only', '--no-renames', '-z', maintenance.baseSha, '--']).split('\0'),
-            ...git(['ls-files', '--others', '--exclude-standard', '-z']).split('\0')].filter(Boolean));
-        if (!scope?.length || [...changed].some(path => !isWithinMergeScope(path, scope))) throw new Error('maintenance-scope-changed');
+        const written = maintenanceWrittenPaths(git, options.mergedBaseSha ?? maintenance.baseSha, maintenance.headSha);
+        if (!scope?.length || written.some(path => !isWithinMergeScope(path, scope))) throw new Error('maintenance-scope-changed');
         git(['merge-base', '--is-ancestor', maintenance.headSha, 'HEAD']);
     }
     const commitMessage = buildMergeConflictCommitMessage({

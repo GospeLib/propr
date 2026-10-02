@@ -5,12 +5,15 @@ let repo: Record<string, boolean> = {};
 let rules: unknown[] = [];
 let rulesPage2: unknown[] = [];
 let linearClassic = false;
+let protectionForbidden = false;
 const graphqlCalls: Record<string, unknown>[] = [];
 const octokit = {
     request: async (route: string, params: unknown = {}) => {
         if (route.startsWith('GET /repos/{owner}/{repo}/pulls')) return { data: { node_id: 'PR_node', base: { ref: 'stage' } } };
         if (route.startsWith('GET /repos/{owner}/{repo}/rules/branches'))
             return { data: (params as { page?: number }).page === 2 ? rulesPage2 : rules };
+        if (route.startsWith('GET /repos/{owner}/{repo}/branches/{branch}/protection') && protectionForbidden)
+            throw Object.assign(new Error('Resource not accessible by integration'), { status: 403 });
         if (route.startsWith('GET /repos/{owner}/{repo}/branches/{branch}/protection'))
             return { data: { required_linear_history: { enabled: linearClassic } } };
         return { data: repo };
@@ -82,4 +85,15 @@ test('a restriction on a later page of branch rules still applies', async () => 
     linearClassic = false;
     assert.equal(await allowedMergeMethod(octokit as never, 'o', 'r', 'stage'), 'merge');
     rulesPage2 = [];
+});
+
+test('unreadable classic protection prefers a linear method over a merge commit', async () => {
+    repo = { allow_squash_merge: false, allow_merge_commit: true, allow_rebase_merge: true };
+    rules = [];
+    rulesPage2 = [];
+    protectionForbidden = true;
+    assert.equal(await allowedMergeMethod(octokit as never, 'o', 'r', 'stage'), 'rebase');
+    repo = { allow_squash_merge: false, allow_merge_commit: true, allow_rebase_merge: false };
+    assert.equal(await allowedMergeMethod(octokit as never, 'o', 'r', 'stage'), 'merge');
+    protectionForbidden = false;
 });

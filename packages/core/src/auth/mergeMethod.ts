@@ -28,20 +28,25 @@ export async function allowedMergeMethod(
     const restrictions = rules
         .filter((rule) => rule.type === 'pull_request' && Array.isArray(rule.parameters?.allowed_merge_methods))
         .map((rule) => new Set(rule.parameters!.allowed_merge_methods));
-    // Linear history (a ruleset rule or classic protection) forbids merge commits.
-    const linear = rules.some((rule) => rule.type === 'required_linear_history')
-        || await classicLinearHistory(octokit, owner, repo, baseBranch);
-    const method = PREFERENCE.find((candidate) =>
+    // Linear history (a ruleset rule or classic protection) forbids merge commits. Unreadable
+    // protection may require it, so a linear method is preferred and a merge commit is the last resort.
+    const classic = await classicLinearHistory(octokit, owner, repo, baseBranch);
+    const linear = rules.some((rule) => rule.type === 'required_linear_history') || classic === true;
+    const permitted = PREFERENCE.filter((candidate) =>
         enabled[candidate] && !(linear && candidate === 'merge')
         && restrictions.every((allowed) => allowed.has(candidate)));
+    const method = classic === UNKNOWN
+        ? permitted.find((candidate) => candidate !== 'merge') ?? permitted[0]
+        : permitted[0];
     if (!method) throw new Error(`No merge method is allowed for ${owner}/${repo} into ${baseBranch}`);
     return method;
 }
 
 const RULES_PAGE_SIZE = 100;
 const NOT_FOUND = 404;
-/** An App without administration read cannot see classic protection; rulesets still apply. */
+/** An App without administration read cannot see classic protection: whether it applies is unknown. */
 const FORBIDDEN = 403;
+const UNKNOWN = 'unknown';
 
 /** Every rule enforced on the branch, across all pages. */
 async function branchRules(octokit: Octokit, owner: string, repo: string, branch: string): Promise<BranchRule[]> {
@@ -56,8 +61,10 @@ async function branchRules(octokit: Octokit, owner: string, repo: string, branch
     }
 }
 
-/** Classic branch protection's required linear history; an unprotected or unreadable branch has none. */
-async function classicLinearHistory(octokit: Octokit, owner: string, repo: string, branch: string): Promise<boolean> {
+/** Classic branch protection's required linear history: none on an unprotected branch, unknown when unreadable. */
+async function classicLinearHistory(
+    octokit: Octokit, owner: string, repo: string, branch: string,
+): Promise<boolean | typeof UNKNOWN> {
     try {
         const { data } = await octokit.request('GET /repos/{owner}/{repo}/branches/{branch}/protection', {
             owner, repo, branch,
@@ -65,7 +72,8 @@ async function classicLinearHistory(octokit: Octokit, owner: string, repo: strin
         return data?.required_linear_history?.enabled === true;
     } catch (error) {
         const status = (error as { status?: number }).status;
-        if (status === NOT_FOUND || status === FORBIDDEN) return false;
+        if (status === NOT_FOUND) return false;
+        if (status === FORBIDDEN) return UNKNOWN;
         throw error;
     }
 }

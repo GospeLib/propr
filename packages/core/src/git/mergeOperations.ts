@@ -27,8 +27,18 @@ export async function mergeBaseIntoBranch(
         logger.info({ worktreePath, baseBranch }, 'Fetching latest base branch for merge');
         await git.raw(['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`, '--prune']);
 
-        if (expectedBaseSha && (await git.revparse([`origin/${baseBranch}`])).trim() !== expectedBaseSha)
-            throw new Error('maintenance-base-moved');
+        // The admitted base is the one GitHub reported on the PR, an ancestor of the branch tip
+        // when the base only moved forward (it always does on a live PR). Merge the current tip so
+        // the PR is up to date; refuse only a base that no longer contains the admitted commit
+        // (rewritten or force-pushed).
+        const baseTip = expectedBaseSha ? (await git.revparse([`origin/${baseBranch}`])).trim() : undefined;
+        if (expectedBaseSha && baseTip !== expectedBaseSha) {
+            try {
+                await git.raw(['merge-base', '--is-ancestor', expectedBaseSha, baseTip!]);
+            } catch {
+                throw new Error('maintenance-base-moved');
+            }
+        }
         // Configure merge author
         try {
             await git.raw(['config', 'user.name', AI_COMMIT_AUTHOR.name]);
@@ -41,7 +51,7 @@ export async function mergeBaseIntoBranch(
         logger.info({ worktreePath, baseBranch }, 'Merging base branch into current branch');
         let mergeError: Error | null = null;
         try {
-            await git.raw(['merge', expectedBaseSha ?? `origin/${baseBranch}`, '--no-edit']);
+            await git.raw(['merge', baseTip ?? `origin/${baseBranch}`, '--no-edit']);
         } catch (err) {
             mergeError = err as Error;
         }

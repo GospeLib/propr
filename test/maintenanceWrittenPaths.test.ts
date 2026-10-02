@@ -53,3 +53,17 @@ test('resolving a conflict counts only the conflicted file, and the real index i
     r.write('services/ezer/a.ts', 'resolved\n');
     assert.deepEqual(changedSinceSnapshot(r.dir, before), ['services/ezer/a.ts']);
 });
+
+test('an edit to an ignored-but-tracked file, or a force-added ignored file, is counted', () => {
+    const r = repo();
+    r.write('.gitignore', 'secret.env\nbuild/\n'); r.write('secret.env', 'tracked anyway\n'); r.write('services/ezer/a.ts', 'base\n');
+    r.git(['add', '-A']); r.git(['add', '-f', 'secret.env']); r.git(['commit', '-q', '-m', 'base']);
+    const before = snapshotWorktree(r.dir);
+    const realIndex = r.git(['ls-files', '--stage']);
+    r.write('secret.env', 'changed by agent\n');
+    r.write('build/out.js', 'generated\n'); r.git(['add', '-f', 'build/out.js']);
+    assert.deepEqual(changedSinceSnapshot(r.dir, before).sort(), ['build/out.js', 'secret.env']);
+    // Snapshots never write the real index: only the agent's own force-add changed it.
+    assert.ok(r.git(['ls-files', '--stage']).includes('build/out.js'));
+    assert.ok(realIndex.includes('secret.env'));
+});

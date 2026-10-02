@@ -6,15 +6,22 @@
  * reverted or restored file is counted.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-/** The full worktree as a tree object, written through a private index (the real one is untouched). */
+/**
+ * The full worktree as a tree object, written through a private COPY of the real index: every path
+ * the real index tracks (ignored-but-tracked and force-added ones included) is captured, unmerged
+ * entries are resolved only in the copy, and the real index is untouched.
+ */
 export function snapshotWorktree(cwd: string): string {
     const dir = mkdtempSync(join(tmpdir(), 'propr-snapshot-'));
     try {
-        const env = { ...process.env, GIT_INDEX_FILE: join(dir, 'index') };
+        const privateIndex = join(dir, 'index');
+        const realIndex = execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-path', 'index'], { cwd, encoding: 'utf8' }).trim();
+        if (existsSync(realIndex)) copyFileSync(realIndex, privateIndex);
+        const env = { ...process.env, GIT_INDEX_FILE: privateIndex };
         const git = (args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', env });
         git(['add', '-A', '--', '.']);
         return git(['write-tree']).trim();

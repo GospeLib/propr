@@ -12,14 +12,20 @@ const mockOctokit = {
 
 /** Reproduces a database that refuses the completed history row and then the read-back. */
 let refuseCompletedHistoryWrite = false;
+let maintenanceFenceError: string | undefined;
+const persistedTask: Record<string, unknown> = {};
+const updateTaskRow = mock.fn(async (row: Record<string, unknown>) => { Object.assign(persistedTask, row); });
+const taskDatabase = () => ({ where: () => ({ update: updateTaskRow }) });
 
 const mockStateManager = {
     createTaskState: mock.fn(async () => {}),
-    updateTaskState: mock.fn(async (_taskId: string, state?: string) => {
+    updateTaskState: mock.fn(async (_taskId: string, state?: string, metadata?: any) => {
         if (refuseCompletedHistoryWrite && state === 'completed') {
             throw new Error('database refused the completed history row');
         }
+        await metadata?.durableCommit?.(taskDatabase);
     }),
+    markTaskFailed: mock.fn(async () => {}),
     getTaskState: mock.fn(async () => null),
     updateHistoryMetadata: mock.fn(async () => {}),
     getTaskKey: mock.fn(() => 'task:test'),
@@ -163,7 +169,10 @@ await mock.module('@propr/core', {
     namedExports: {
         ...(await import('../packages/core/src/agents/executionFailure.js')),
         ...completionCoreExports, ...cancellation,
-        requireMaintenanceJob: async () => undefined,
+        requireMaintenanceJob: async (data: any) => {
+            if (Date.parse(data.executionAdmissionReceipt.executionDeadline) <= Date.now()) throw new Error('maintenance-deadline-expired');
+            if (maintenanceFenceError) throw new Error(maintenanceFenceError);
+        },
         logger: {
             info: mock.fn(),
             warn: mock.fn(),
@@ -199,7 +208,7 @@ await mock.module('@propr/core', {
         loadSettings: mock.fn(async () => mockSettings),
         loadSummarizationSettings: mock.fn(async () => ({ agent_alias: '' })),
         runLightweightLLMAnalysis: mock.fn(async () => 'Resolve merge conflicts'),
-        db: Object.assign(mock.fn(() => ({ where: mock.fn(() => ({ update: mock.fn(async () => {}) })) })), {
+        db: Object.assign(mock.fn(taskDatabase), {
             migrate: { latest: mock.fn(async () => {}) }
         }),
         cleanupWorktree: mockCleanupWorktree,
@@ -284,6 +293,10 @@ function resetAllMocks() {
     mockRedisStore.clear();
     mockSettings = {};
     refuseCompletedHistoryWrite = false;
+    maintenanceFenceError = undefined;
+    delete persistedTask.commit_hash;
+    updateTaskRow.mock.resetCalls();
+    mockStateManager.markTaskFailed.mock.resetCalls();
     completionDatabase.reset();
 }
 
@@ -581,7 +594,7 @@ for (const cancelAt of ['worker-start', 'before-push', 'after-push'] as const) t
     if (cancelAt === 'after-push') { assert.equal(result.pushedHead, 'abc1234567890'); assert.equal(terminal.historyMetadata.pushedHead, result.pushedHead); }
 });
 
-for (const outcome of ['published', 'no-change', 'outside-scope', 'conflict-outside-scope', 'published-before-cancel'] as const) {
+for (const outcome of ['published', 'no-change', 'outside-scope', 'conflict-outside-scope', 'published-before-cancel', 'deadline-after-push', 'pause-after-push', 'competing-after-push', 'comment-failure', 'settled-failed', 'deadline-before-push', 'pause-before-push', 'competing-before-push'] as const) {
     test(`maintenance worker reports ${outcome} through existing settlement`, async () => {
         const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
         const { execFileSync } = await import('node:child_process');
@@ -602,7 +615,17 @@ for (const outcome of ['published', 'no-change', 'outside-scope', 'conflict-outs
             mockMergeBaseIntoBranch.mock.mockImplementation(async () => outcome === 'conflict-outside-scope'
                 ? { outcome: 'conflicts', conflictedFiles: ['forbidden.txt'] } as never : { outcome: 'clean' });
             mockStateManager.getTaskState.mock.mockImplementation(async () => ({ claudeResult: { success: true, resultPhase: 'final' } }) as never);
+            mockOctokit.request.mock.mockImplementation(async (route?: string) => {
+                if (route?.startsWith('PATCH')) {
+                    assert.equal(mockStateManager.updateTaskState.mock.calls.at(-1)?.arguments[1], 'completed');
+                    assert.equal(persistedTask.commit_hash, git(['rev-parse', 'HEAD']));
+                    if (outcome === 'comment-failure') throw new Error('GitHub PATCH failed');
+                }
+                return { data: { id: 100, html_url: 'https://github.com/test' } };
+            });
             mockAgent.executeTask.mock.mockImplementation(async () => {
+                if (outcome.endsWith('before-push')) maintenanceFenceError = outcome;
+                if (outcome === 'deadline-before-push') job.data.executionAdmissionReceipt.executionDeadline = new Date(0).toISOString();
                 if (outcome === 'outside-scope') await writeFile(`${root}/forbidden.txt`, 'unrelated');
                 else if (outcome !== 'no-change') await writeFile(`${root}/allowed.txt`, 'resolved');
                 return mockAgentResult;
@@ -611,25 +634,57 @@ for (const outcome of ['published', 'no-change', 'outside-scope', 'conflict-outs
                 if (outcome !== 'no-change') { git(['add', '.']); git(['commit', '-m', 'resolved']); }
                 return { commitHash: git(['rev-parse', 'HEAD']), commitMessage: 'resolved' };
             });
+            refuseCompletedHistoryWrite = outcome === 'settled-failed';
             mockPushBranch.mock.mockImplementation(async () => {
+                if (outcome.endsWith('after-push')) maintenanceFenceError = outcome;
+                if (outcome === 'deadline-after-push') job.data.executionAdmissionReceipt.executionDeadline = new Date(0).toISOString();
                 if (outcome === 'published-before-cancel') mockRedisStore.set(cancellation.cancelledExecutionAdmissionKey('maintenance'), 'cancelled');
             });
+            if (outcome.endsWith('before-push')) {
+                await assert.rejects(() => processMergeConflictJob(job), outcome === 'deadline-before-push' ? /maintenance-deadline-expired/ : new RegExp(outcome));
+                assert.equal(mockPushBranch.mock.callCount(), 0);
+                return;
+            }
             if (outcome.endsWith('outside-scope')) {
                 await assert.rejects(() => processMergeConflictJob(job), /maintenance-(scope-changed|conflict-outside-scope)/);
                 assert.equal(mockPushBranch.mock.callCount(), 0);
                 if (outcome === 'conflict-outside-scope') assert.equal(mockAgent.executeTask.mock.callCount(), 0);
             } else {
                 const result = await processMergeConflictJob(job);
-                assert.equal(result.status, outcome === 'published-before-cancel' ? outcome : 'complete');
+                assert.equal(result.status, outcome === 'settled-failed' ? 'failed' : 'complete');
+                assert.equal(result.commit, git(['rev-parse', 'HEAD']));
+                assert.equal(persistedTask.commit_hash, result.commit);
+                if (outcome === 'settled-failed') {
+                    assert.equal(result.pushedHead, result.commit);
+                    assert.equal(result.reason, 'completion_history_not_durable');
+                    const failed: any = mockStateManager.markTaskFailed.mock.calls[0].arguments[2];
+                    assert.equal(failed.commitHash, result.commit);
+                    assert.equal(failed.historyMetadata.pushedHead, result.commit);
+                    assert.equal(failed.historyMetadata.settlement, 'published');
+                    assert.equal(failed.historyMetadata.completionPersistenceFailed, true);
+                    assert.equal(mockOctokit.request.mock.calls.filter(c => c.arguments[0]?.startsWith('PATCH')).length, 0);
+                    return;
+                }
+                assert.equal(mockStateManager.markTaskFailed.mock.callCount(), 0);
+                assert.equal(mockStateManager.updateTaskState.mock.calls.filter(c => c.arguments[1] === 'failed').length, 0);
                 assert.equal(mockPushBranch.mock.calls[0].arguments[2].expectedHeadSha, head);
                 const agentOptions = mockAgent.executeTask.mock.calls[0].arguments[0];
                 assert.ok(agentOptions.timeoutMs > 0 && agentOptions.timeoutMs <= 60000);
                 assert.match(agentOptions.prompt, /allowed.txt/);
             }
             const terminal: any = mockStateManager.updateTaskState.mock.calls.at(-1)?.arguments[2];
-            assert.equal(terminal.historyMetadata.settlement, outcome.endsWith('outside-scope') ? 'failed' : outcome);
+            assert.equal(terminal.historyMetadata.settlement, outcome.endsWith('outside-scope') ? 'failed' : outcome === 'no-change' ? 'no-change' : 'published');
             assert.equal(terminal.historyMetadata.admissionId, 'maintenance');
             assert.equal(terminal.historyMetadata.operationId, 'maintenance-op');
+            if (!outcome.endsWith('outside-scope')) {
+                assert.equal(mockStateManager.updateTaskState.mock.calls.at(-1)?.arguments[1], 'completed');
+                assert.equal(terminal.commitHash, git(['rev-parse', 'HEAD']));
+                assert.equal(terminal.historyMetadata.pushedHead, terminal.commitHash);
+                assert.equal(terminal.requireDurableHistory, true);
+                if (outcome.endsWith('after-push') || outcome === 'published-before-cancel') {
+                    assert.equal(mockOctokit.request.mock.calls.filter(c => c.arguments[0]?.startsWith('PATCH')).length, 0);
+                }
+            }
         } finally { await rm(root, { recursive: true, force: true }); }
     });
 }

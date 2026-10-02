@@ -213,27 +213,20 @@ export async function handleMergeWithAgent(options: {
     await options.beforePublish?.();
     await pushBranch(worktreeInfo.worktreePath, branchName, { repoUrl, authToken: githubToken.token, ...(maintenance ? { expectedHeadSha: maintenance.headSha } : {}) });
     options.onPushed?.(finalCommitHash);
-    if (maintenance) await db('tasks').where({ task_id: taskId }).update({ commit_hash: finalCommitHash });
 
-    const taskUrl = `${process.env.WEB_UI_URL || process.env.FRONTEND_URL || 'https://gitfix.dev'}/tasks/${taskId}`;
-    const comment = buildMergeConflictComment({
-        wasCleanMerge,
-        commitHash: finalCommitHash, baseBranch, headBranch: branchName, conflictedFiles,
-        resolutionSummary: claudeResult.summary, model: claudeResult.model || resolvedModel,
-        executionTimeMs: claudeResult.executionTime, taskUrl,
-    });
-
-    await options.beforePublish?.();
-    await octokit.request('PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}', {
-        owner: repoOwner, repo: repoName, comment_id: startingCommentId, body: comment,
-    });
+    // Maintenance authorization ends at the acknowledged push. Later fence changes can
+    // suppress notifications, but must not erase the publication from task history.
+    if (!maintenance) await options.beforePublish?.();
     // `completed` is published only once the final execution evidence is durable; the evidence
     // rides on the completed entry itself. See completedExecutionDurability.ts.
-    await publishCompletedWithDurableExecutionEvidence({
+    const completion = await publishCompletedWithDurableExecutionEvidence({
         stateManager, taskId, correlatedLogger, operationId,
         metadata: {
             reason: 'Merge conflict resolution completed successfully', commitHash: finalCommitHash,
             claudeResult: executionSummary,
+            ...(maintenance ? { durableCommit: async (transaction: import('knex').Knex.Transaction) => {
+                await transaction('tasks').where({ task_id: taskId }).update({ commit_hash: finalCommitHash });
+            } } : {}),
             historyMetadata: {
                 ...await buildMergeCompletionHistoryMetadata({
                     stateManager, taskId, pullRequestNumber, baseBranch, headBranch: branchName,
@@ -248,6 +241,28 @@ export async function handleMergeWithAgent(options: {
         await db('tasks').where({ task_id: taskId }).update({ commit_hash: finalCommitHash });
     } catch (dbError) {
         correlatedLogger.warn({ taskId, error: (dbError as Error).message }, 'Failed to save commit hash to database');
+    }
+
+    if (completion.outcome === 'settled_failed') {
+        return { status: 'failed', reason: 'completion_history_not_durable', commit: finalCommitHash,
+            pushedHead: finalCommitHash, pullRequestNumber };
+    }
+
+    try {
+        if (maintenance) await options.beforePublish?.();
+        const taskUrl = `${process.env.WEB_UI_URL || process.env.FRONTEND_URL || 'https://gitfix.dev'}/tasks/${taskId}`;
+        const comment = buildMergeConflictComment({
+            wasCleanMerge,
+            commitHash: finalCommitHash, baseBranch, headBranch: branchName, conflictedFiles,
+            resolutionSummary: claudeResult.summary, model: claudeResult.model || resolvedModel,
+            executionTimeMs: claudeResult.executionTime, taskUrl,
+        });
+        await octokit.request('PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}', {
+            owner: repoOwner, repo: repoName, comment_id: startingCommentId, body: comment,
+        });
+    } catch (commentError) {
+        correlatedLogger.warn({ taskId, commitHash: finalCommitHash, error: (commentError as Error).message },
+            'Merge completed, but the completion comment could not be published');
     }
 
     correlatedLogger.info({

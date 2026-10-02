@@ -64,18 +64,37 @@ interface DisableAutoMergeGraphQLResponse {
  * @param options - Options for enabling auto-merge
  * @returns Result indicating success or failure
  */
+type RepoMergeSettings = { allow_squash_merge?: boolean; allow_merge_commit?: boolean; allow_rebase_merge?: boolean };
+
+/**
+ * The merge method GitHub accepts for this repository: squash when allowed (the historical
+ * default), otherwise a merge commit, otherwise rebase. Requesting a method the repository
+ * disallows makes GitHub refuse auto-merge.
+ */
+async function allowedMergeMethod(
+    octokit: Awaited<ReturnType<typeof getAuthenticatedOctokit>>,
+    owner: string,
+    repoName: string,
+): Promise<AutoMergeMethod> {
+    const { data } = await octokit.request('GET /repos/{owner}/{repo}', { owner, repo: repoName }) as { data: RepoMergeSettings };
+    if (data.allow_squash_merge !== false) return 'SQUASH';
+    if (data.allow_merge_commit !== false) return 'MERGE';
+    return 'REBASE';
+}
+
 export async function enableAutoMerge(options: EnableAutoMergeOptions): Promise<EnableAutoMergeResult> {
     const {
         owner,
         repoName,
         prNumber,
-        mergeMethod = 'SQUASH',
+        mergeMethod: requestedMergeMethod,
         commitHeadline,
         commitBody
     } = options;
 
     try {
         const octokit = await getAuthenticatedOctokit();
+        const mergeMethod = requestedMergeMethod ?? await allowedMergeMethod(octokit, owner, repoName);
 
         logger.info({
             owner,

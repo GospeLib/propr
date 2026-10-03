@@ -55,7 +55,8 @@ const p = {
   scope: ["src"],
   issueNumber: 1,
   expiresAt: new Date(Date.now() + 60000).toISOString(),
-  requestId: milestoneRequestId("EP-x", "m1", "o/r", "a".repeat(40), "b".repeat(40)),
+  attempt: 0,
+  requestId: milestoneRequestId("EP-x", "m1", "o/r", "a".repeat(40), "b".repeat(40), 0),
 };
 const token = signMilestoneRequest(p, SECRET);
 const request = (body: unknown, internal = true) => ({

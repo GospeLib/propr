@@ -24,20 +24,35 @@ export interface MilestoneMaintenanceRequest {
   scope: string[];
   issueNumber: number;
   expiresAt: string;
+  /** How many earlier requests for these exact heads Ezer closed as invalidated. */
+  attempt: number;
 }
 export interface MilestoneMaintenanceJob {
   token: string;
 }
-/** One request per (recorded head, source), mirroring Ezer: a superseded request gets a new id. */
+/**
+ * One request per (recorded head, source, attempt), mirroring Ezer: a superseded or invalidated
+ * request is asked again under a new id.
+ */
 export function milestoneRequestId(
   epicId: string,
   milestoneId: string,
   repository: string,
   fromHead: string,
   sourceSha: string,
+  attempt: number,
 ): string {
   return createHash("sha256")
-    .update(JSON.stringify([epicId, milestoneId, repository, fromHead, sourceSha]))
+    .update(
+      JSON.stringify([
+        epicId,
+        milestoneId,
+        repository,
+        fromHead,
+        sourceSha,
+        attempt,
+      ]),
+    )
     .digest("hex");
 }
 export function milestoneCommitMessage(requestId: string): string {
@@ -100,6 +115,8 @@ export function readMilestoneRequest(
     !Number.isSafeInteger(p.issueNumber) ||
     p.issueNumber < 1 ||
     !Number.isFinite(Date.parse(p.expiresAt)) ||
+    !Number.isSafeInteger(p.attempt) ||
+    p.attempt < 0 ||
     !Array.isArray(p.scope) ||
     p.scope.length === 0 ||
     p.scope.some(
@@ -110,7 +127,14 @@ export function readMilestoneRequest(
         path.split("/").includes(".."),
     ) ||
     p.requestId !==
-      milestoneRequestId(p.epicId, p.milestoneId, p.repository, p.fromHead, p.sourceSha)
+      milestoneRequestId(
+        p.epicId,
+        p.milestoneId,
+        p.repository,
+        p.fromHead,
+        p.sourceSha,
+        p.attempt,
+      )
   )
     throw Error("MILESTONE_REQUEST_INVALID");
   return p;

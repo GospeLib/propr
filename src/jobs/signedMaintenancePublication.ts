@@ -11,12 +11,22 @@ export async function publishSignedMaintenanceCommit(input: {
     branch: string;
     headSha: string;
     baseSha: string;
+    /** The exact base commit Git merged (the verified base tip); the commit's second parent. */
+    mergedBaseSha: string;
     commitMessage: string;
     beforePublish: () => Promise<void>;
 }): Promise<string> {
     const { octokit, owner, repo, worktreePath, branch, headSha } = input;
     const git = (args: string[]) => execFileSync('git', args, { cwd: worktreePath, maxBuffer: 100 * 1024 * 1024 });
-    const baseSha = mergedBaseCommit(git, headSha, input.baseSha);
+    // The second parent is the base commit the worker actually merged, never the older admitted base
+    // (GitHub would then show every later base change as part of the pull request). It must still
+    // contain the admitted base.
+    const baseSha = input.mergedBaseSha;
+    try {
+        git(['merge-base', '--is-ancestor', input.baseSha, baseSha]);
+    } catch {
+        throw new Error('maintenance-base-moved');
+    }
     const localHead = git(['rev-parse', 'HEAD']).toString().trim();
     const treeSha = snapshotWorktree(worktreePath);
     const readHead = async () => {
@@ -84,39 +94,4 @@ export async function publishSignedMaintenanceCommit(input: {
     // The atomic update acknowledgement is the publication boundary. Do not insert
     // fallible readbacks here: the worker must now persist the acknowledged commit.
     return commit;
-}
-
-/**
- * The base commit Git actually merged: MERGE_HEAD while a conflicted merge is being resolved, or
- * the second parent of Git's own clean merge commit on the admitted head. The worker merges the
- * base tip (which only moved forward from the admitted base), so the published commit must name
- * that tip as its second parent; naming the older admitted base would make GitHub show every
- * later base change as part of the pull request. With no merge made, the admitted base stands.
- */
-function isAncestor(git: (args: string[]) => Buffer, ancestor: string, descendant: string): boolean {
-    try {
-        git(['merge-base', '--is-ancestor', ancestor, descendant]);
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-function mergedBaseCommit(git: (args: string[]) => Buffer, headSha: string, admittedBase: string): string {
-    let merged: string | undefined;
-    try {
-        merged = git(['rev-parse', '-q', '--verify', 'MERGE_HEAD']).toString().trim();
-    } catch {
-        const [current, first, second, ...rest] = git(['rev-list', '--parents', '-n', '1', 'HEAD']).toString().trim().split(' ');
-        if (first === headSha && second && rest.length === 0) merged = second;
-        // A fast-forward: the admitted head was already in the base, and Git moved HEAD to the tip.
-        else if (current !== headSha && isAncestor(git, headSha, current)) merged = current;
-    }
-    if (!merged) return admittedBase;
-    try {
-        git(['merge-base', '--is-ancestor', admittedBase, merged]);
-    } catch {
-        throw new Error('maintenance-base-moved');
-    }
-    return merged;
 }

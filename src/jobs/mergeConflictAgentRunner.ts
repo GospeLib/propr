@@ -119,6 +119,8 @@ export async function handleMergeWithAgent(options: {
     executionAdmissionReceipt?: import('@propr/core').WorkerAdmissionReceipt;
     beforePublish?: () => Promise<void>;
     onPushed?: (head: string) => void;
+    /** The exact base commit Git merged for an Ezer maintenance request. */
+    mergedBaseSha?: string;
     conflictedFiles?: string[];
     worktreeInfo: WorktreeInfo;
     branchName: string;
@@ -212,7 +214,8 @@ export async function handleMergeWithAgent(options: {
     if (maintenance) {
         finalCommitHash = await publishSignedMaintenanceCommit({
             octokit, owner: repoOwner, repo: repoName, worktreePath: worktreeInfo.worktreePath,
-            branch: branchName, headSha: maintenance.headSha, baseSha: maintenance.baseSha, commitMessage,
+            branch: branchName, headSha: maintenance.headSha, baseSha: maintenance.baseSha,
+            mergedBaseSha: options.mergedBaseSha ?? maintenance.baseSha, commitMessage,
             beforePublish: async () => {
                 await options.beforePublish?.();
                 const written = changedSinceSnapshot(worktreeInfo.worktreePath, preAgentSnapshot!);

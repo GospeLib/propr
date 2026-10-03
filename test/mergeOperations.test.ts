@@ -167,7 +167,10 @@ test('maintenance merges the base tip when the admitted base is its ancestor, an
     // The base only moved forward: the admitted commit is an ancestor of the tip.
     mockGitInstance.raw.mock.mockImplementation(async () => '');
     mockGitInstance.raw.mock.resetCalls();
-    assert.equal((await mergeBaseIntoBranch('/tmp/worktree', 'stage', admitted)).outcome, 'clean');
+    const forward = await mergeBaseIntoBranch('/tmp/worktree', 'stage', admitted);
+    assert.equal(forward.outcome, 'clean');
+    // The exact tip merged is reported, so publication names it as the second parent.
+    assert.equal(forward.mergedBaseSha, tip);
     const calls = mockGitInstance.raw.mock.calls.map(call => JSON.stringify(call.arguments[0]));
     assert.ok(calls.includes(JSON.stringify(['merge-base', '--is-ancestor', admitted, tip])));
     assert.ok(calls.includes(JSON.stringify(['merge', tip, '--no-edit'])));

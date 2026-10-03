@@ -35,6 +35,9 @@ await mock.module('ioredis', {
                 on: mock.fn(),
                 connect: mock.fn(async () => {}),
                 quit: mock.fn(async () => {}),
+                disconnect: mock.fn(() => {}),
+                // The signed-Ezer replay reads its cancellation marker: absent means not cancelled.
+                get: mock.fn(async () => null),
             };
         },
     },

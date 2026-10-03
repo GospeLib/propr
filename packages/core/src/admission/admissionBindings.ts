@@ -51,14 +51,22 @@ export interface SourceAdmissionBinding {
     headBranch: string;
     mode: 'fix' | 'review' | 'ultrafix' | 'merge';
     model?: string;
+    /**
+     * Whose authority the source carries. Absent: the owner's own message. `ezer-review`: Ezer's
+     * own review of an epic story asked for this fix, and the source is ProPR's review comment.
+     */
+    authority?: typeof EZER_REVIEW_AUTHORITY;
 }
+
+/** A fix Ezer starts from its own review of an epic story (owner decision, 2026-10-03). */
+export const EZER_REVIEW_AUTHORITY = 'ezer-review';
 
 export interface SourceAdmissionStep { loopId: string; ordinal: number }
 
 export function parseSourceBinding(value: unknown): SourceAdmissionBinding {
     if (!value || typeof value !== 'object' || Array.isArray(value)) refuse('invalid-source');
     const v = value as Record<string, unknown>;
-    const keys = ['kind', 'id', 'authorId', 'generation', 'bodyDigest', 'revisionAt', 'headSha', 'headBranch', 'mode', 'model'];
+    const keys = ['kind', 'id', 'authorId', 'generation', 'bodyDigest', 'revisionAt', 'headSha', 'headBranch', 'mode', 'model', 'authority'];
     if (Object.keys(v).some(key => !keys.includes(key)) ||
         !['issue_comment', 'review_comment', 'review'].includes(String(v.kind)) ||
         !['fix', 'review', 'ultrafix', 'merge'].includes(String(v.mode))) refuse('invalid-source');
@@ -69,10 +77,14 @@ export function parseSourceBinding(value: unknown): SourceAdmissionBinding {
         typeof v.headSha !== 'string' || !/^[a-f0-9]{40}$/.test(v.headSha)) refuse('invalid-source');
     if (v.model !== undefined && (!['fix', 'review'].includes(String(v.mode)) ||
         typeof v.model !== 'string' || !v.model || /\s/.test(v.model))) refuse('invalid-source-model');
+    // Ezer's own review may only ever ask for a plain fix, from an issue comment.
+    if (v.authority !== undefined && (v.authority !== EZER_REVIEW_AUTHORITY || v.kind !== 'issue_comment' ||
+        v.mode !== 'fix')) refuse('invalid-source-authority');
     return { kind: v.kind as SourceAdmissionBinding['kind'], id: Number(v.id), authorId: Number(v.authorId),
         generation: Number(v.generation), bodyDigest: v.bodyDigest, revisionAt: requireIsoTimestamp(v.revisionAt, 'invalid-source-revision'),
         headSha: v.headSha, headBranch: requiredString(v.headBranch, 'invalid-source-branch'),
-        mode: v.mode as SourceAdmissionBinding['mode'], ...(v.model === undefined ? {} : { model: v.model as string }) };
+        mode: v.mode as SourceAdmissionBinding['mode'], ...(v.model === undefined ? {} : { model: v.model as string }),
+        ...(v.authority === undefined ? {} : { authority: EZER_REVIEW_AUTHORITY }) };
 }
 
 export function parseSourceStep(value: unknown): SourceAdmissionStep {

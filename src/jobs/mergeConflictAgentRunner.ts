@@ -1,3 +1,4 @@
+import { publishSignedMaintenanceCommit } from './signedMaintenancePublication.js';
 import { changedSinceSnapshot, snapshotWorktree } from './maintenanceWrittenPaths.js';
 import { buildAdmittedWorkerEnvironment } from './ezerAdmittedWorkerEnvironment.js';
 import type { Logger } from 'pino';
@@ -118,6 +119,8 @@ export async function handleMergeWithAgent(options: {
     executionAdmissionReceipt?: import('@propr/core').WorkerAdmissionReceipt;
     beforePublish?: () => Promise<void>;
     onPushed?: (head: string) => void;
+    /** The exact base commit Git merged for an Ezer maintenance request. */
+    mergedBaseSha?: string;
     conflictedFiles?: string[];
     worktreeInfo: WorktreeInfo;
     branchName: string;
@@ -207,11 +210,25 @@ export async function handleMergeWithAgent(options: {
         model: claudeResult.model || resolvedModel, wasCleanMerge,
     });
     await options.beforePublish?.();
-    const commitResult = await commitChanges(worktreeInfo.worktreePath, commitMessage, AI_COMMIT_AUTHOR, { issueNumber: pullRequestNumber, issueTitle: wasCleanMerge ? 'Verify clean merge' : 'Resolve merge conflicts' });
-    const { simpleGit } = await import('simple-git');
-    const finalCommitHash = commitResult?.commitHash || (await simpleGit({ baseDir: worktreeInfo.worktreePath }).revparse(['HEAD'])).trim();
-    await options.beforePublish?.();
-    await pushBranch(worktreeInfo.worktreePath, branchName, { repoUrl, authToken: githubToken.token, ...(maintenance ? { expectedHeadSha: maintenance.headSha } : {}) });
+    let finalCommitHash: string;
+    if (maintenance) {
+        finalCommitHash = await publishSignedMaintenanceCommit({
+            octokit, owner: repoOwner, repo: repoName, worktreePath: worktreeInfo.worktreePath,
+            branch: branchName, headSha: maintenance.headSha, baseSha: maintenance.baseSha,
+            mergedBaseSha: options.mergedBaseSha ?? maintenance.baseSha, commitMessage,
+            beforePublish: async () => {
+                await options.beforePublish?.();
+                const written = changedSinceSnapshot(worktreeInfo.worktreePath, preAgentSnapshot!);
+                if (!scope?.length || written.some(path => !isWithinMergeScope(path, scope))) throw new Error('maintenance-scope-changed');
+            },
+        });
+    } else {
+        const commitResult = await commitChanges(worktreeInfo.worktreePath, commitMessage, AI_COMMIT_AUTHOR, { issueNumber: pullRequestNumber, issueTitle: wasCleanMerge ? 'Verify clean merge' : 'Resolve merge conflicts' });
+        const { simpleGit } = await import('simple-git');
+        finalCommitHash = commitResult?.commitHash || (await simpleGit({ baseDir: worktreeInfo.worktreePath }).revparse(['HEAD'])).trim();
+        await options.beforePublish?.();
+        await pushBranch(worktreeInfo.worktreePath, branchName, { repoUrl, authToken: githubToken.token });
+    }
     options.onPushed?.(finalCommitHash);
 
     // Maintenance authorization ends at the acknowledged push. Later fence changes can

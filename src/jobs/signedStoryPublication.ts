@@ -5,11 +5,8 @@ import { join } from 'node:path';
 import type { CommitResult, StoryExecutionContract } from '@propr/core';
 import { verifyStoryPublication } from '@propr/core';
 import { simpleGit, type SimpleGit } from 'simple-git';
+import { assertCommit, createVerifiedGitCommit, record, sha, type Api } from './signedGitPublication.js';
 import { buildStoryCommitMessage } from './publicationMetadata.js';
-
-interface Api {
-    request(endpoint: string, options: Record<string, unknown>): Promise<{ data: unknown }>;
-}
 
 interface PublicationSnapshot {
     path: string;
@@ -32,7 +29,6 @@ const GET_COMMIT_ENDPOINT = 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}'
 const GET_TREE_ENDPOINT = 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}';
 const CREATE_BLOB_ENDPOINT = 'POST /repos/{owner}/{repo}/git/blobs';
 const CREATE_TREE_ENDPOINT = 'POST /repos/{owner}/{repo}/git/trees';
-const CREATE_COMMIT_ENDPOINT = 'POST /repos/{owner}/{repo}/git/commits';
 const CREATE_REF_ENDPOINT = 'POST /repos/{owner}/{repo}/git/refs';
 const UPDATE_REF_ENDPOINT = 'PATCH /repos/{owner}/{repo}/git/refs/{ref}';
 const HEADS_PREFIX = 'heads/';
@@ -46,36 +42,21 @@ const EXECUTABLE_FILE_MODE = '100755';
 const SYMBOLIC_LINK_MODE = '120000';
 const EXECUTABLE_MASK = 0o111;
 const NOT_FOUND_STATUS = 404;
-const EXPECTED_PARENT_COUNT = 1;
-const SHA_PATTERN = /^[a-f0-9]{40}$/;
 const GIT_OBJECT_HEADER_SEPARATOR = '\0';
 const GIT_BLOB_HEADER = 'blob';
 const GIT_SHA_ALGORITHM = 'sha1';
-const VERIFIED_REASON = 'valid';
 const RECURSIVE_TREE_VALUE = '1';
 
+const ERROR_API_RESPONSE = 'STORY_SIGNED_PUBLICATION_API_RESPONSE_INVALID';
 const ERROR_COMMIT_MESSAGE = 'STORY_SIGNED_PUBLICATION_COMMIT_MESSAGE';
 const ERROR_LOCAL_HISTORY = 'STORY_SIGNED_PUBLICATION_LOCAL_HISTORY_CHANGED';
 const ERROR_BASE_CHANGED = 'STORY_SIGNED_PUBLICATION_BASE_CHANGED';
 const ERROR_FILE_TYPE = 'STORY_SIGNED_PUBLICATION_FILE_TYPE';
 const ERROR_BLOB_MISMATCH = 'STORY_SIGNED_PUBLICATION_BLOB_MISMATCH';
 const ERROR_TREE_MISMATCH = 'STORY_SIGNED_PUBLICATION_TREE_MISMATCH';
-const ERROR_COMMIT_MISMATCH = 'STORY_SIGNED_PUBLICATION_COMMIT_MISMATCH';
-const ERROR_UNVERIFIED = 'STORY_SIGNED_PUBLICATION_UNVERIFIED';
 const ERROR_WORKTREE_CHANGED = 'STORY_SIGNED_PUBLICATION_WORKTREE_CHANGED';
 const ERROR_REF_CHANGED = 'STORY_SIGNED_PUBLICATION_REF_CHANGED';
 const ERROR_READBACK_CHANGED = 'STORY_SIGNED_PUBLICATION_READBACK_CHANGED';
-const ERROR_API_RESPONSE = 'STORY_SIGNED_PUBLICATION_API_RESPONSE_INVALID';
-
-function record(value: unknown): Record<string, unknown> {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(ERROR_API_RESPONSE);
-    return value as Record<string, unknown>;
-}
-
-function sha(value: unknown, errorCode = ERROR_API_RESPONSE): string {
-    if (typeof value !== 'string' || !SHA_PATTERN.test(value)) throw new Error(errorCode);
-    return value;
-}
 
 function status(error: unknown): number | undefined {
     return error && typeof error === 'object' && 'status' in error
@@ -198,34 +179,6 @@ function assertExactTreeDelta(
     }
 }
 
-function assertVerified(value: unknown): void {
-    const verification = record(value);
-    if (verification.verified !== true || verification.reason !== VERIFIED_REASON ||
-        typeof verification.signature !== 'string' || verification.signature.trim().length === 0 ||
-        typeof verification.payload !== 'string' || verification.payload.trim().length === 0) {
-        throw new Error(ERROR_UNVERIFIED);
-    }
-}
-
-function assertCommit(value: unknown, expected: {
-    commitSha?: string;
-    baseSha: string;
-    treeSha: string;
-    message: string;
-}): string {
-    const commit = record(value);
-    const commitSha = sha(commit.sha, ERROR_COMMIT_MISMATCH);
-    const treeSha = sha(record(commit.tree).sha, ERROR_COMMIT_MISMATCH);
-    const parents = commit.parents;
-    if ((expected.commitSha && commitSha !== expected.commitSha) || treeSha !== expected.treeSha ||
-        commit.message !== expected.message || !Array.isArray(parents) || parents.length !== EXPECTED_PARENT_COUNT ||
-        sha(record(parents[0]).sha, ERROR_COMMIT_MISMATCH) !== expected.baseSha) {
-        throw new Error(ERROR_COMMIT_MISMATCH);
-    }
-    assertVerified(commit.verification);
-    return commitSha;
-}
-
 async function assertStableWorktree(input: {
     git: SimpleGit;
     worktreePath: string;
@@ -278,7 +231,7 @@ export async function publishSignedStoryCommit(options: {
         })).data);
         const existingTreeSha = sha(record(existing.tree).sha, ERROR_TREE_MISMATCH);
         assertCommit(existing, {
-            commitSha: priorRef, baseSha: execution.baseSha, treeSha: existingTreeSha, message: commitMessage,
+            commitSha: priorRef, parents: [execution.baseSha], treeSha: existingTreeSha, message: commitMessage,
         });
         const [baseTree, existingTree] = await Promise.all([
             fetchLeafTree({ octokit, owner, repo, treeSha: baseTreeSha }),
@@ -319,23 +272,8 @@ export async function publishSignedStoryCommit(options: {
     ]);
     assertExactTreeDelta(baseTree, createdTree, snapshots);
 
-    const createdCommit = assertCommit((await octokit.request(CREATE_COMMIT_ENDPOINT, {
-        owner,
-        repo,
-        message: commitMessage,
-        tree: createdTreeSha,
-        parents: [execution.baseSha],
-    })).data, { baseSha: execution.baseSha, treeSha: createdTreeSha, message: commitMessage });
-    const fetchedCommit = (await octokit.request(GET_COMMIT_ENDPOINT, {
-        owner,
-        repo,
-        commit_sha: createdCommit,
-    })).data;
-    assertCommit(fetchedCommit, {
-        commitSha: createdCommit,
-        baseSha: execution.baseSha,
-        treeSha: createdTreeSha,
-        message: commitMessage,
+    const createdCommit = await createVerifiedGitCommit({
+        octokit, owner, repo, parents: [execution.baseSha], treeSha: createdTreeSha, message: commitMessage,
     });
 
     await assertStableWorktree({ git, worktreePath, execution, paths, snapshots });

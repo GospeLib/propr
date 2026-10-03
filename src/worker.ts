@@ -1,3 +1,4 @@
+import { processMilestoneMaintenance } from './jobs/milestoneMaintenance.js';
 import 'dotenv/config';
 import { publishWorkerAgentHealth, WORKER_HEALTH_PREFIX } from './workerAgentHealth.js';
 import { executeIntegration } from '@propr/core';
@@ -330,6 +331,7 @@ async function startWorker(options: WorkerOptions = {}): Promise<StartedWorker> 
             processTaskImportJob,
             processSystemTaskJob,
             processMergeConflictJob,
+            processMilestoneMaintenance,
         },
         startPaused: true,
         beforeRun: configuredWorker => {

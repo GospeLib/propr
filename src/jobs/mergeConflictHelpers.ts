@@ -327,10 +327,4 @@ export async function updateMergeTaskWithKnownPRInfo(options: {
     correlatedLogger.info({ taskId, prTitle, taskTitle, linkedIssueNumber }, 'Updated merge task with PR title and linked issue');
 }
 
-/** Admission scopes name exact files or directory roots (with or without a trailing slash). */
-export function isWithinMergeScope(path: string, scope: readonly string[] | undefined): boolean {
-    return scope?.some(value => {
-        const root = value.replace(/\/+$/, '');
-        return path === root || path.startsWith(`${root}/`);
-    }) ?? false;
-}
+export { isWithinMergeScope } from './mergeScope.js';

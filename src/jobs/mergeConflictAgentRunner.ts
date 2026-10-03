@@ -293,3 +293,35 @@ export async function handleMergeWithAgent(options: {
         claudeResult: { success: claudeResult.success },
     };
 }
+
+/** Same merge-conflict agent, with milestone authority and no fabricated story/PR task. */
+export async function runMilestoneConflictAgent(options: {
+    worktreePath: string;
+    conflicts: string[];
+    request: import('@propr/core').MilestoneMaintenanceRequest;
+    logger: Logger;
+    fence: () => Promise<void>;
+}): Promise<void> {
+    const { request: p } = options;
+    const registry = AgentRegistry.getInstance();
+    await registry.ensureInitialized();
+    const { resolvedAlias, resolvedModel } = await resolveDefaultAgentAndModel(registry, options.logger);
+    const agent = registry.getAgentByAlias(resolvedAlias);
+    if (!agent) throw Error('milestone-agent-unavailable');
+    await options.fence();
+    const [repoOwner, repoName] = p.repository.split('/');
+    const result = await agent.executeTask({
+        worktreePath: options.worktreePath,
+        issueRef: { number: p.issueNumber, repoOwner, repoName },
+        prompt: `Resolve the merge of ${p.sourceSha} into ${p.fromHead} for milestone ${p.epicId}/${p.milestoneId}. Conflicts: ${JSON.stringify(options.conflicts)}. You may edit only ${JSON.stringify(p.scope)}. Leave the result uncommitted. Do not push, change HEAD, switch branches, or change remotes.`,
+        model: resolvedModel,
+        timeoutMs: Math.max(1, Date.parse(p.expiresAt) - Date.now()),
+        branchName: p.branch,
+        taskId: `milestone-${p.requestId}`,
+        githubToken: '',
+        environment: buildAdmittedWorkerEnvironment({ repoOwner, repoName, number: p.issueNumber,
+            baseBranch: p.branch }, `milestone-${p.requestId}`, true),
+    });
+    if (!result.success) throw Error('milestone-conflict-agent-failed');
+    await options.fence();
+}

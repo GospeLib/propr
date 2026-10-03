@@ -22,6 +22,9 @@ export function signedMaintenanceApi(cwd: string, head: string, options: {
             const bytes = Buffer.from(input.content, 'base64');
             const sha = createHash('sha1').update(Buffer.from(`blob ${bytes.length}\0`)).update(bytes).digest('hex');
             blobs.set(sha, bytes);
+            // GitHub stores uploaded blobs before building a tree. The publisher may use an
+            // entirely separate repository, so the fake server cannot rely on shared objects.
+            assert.equal(execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd, input: bytes, encoding: 'utf8' }).trim(), sha);
             return { data: { sha } };
         }
         if (endpoint.endsWith('/git/trees')) {

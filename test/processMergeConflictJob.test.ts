@@ -311,6 +311,29 @@ describe('processMergeConflictJob', () => {
         mockOctokit.request.mock.mockImplementation(async () => ({ data: { id: 100, html_url: 'https://github.com/test' } }));
     });
 
+    test('refreshes an expired pre-agent token before publishing the merge', async () => {
+        let agentFinished = false;
+        let published = false;
+        mockOctokit.auth.mock.mockImplementation(async () => ({ token: agentFinished ? 'fresh' : 'expired' }));
+        mockAgent.executeTask.mock.mockImplementationOnce(async () => {
+            agentFinished = true;
+            return mockAgentResult;
+        });
+        mockPushBranch.mock.mockImplementationOnce(async (...args: any[]) => {
+            const options = args[2];
+            const token = options.tokenRefreshFn ? await options.tokenRefreshFn() : options.authToken;
+            assert.equal(token, 'fresh', 'Git rejects the token minted before the agent');
+            published = true;
+        });
+        try {
+            await processMergeConflictJob(createMockJob());
+            assert.equal(published, true);
+            assert.ok(mockOctokit.auth.mock.callCount() >= 2);
+        } finally {
+            mockOctokit.auth.mock.mockImplementation(async () => ({ token: 'mock-github-token' }));
+        }
+    });
+
     test('clean merge: commits and pushes after agent verification', async () => {
         const job = createMockJob();
         const result = await processMergeConflictJob(job);

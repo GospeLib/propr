@@ -1,4 +1,5 @@
 import { setTimeout } from 'timers/promises';
+import { installationTokenProvider } from './githubTypes.js';
 import type { ClaudeCodeResponse } from '@propr/core';
 import { verifyStoryPublication } from '@propr/core';
 import type { CommitResult } from '@propr/core';
@@ -42,7 +43,7 @@ export interface PostProcessResult {
 }
 
 export async function performPostProcessing(options: PostProcessOptions): Promise<PostProcessResult> {
-    const { octokit, issueRef, worktreeInfo, currentIssueData, claudeResult, modelName, repoValidation, repoUrl, githubToken, PR_LABEL, AI_PROCESSING_TAG, AI_DONE_TAG, correlatedLogger, taskId, stateManager } = options;
+    const { octokit, issueRef, worktreeInfo, currentIssueData, claudeResult, modelName, repoValidation, repoUrl, PR_LABEL, AI_PROCESSING_TAG, AI_DONE_TAG, correlatedLogger, taskId, stateManager } = options;
     let commitResult: CommitResult | null = null;
     let postProcessingResult: PostProcessingResult | null = null;
     let preparedVisualPreview: Awaited<ReturnType<typeof prepareVisualPreviewEvidence>> | undefined;
@@ -107,7 +108,7 @@ export async function performPostProcessing(options: PostProcessOptions): Promis
             return { commitResult, postProcessingResult };
         }
 
-        if (!options.execution?.taskAssignment) await pushBranch(worktreeInfo.worktreePath, worktreeInfo.branchName, { repoUrl, authToken: githubToken.token, execution: options.execution });
+        if (!options.execution?.taskAssignment) await pushBranch(worktreeInfo.worktreePath, worktreeInfo.branchName, { repoUrl, tokenRefreshFn: installationTokenProvider(octokit), execution: options.execution });
 
         correlatedLogger.debug('Waiting for branch propagation...');
         await setTimeout(3000);

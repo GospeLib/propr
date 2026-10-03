@@ -79,6 +79,8 @@ export interface PublishPinnedCheckpointOptions {
     remote?: string;
     repoUrl?: string;
     authToken?: string;
+    /** Resolve current credentials at each network operation, including the first attempt. */
+    tokenRefreshFn?: () => Promise<string>;
 }
 
 /**
@@ -90,9 +92,14 @@ export async function publishPinnedExecutionCheckpoint(options: PublishPinnedChe
     const remote = options.remote ?? DEFAULT_REMOTE;
     const ref = requireExecutionCheckpointRef(options.ref);
     const pin = await pinExecutionCheckpoint(options.repoPath, ref, options.sha);
-    if (options.repoUrl && options.authToken)
-        await setupAuthenticatedRemote(createHooklessGit(options.repoPath), options.repoUrl, options.authToken);
+    const authenticate = async () => {
+        const token = options.tokenRefreshFn ? await options.tokenRefreshFn() : options.authToken;
+        if (options.repoUrl && token)
+            await setupAuthenticatedRemote(createHooklessGit(options.repoPath), options.repoUrl, token);
+    };
+    await authenticate();
     await runCheckpointGit(options.repoPath, ['push', remote, `${options.sha}:${ref}`]);
+    await authenticate();
     const remoteSha = (await runCheckpointGit(options.repoPath, ['ls-remote', remote, ref])).trim().split(/\s+/)[0];
     if (remoteSha !== options.sha) throw Error('EXECUTION_CHECKPOINT_REMOTE_MISMATCH');
     // Published and verified: the remote ref now holds the only copy that must survive.

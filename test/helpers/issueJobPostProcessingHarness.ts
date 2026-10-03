@@ -54,6 +54,8 @@ await mock.module('@propr/core', {
         loadRepositoryVisualPreviewSettings: mock.fn(async () => ({ enabled: false, types: ['image'] })),
         prepareVisualPreviewEvidence: mock.fn(async () => ({ evidence: { assets: [], toolSuggestions: [] } })),
         pushBranch,
+        createWorktreeForIssue: async () => ({ worktreePath: "/tmp/worktree", branchName: "task/signed-timeout" }),
+        updateFileChangesFromWorktree: async () => undefined,
         verifyStoryPublication,
         preserveExecutionCheckpoint,
         resolveRepositoryGitDir,

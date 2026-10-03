@@ -55,6 +55,8 @@ export interface PreserveExecutionCheckpointOptions {
     remote?: string;
     repoUrl?: string;
     authToken?: string;
+    /** Resolve current credentials at each network operation, including the first attempt. */
+    tokenRefreshFn?: () => Promise<string>;
 }
 
 export interface RestoredExecutionCheckpoint {
@@ -147,7 +149,7 @@ export async function preserveExecutionCheckpoint(options: PreserveExecutionChec
         // Never forced: an existing checkpoint for this exact task attempt is kept, not replaced.
         // The pin is released only once the remote is verified to hold this exact SHA.
         await publishPinnedExecutionCheckpoint({ repoPath: options.worktreePath, ref, sha, remote,
-            repoUrl: options.repoUrl, authToken: options.authToken });
+            repoUrl: options.repoUrl, authToken: options.authToken, tokenRefreshFn: options.tokenRefreshFn });
         delete record.localRef;
         record.status = 'preserved';
         return record;

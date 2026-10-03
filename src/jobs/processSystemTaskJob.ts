@@ -119,7 +119,8 @@ async function performGitResetAndPush(
     await git.reset(['--hard', `${commitHash}^`]);
     correlatedLogger.info({ commitHash }, 'Git reset to parent commit complete');
 
-    const authenticatedUrl = repoUrl.replace('https://', `https://x-access-token:${token}@`);
+    const pushAuth = await octokit.auth({ type: "installation" }) as { token: string };
+    const authenticatedUrl = repoUrl.replace('https://', `https://x-access-token:${pushAuth.token}@`);
     try {
         await git.push([authenticatedUrl, prBranch, '--force']);
     } catch (error) {

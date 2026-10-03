@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
-import { pushBranch, redactAuthenticatedGitUrl } from '../packages/core/src/git/repoBranching.js';
+import { pushBranch, ensureBranchAndPush, redactAuthenticatedGitUrl } from '../packages/core/src/git/repoBranching.js';
 import { addWorktreeWithoutTracking } from '../packages/core/src/git/worktreeCreation.js';
 import { createHooklessGit } from '../packages/core/src/git/hooklessGit.js';
 
@@ -67,7 +67,10 @@ test('pushBranch rebases and retries when remote branch advanced', async () => {
         await git(firstClone, ['commit', '-m', 'local follow-up']);
         const originalLocalCommit = await git(firstClone, ['rev-parse', 'HEAD']);
 
-        const result = await pushBranch(firstClone, 'feature', { rebaseOnNonFastForward: true });
+        let tokenUses = 0;
+        const result = await pushBranch(firstClone, 'feature', { rebaseOnNonFastForward: true, repoUrl: remotePath,
+            tokenRefreshFn: async () => `fresh-${++tokenUses}` });
+        assert.equal(tokenUses, 3, 'resolve credentials separately for push, fetch, and post-rebase push');
         const finalLocalCommit = await git(firstClone, ['rev-parse', 'HEAD']);
         const finalRemoteCommit = await git(firstClone, ['ls-remote', 'origin', 'refs/heads/feature']);
         const remoteLog = await git(firstClone, ['log', '--format=%s', 'origin/feature', '-3']);
@@ -150,5 +153,31 @@ test('maintenance push uses an exact head lease and preserves a competing commit
         await git(local, ['reset', '--hard', admitted]);
         await assert.rejects(() => pushBranch(local, 'feature', { expectedHeadSha: merged }));
         assert.equal(await git(remote, ['rev-parse', 'feature']), merged);
+    } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+for (const robust of [false, true]) test(`${robust ? 'ensureBranchAndPush' : 'pushBranch'} resolves credentials before its first push`, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'propr-fresh-token-'));
+    try {
+        const origin = path.join(root, 'origin.git');
+        const clone = path.join(root, 'clone');
+        await git(root, ['init', '--bare', origin]);
+        await git(root, ['clone', origin, clone]);
+        await configureUser(clone);
+        await writeFile(path.join(clone, 'file.txt'), 'agent output');
+        await git(clone, ['add', '.']);
+        await git(clone, ['commit', '-m', 'agent output']);
+        await git(clone, ['branch', '-M', 'feature']);
+        await git(clone, ['config', `url.${origin}.insteadOf`, 'https://x-access-token:fresh@token-test.invalid/repo.git']);
+        await git(clone, ['config', `url.${origin}-missing.insteadOf`, 'https://x-access-token:expired@token-test.invalid/repo.git']);
+        await git(clone, ['remote', 'set-url', 'origin', 'https://x-access-token:expired@token-test.invalid/repo.git']);
+        let calls = 0;
+        const options = { repoUrl: 'https://token-test.invalid/repo.git', authToken: 'expired',
+            tokenRefreshFn: async () => { calls++; return 'fresh'; } };
+        if (robust) await ensureBranchAndPush(clone, 'feature', 'main', options);
+        else await pushBranch(clone, 'feature', options);
+        assert.equal(await git(origin, ['rev-parse', 'refs/heads/feature']), await git(clone, ['rev-parse', 'HEAD']));
+        assert.ok(calls >= 1);
+        assert.equal(await git(clone, ['config', '--get', 'remote.origin.url']), 'https://x-access-token:fresh@token-test.invalid/repo.git');
     } finally { await rm(root, { recursive: true, force: true }); }
 });

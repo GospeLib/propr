@@ -238,3 +238,38 @@ test('worker checks unchanged digest AND revision, owner identity and head after
     message.updated_at = '2026-09-29T10:00:00Z'; message.user.id = 99; await assert.rejects(() => verifyAdmittedSourceJob(job.data, redis), /scope-changed/);
     message.user.id = 42; pr.head.sha = 'c'.repeat(40); await assert.rejects(() => verifyAdmittedSourceJob(job.data, redis), /headSha/);
 });
+test("Ezer's review authority admits only ProPR's own unedited review comment, as a fix", async () => {
+    process.env.EZER_PROPR_REVIEW_AUTHOR_USER_ID = '77';
+    try {
+        message.user = { id: 77, login: 'propr-dev[bot]' };
+        await pending({ source: source({ authorId: 77, authority: 'ezer-review' }) });
+        const result = await enqueue();
+        assert.deepEqual(result, { mode: 'fix', jobId: 'pr-comments-batch-ezer-typed-1' });
+        const job = (await queue.getJob(result.jobId))!;
+        assert.equal(job.data.executionAdmissionReceipt.source.authority, 'ezer-review');
+        // An edit after it was posted makes it no longer the review Ezer recorded.
+        message.updated_at = '2026-09-29T10:00:01Z';
+        await assert.rejects(() => verifyAdmittedSourceJob(job.data, redis));
+    } finally {
+        delete process.env.EZER_PROPR_REVIEW_AUTHOR_USER_ID;
+    }
+});
+test('Ezer review authority refuses the owner, other authors, other modes and kinds, and an unset identity', async () => {
+    for (const [author, configured, overrides] of [
+        [42, '77', {}],
+        [77, undefined, {}],
+        [77, '77', { mode: 'ultrafix' }],
+        [77, '77', { kind: 'review' }],
+        [77, '77', { authority: 'someone-else' }],
+    ] as const) {
+        await redis.flushdb();
+        if (configured) process.env.EZER_PROPR_REVIEW_AUTHOR_USER_ID = configured;
+        else delete process.env.EZER_PROPR_REVIEW_AUTHOR_USER_ID;
+        message.user = { id: author, login: 'someone' };
+        await pending({ source: source({ authorId: author, authority: 'ezer-review', ...(overrides as object) } as never) });
+        await assert.rejects(() => enqueue({ kind: (overrides as { kind?: string }).kind ?? 'issue_comment' }));
+        assert.equal(await queue.getJob('pr-comments-batch-ezer-typed-1'), undefined);
+    }
+    delete process.env.EZER_PROPR_REVIEW_AUTHOR_USER_ID;
+    message.user = { id: 42, login: 'owner' };
+});

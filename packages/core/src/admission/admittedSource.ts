@@ -10,7 +10,7 @@ import { buildCodeContext } from '../webhook/commentEventHelpers.js';
 import { fenceAdmittedManualCommand } from '../webhook/commentEventHandler.js';
 import { resolveLlmLabel, resolveModelAlias } from '../config/modelAliases.js';
 import { consumeExecutionAdmission, createRedisAdmissionStore, pendingExecutionAdmissionKey, readSignedExecutionAdmission } from './ezerExecutionAdmission.js';
-import { parseSourceBinding, requireExactSource, requireExactSourceStep, refuse, type SourceAdmissionBinding } from './admissionBindings.js';
+import { EZER_REVIEW_AUTHORITY, parseSourceBinding, requireExactSource, requireExactSourceStep, refuse, type SourceAdmissionBinding } from './admissionBindings.js';
 import { executionAdmissionJobKey, requireAdmissionNotCancelled, sourceAdmissionJobId } from './executionAdmissionCancellation.js';
 
 export interface SourceReference { kind: SourceAdmissionBinding['kind']; id: number }
@@ -38,8 +38,12 @@ export async function readLiveAdmissionSource(repository: string, prNumber: numb
     const message = raw as { id: number; body?: string | null; user?: { id: number; login: string } | null;
         issue_url?: string; pull_request_url?: string; state?: string; updated_at?: string; submitted_at?: string | null;
         created_at?: string; path?: string; line?: number | null; diff_hunk?: string };
-    const ownerId = Number(process.env.EZER_OWNER_GITHUB_USER_ID);
-    if (!Number.isSafeInteger(ownerId) || ownerId < 1 || message.user?.id !== ownerId || expected.authorId !== ownerId ||
+    // The owner's own message, or (Ezer's review authority) ProPR's own unchanged review comment.
+    // Each identity is configured and fails closed when it is not.
+    const ezerReview = expected.authority === EZER_REVIEW_AUTHORITY;
+    const authorId = Number(ezerReview ? process.env.EZER_PROPR_REVIEW_AUTHOR_USER_ID : process.env.EZER_OWNER_GITHUB_USER_ID);
+    if (!Number.isSafeInteger(authorId) || authorId < 1 || message.user?.id !== authorId || expected.authorId !== authorId ||
+        (ezerReview && (!message.created_at || message.created_at !== message.updated_at)) ||
         message.id !== expected.id || (expected.kind === 'review' && message.state?.toUpperCase() === 'DISMISSED') ||
         (expected.kind === 'issue_comment' ? message.issue_url !== `https://api.github.com/repos/${repository}/issues/${prNumber}`
             : message.pull_request_url !== `https://api.github.com/repos/${repository}/pulls/${prNumber}`) ||

@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  exactSha,
   milestoneCommitMessage,
   type MilestoneMaintenanceRequest,
 } from "../../packages/core/src/admission/milestoneMaintenance.js";
@@ -46,9 +47,10 @@ export async function executeMilestoneMaintenance(
         "fetch",
         "--quiet",
         "--no-tags",
+        "--",
         ports.repositoryPath,
-        p.fromHead,
-        p.sourceSha,
+        exactSha(p.fromHead),
+        exactSha(p.sourceSha),
       ],
       privateRepository,
     );

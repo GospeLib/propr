@@ -8,6 +8,7 @@ import {
   issueQueue,
   readMilestoneRequest,
   milestoneSignature,
+  exactSha,
   MILESTONE_AUTHORITY_PATH,
   MILESTONE_SIGNATURE_HEADER,
 } from "@propr/core";
@@ -59,9 +60,13 @@ export async function processMilestoneMaintenance(job: Job<{ token: string }>) {
     authToken: token.token,
     baseBranch: p.sourceBranch,
   });
-  execFileSync("git", ["fetch", "origin", p.fromHead, p.sourceSha], {
-    cwd: repositoryPath,
-  });
+  execFileSync(
+    "git",
+    ["fetch", "--", "origin", exactSha(p.fromHead), exactSha(p.sourceSha)],
+    {
+      cwd: repositoryPath,
+    },
+  );
   // BullMQ retries/stalls never spend another agent attempt. Reconciliation belongs to Ezer.
   const redis = (await issueQueue.client) as unknown as import("ioredis").Redis;
   const spent = await redis.set(

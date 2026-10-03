@@ -55,6 +55,11 @@ export function milestoneRequestId(
     )
     .digest("hex");
 }
+/** A full commit SHA, or throws: never let request data reach git as anything but a SHA. */
+export function exactSha(value: string): string {
+  if (!SHA.test(value)) throw Error("MILESTONE_SHA_INVALID");
+  return value;
+}
 export function milestoneCommitMessage(requestId: string): string {
   return `Ezer milestone maintenance ${requestId}`;
 }

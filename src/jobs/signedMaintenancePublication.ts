@@ -93,13 +93,24 @@ export async function publishSignedMaintenanceCommit(input: {
  * that tip as its second parent; naming the older admitted base would make GitHub show every
  * later base change as part of the pull request. With no merge made, the admitted base stands.
  */
+function isAncestor(git: (args: string[]) => Buffer, ancestor: string, descendant: string): boolean {
+    try {
+        git(['merge-base', '--is-ancestor', ancestor, descendant]);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 function mergedBaseCommit(git: (args: string[]) => Buffer, headSha: string, admittedBase: string): string {
     let merged: string | undefined;
     try {
         merged = git(['rev-parse', '-q', '--verify', 'MERGE_HEAD']).toString().trim();
     } catch {
-        const [, first, second, ...rest] = git(['rev-list', '--parents', '-n', '1', 'HEAD']).toString().trim().split(' ');
+        const [current, first, second, ...rest] = git(['rev-list', '--parents', '-n', '1', 'HEAD']).toString().trim().split(' ');
         if (first === headSha && second && rest.length === 0) merged = second;
+        // A fast-forward: the admitted head was already in the base, and Git moved HEAD to the tip.
+        else if (current !== headSha && isAncestor(git, headSha, current)) merged = current;
     }
     if (!merged) return admittedBase;
     try {

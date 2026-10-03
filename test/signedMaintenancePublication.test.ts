@@ -90,3 +90,23 @@ test('refuses a merged base that no longer contains the admitted base', async ()
         );
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
+
+test('names the base tip after a fast-forward (the admitted head was already in the base)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'signed-ff-'));
+    const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+    try {
+        git(['init', '-b', 'feature']); git(['config', 'user.name', 'Test']); git(['config', 'user.email', 'test@example.test']);
+        await writeFile(join(root, 'a'), 'a\n'); git(['add', '.']); git(['commit', '-m', 'head']);
+        const headSha = git(['rev-parse', 'HEAD']);
+        git(['checkout', '-b', 'base']);
+        await writeFile(join(root, 'b'), 'b\n'); git(['add', '.']); git(['commit', '-m', 'base tip']);
+        const tip = git(['rev-parse', 'HEAD']);
+        git(['checkout', 'feature']); git(['merge', '--no-edit', tip]);
+        assert.equal(git(['rev-parse', 'HEAD']), tip);
+        const api = signedMaintenanceApi(root, headSha);
+        await publishSignedMaintenanceCommit({ owner: 'owner', repo: 'repo', worktreePath: root, branch: 'feature', headSha,
+            baseSha: headSha, commitMessage: 'merge', beforePublish: async () => {}, octokit: api });
+        const commit = api.calls.find(c => c.endpoint === 'POST /repos/{owner}/{repo}/git/commits')!.options;
+        assert.deepEqual(commit.parents, [headSha, tip]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+});

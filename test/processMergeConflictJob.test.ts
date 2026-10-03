@@ -1,3 +1,4 @@
+import { signedMaintenanceApi, SIGNED_MERGE_SHA } from './helpers/signedMaintenanceApi.js';
 import * as cancellation from '../packages/core/src/admission/executionAdmissionCancellation.js';
 import { test, mock, describe, beforeEach } from 'node:test';
 import { completionCoreExports, completionDatabase } from './helpers/completionCoreDoubles.js';
@@ -615,10 +616,19 @@ for (const outcome of ['published', 'no-change', 'outside-scope', 'conflict-outs
             mockMergeBaseIntoBranch.mock.mockImplementation(async () => outcome === 'conflict-outside-scope'
                 ? { outcome: 'conflicts', conflictedFiles: ['forbidden.txt'] } as never : { outcome: 'clean' });
             mockStateManager.getTaskState.mock.mockImplementation(async () => ({ claudeResult: { success: true, resultPhase: 'final' } }) as never);
-            mockOctokit.request.mock.mockImplementation(async (route?: string) => {
+            const publishedHead = outcome === 'no-change' ? head : SIGNED_MERGE_SHA;
+            const api = signedMaintenanceApi(root, head, { onUpdate: () => {
+                if (outcome.endsWith('after-push')) maintenanceFenceError = outcome;
+                if (outcome === 'deadline-after-push') job.data.executionAdmissionReceipt.executionDeadline = new Date(0).toISOString();
+                if (outcome === 'published-before-cancel') mockRedisStore.set(cancellation.cancelledExecutionAdmissionKey('maintenance'), 'cancelled');
+            } });
+            mockOctokit.request.mock.mockImplementation(async (route?: string, params?: Record<string, any>) => {
+                if (route?.includes('/git/') || route === 'POST /graphql' || route === 'GET /repos/{owner}/{repo}') {
+                    return await api.request(route, params!) as never;
+                }
                 if (route?.startsWith('PATCH')) {
                     assert.equal(mockStateManager.updateTaskState.mock.calls.at(-1)?.arguments[1], 'completed');
-                    assert.equal(persistedTask.commit_hash, git(['rev-parse', 'HEAD']));
+                    assert.equal(persistedTask.commit_hash, publishedHead);
                     if (outcome === 'comment-failure') throw new Error('GitHub PATCH failed');
                 }
                 return { data: { id: 100, html_url: 'https://github.com/test' } };
@@ -630,16 +640,7 @@ for (const outcome of ['published', 'no-change', 'outside-scope', 'conflict-outs
                 else if (outcome !== 'no-change') await writeFile(`${root}/allowed.txt`, 'resolved');
                 return mockAgentResult;
             });
-            mockCommitChanges.mock.mockImplementation(async () => {
-                if (outcome !== 'no-change') { git(['add', '.']); git(['commit', '-m', 'resolved']); }
-                return { commitHash: git(['rev-parse', 'HEAD']), commitMessage: 'resolved' };
-            });
             refuseCompletedHistoryWrite = outcome === 'settled-failed';
-            mockPushBranch.mock.mockImplementation(async () => {
-                if (outcome.endsWith('after-push')) maintenanceFenceError = outcome;
-                if (outcome === 'deadline-after-push') job.data.executionAdmissionReceipt.executionDeadline = new Date(0).toISOString();
-                if (outcome === 'published-before-cancel') mockRedisStore.set(cancellation.cancelledExecutionAdmissionKey('maintenance'), 'cancelled');
-            });
             if (outcome.endsWith('before-push')) {
                 await assert.rejects(() => processMergeConflictJob(job), outcome === 'deadline-before-push' ? /maintenance-deadline-expired/ : new RegExp(outcome));
                 assert.equal(mockPushBranch.mock.callCount(), 0);
@@ -652,7 +653,9 @@ for (const outcome of ['published', 'no-change', 'outside-scope', 'conflict-outs
             } else {
                 const result = await processMergeConflictJob(job);
                 assert.equal(result.status, outcome === 'settled-failed' ? 'failed' : 'complete');
-                assert.equal(result.commit, git(['rev-parse', 'HEAD']));
+                assert.equal(result.commit, publishedHead);
+                assert.equal(mockPushBranch.mock.callCount(), 0);
+                assert.equal(mockCommitChanges.mock.callCount(), 0);
                 assert.equal(persistedTask.commit_hash, result.commit);
                 if (outcome === 'settled-failed') {
                     assert.equal(result.pushedHead, result.commit);
@@ -667,7 +670,7 @@ for (const outcome of ['published', 'no-change', 'outside-scope', 'conflict-outs
                 }
                 assert.equal(mockStateManager.markTaskFailed.mock.callCount(), 0);
                 assert.equal(mockStateManager.updateTaskState.mock.calls.filter(c => c.arguments[1] === 'failed').length, 0);
-                assert.equal(mockPushBranch.mock.calls[0].arguments[2].expectedHeadSha, head);
+                assert.equal(api.ref(), publishedHead);
                 const agentOptions = mockAgent.executeTask.mock.calls[0].arguments[0];
                 assert.ok(agentOptions.timeoutMs > 0 && agentOptions.timeoutMs <= 60000);
                 assert.match(agentOptions.prompt, /allowed.txt/);
@@ -678,7 +681,7 @@ for (const outcome of ['published', 'no-change', 'outside-scope', 'conflict-outs
             assert.equal(terminal.historyMetadata.operationId, 'maintenance-op');
             if (!outcome.endsWith('outside-scope')) {
                 assert.equal(mockStateManager.updateTaskState.mock.calls.at(-1)?.arguments[1], 'completed');
-                assert.equal(terminal.commitHash, git(['rev-parse', 'HEAD']));
+                assert.equal(terminal.commitHash, publishedHead);
                 assert.equal(terminal.historyMetadata.pushedHead, terminal.commitHash);
                 assert.equal(terminal.requireDurableHistory, true);
                 if (outcome.endsWith('after-push') || outcome === 'published-before-cancel') {

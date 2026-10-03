@@ -28,14 +28,16 @@ export interface MilestoneMaintenanceRequest {
 export interface MilestoneMaintenanceJob {
   token: string;
 }
+/** One request per (recorded head, source), mirroring Ezer: a superseded request gets a new id. */
 export function milestoneRequestId(
   epicId: string,
   milestoneId: string,
   repository: string,
+  fromHead: string,
   sourceSha: string,
 ): string {
   return createHash("sha256")
-    .update(JSON.stringify([epicId, milestoneId, repository, sourceSha]))
+    .update(JSON.stringify([epicId, milestoneId, repository, fromHead, sourceSha]))
     .digest("hex");
 }
 export function milestoneCommitMessage(requestId: string): string {
@@ -108,7 +110,7 @@ export function readMilestoneRequest(
         path.split("/").includes(".."),
     ) ||
     p.requestId !==
-      milestoneRequestId(p.epicId, p.milestoneId, p.repository, p.sourceSha)
+      milestoneRequestId(p.epicId, p.milestoneId, p.repository, p.fromHead, p.sourceSha)
   )
     throw Error("MILESTONE_REQUEST_INVALID");
   return p;

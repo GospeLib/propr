@@ -48,7 +48,7 @@ async function fixture(conflict = false) {
     sourceSha,
     sourceBranch: "stage",
     activationEventId: "activation",
-    requestId: milestoneRequestId("EP-x", "m1", "owner/repo", sourceSha),
+    requestId: milestoneRequestId("EP-x", "m1", "owner/repo", fromHead, sourceSha),
     scope: ["file"],
     issueNumber: 1,
     expiresAt: new Date(Date.now() + 60_000).toISOString(),

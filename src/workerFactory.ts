@@ -9,10 +9,11 @@ import type {
     IntegrationJobData,
 } from '@propr/core';
 
-export type MainJobData = IssueJobData | CommentJobData | TaskImportJobData | SystemTaskJobData | MergeConflictJobData | IntegrationJobData;
+export type MainJobData = import('@propr/core').MilestoneMaintenanceJob | IssueJobData | CommentJobData | TaskImportJobData | SystemTaskJobData | MergeConflictJobData | IntegrationJobData;
 export type MainWorker = Worker<MainJobData, JobResult>;
 
 export interface MainJobProcessors {
+    processMilestoneMaintenance?: (job: Job<import('@propr/core').MilestoneMaintenanceJob>) => Promise<JobResult>;
     processIntegrationJob?: (job: Job<IntegrationJobData>) => Promise<JobResult>;
     processGitHubIssueJob: (job: Job<IssueJobData>) => Promise<JobResult>;
     processPullRequestCommentJob: (job: Job<CommentJobData>) => Promise<JobResult>;
@@ -30,6 +31,9 @@ export type MainWorkerFactory = (
 export function createMainJobProcessor(processors: MainJobProcessors) {
     return async (job: Job<MainJobData>): Promise<JobResult> => {
         switch (job.name) {
+            case 'processMilestoneMaintenance':
+                if (!processors.processMilestoneMaintenance) throw Error('Milestone processor unavailable');
+                return processors.processMilestoneMaintenance(job as Job<import('@propr/core').MilestoneMaintenanceJob>);
             case 'processIntegration':
                 if (!processors.processIntegrationJob) throw new Error('Integration processor is not configured');
                 return processors.processIntegrationJob(job as Job<IntegrationJobData>);

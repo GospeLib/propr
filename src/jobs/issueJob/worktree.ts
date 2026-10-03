@@ -10,6 +10,7 @@ import { performPostProcessing } from '../issueJobPostProcessing.js';
 import { requireStoryPublicationPolicy } from '../storyPublicationPolicy.js';
 import { requireIssueRecordedCheckpoint } from '../recordedExecutionCheckpoint.js';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { installationTokenProvider } from '../githubTypes.js';
 import { dirname, join } from 'node:path';
 
 export async function executeWorktreeOperations(params: ExecuteWorktreeParams): Promise<ExecuteWorktreeResult> {
@@ -55,7 +56,7 @@ export async function executeWorktreeOperations(params: ExecuteWorktreeParams): 
     body: `🤖 AI processing has started for this issue using **${agentAlias}** agent with **${modelName}** model.\n\nI'll analyze the problem and work on a solution. This may take a few minutes.\n\n**Processing Details:**\n- Agent: \`${agentAlias}\`\n- Model: \`${modelName}\`\n- Branch: \`${worktreeInfo.branchName}\`\n- Base Branch: \`${issueRef.baseBranch || repoValidation.repoData?.defaultBranch || 'main'}\`\n- Worktree: \`${worktreeInfo.worktreePath.split('/').pop()}\`\n\n🔍 [Track Task Execution](${taskUrl})`,
   });
 
-  await pushBranch(worktreeInfo.worktreePath, worktreeInfo.branchName, { repoUrl, authToken: githubToken.token, execution });
+  await pushBranch(worktreeInfo.worktreePath, worktreeInfo.branchName, { repoUrl, tokenRefreshFn: installationTokenProvider(octokit), execution });
   await job.updateProgress(80);
 
   const claudeResult = await executeAgentAndRecordMetrics({ octokit, worktreeInfo, issueRef, githubToken, currentIssueData, issueComments }, context);

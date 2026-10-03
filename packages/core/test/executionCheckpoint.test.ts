@@ -175,3 +175,30 @@ test('the optional recovery checkpoint is exact and backward compatible', () => 
   ]) assert.throws(() => requireStoryExecutionContract({ ...base, recovery: { ...recovery, checkpoint: invalid } }),
     /EXECUTION_RECOVERY_CONTEXT_INVALID/);
 });
+
+for (const tokenFailure of [false, true]) test(`checkpoint token provider ${tokenFailure ? 'failure retains the pinned commit' : 'replaces the expired remote credential'}`, async () => {
+  const { origin, execution, worktree } = await fixture();
+  const git = simpleGit(worktree);
+  // Both URLs resolve locally: an expired credential cannot accidentally reach GitHub.
+  const repoUrl = 'https://token-test.invalid/repo.git';
+  await git.addConfig(`url.${origin}.insteadOf`, 'https://x-access-token:fresh@token-test.invalid/repo.git');
+  await git.addConfig(`url.${origin}-missing.insteadOf`, 'https://x-access-token:expired@token-test.invalid/repo.git');
+  await git.remote(['set-url', 'origin', 'https://x-access-token:expired@token-test.invalid/repo.git']);
+  await writeFile(join(worktree, 'allowed.txt'), 'partial work after a long run');
+  let calls = 0;
+  const record = await preserveExecutionCheckpoint({ worktreePath: worktree, execution, taskId: 'fresh-token',
+    failureClassification: 'timeout', author: AUTHOR, repoUrl, authToken: 'expired',
+    tokenRefreshFn: async () => { calls++; if (tokenFailure) throw Error('token service unavailable'); return 'fresh'; },
+  });
+  if (tokenFailure) {
+    assert.equal(record.status, 'failed');
+    assert.match(record.error!, /token service unavailable/);
+    assert.equal((await git.revparse([record.localRef!])).trim(), record.sha);
+    assert.equal((await simpleGit(origin).raw(['for-each-ref', '--format=%(refname)', 'refs/propr/checkpoints'])).trim(), '');
+  } else {
+    assert.equal(record.status, 'preserved', record.error);
+    assert.equal((await simpleGit(origin).revparse([record.ref!])).trim(), record.sha);
+    assert.equal((await git.raw(['config', '--get', 'remote.origin.url'])).trim(), 'https://x-access-token:fresh@token-test.invalid/repo.git');
+    assert.ok(calls >= 2, 'push and remote verification each resolve current credentials');
+  }
+});

@@ -34,6 +34,7 @@ export async function setupAuthenticatedRemote(git: SimpleGit, repoUrl: string, 
 interface EnsureBranchAndPushOptions {
     repoUrl?: string;
     authToken?: string;
+    /** Resolve current credentials at each network operation, including the first attempt. */
     tokenRefreshFn?: () => Promise<string>;
     correlationId?: string;
 }
@@ -42,6 +43,7 @@ export async function ensureBranchAndPush(worktreePath: string, branchName: stri
     const { repoUrl, authToken, tokenRefreshFn, correlationId } = options;
 
     const pushOperation = async (currentToken: string | undefined): Promise<void> => {
+        if (tokenRefreshFn) currentToken = await tokenRefreshFn();
         const git: SimpleGit = createHooklessGit(worktreePath);
 
         if (repoUrl && currentToken) await setupAuthenticatedRemote(git, repoUrl, currentToken);
@@ -122,6 +124,8 @@ export async function ensureBranchAndPush(worktreePath: string, branchName: stri
 }
 
 interface PushBranchOptions {
+    /** Resolve current credentials at each network operation, including the first attempt. */
+    tokenRefreshFn?: () => Promise<string>;
     expectedHeadSha?: string;
     execution?: StoryExecutionContract;
     repoUrl?: string;
@@ -163,8 +167,12 @@ export async function pushBranch(worktreePath: string, branchName: string, optio
         throw Error('STORY_EXECUTION_BRANCH_CHANGED');
 
     if (options.expectedHeadSha && (rebaseOnNonFastForward || options.execution || !/^[a-f0-9]{40}$/.test(options.expectedHeadSha))) throw Error('INVALID_PUSH_LEASE');
-    const performPush = async (token: string | undefined): Promise<void> => {
+    const authenticate = async (fallback: string | undefined): Promise<void> => {
+        const token = options.tokenRefreshFn ? await options.tokenRefreshFn() : fallback;
         if (repoUrl && token) await setupAuthenticatedRemote(git, repoUrl, token);
+    };
+    const performPush = async (token: string | undefined): Promise<void> => {
+        await authenticate(token);
         if (options.expectedHeadSha) {
             if ((await git.revparse(['--abbrev-ref', 'HEAD'])).trim() !== branchName) throw Error('MAINTENANCE_BRANCH_CHANGED');
             // The lease checks the remote atomically. Ancestry independently forbids rewriting history.
@@ -211,6 +219,7 @@ export async function pushBranch(worktreePath: string, branchName: string, optio
         logger.info({ worktreePath, branchName, remote }, 'Push rejected because remote branch advanced; rebasing local work onto latest remote head');
 
         try {
+            await authenticate(token);
             await git.raw(['fetch', remote, `+refs/heads/${branchName}:refs/remotes/${remote}/${branchName}`]);
             await git.raw(['rebase', `${remote}/${branchName}`]);
         } catch (rebaseError) {

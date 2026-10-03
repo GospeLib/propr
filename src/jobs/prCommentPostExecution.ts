@@ -34,7 +34,7 @@ import { finalClaudeExecutionResult } from './claudeExecutionResult.js';
 import { publishCompletedWithDurableExecutionEvidence } from './completedExecutionDurability.js';
 import { durableOperationIdentity } from '@propr/core';
 import { buildAgentOutcome } from './executionOutcome.js';
-import type { GitHubToken } from './githubTypes.js';
+import { installationTokenProvider, type GitHubToken } from './githubTypes.js';
 import {
     isVisualPreviewUploadAuthenticationError,
     publishPullRequestCommentVisualPreviews,
@@ -100,11 +100,10 @@ async function commitAndPush(
 
     if (commitResult) {
         const repoUrl = getRepoUrl({ repoOwner: issueRef.repoOwner, repoName: issueRef.repoName });
-        const githubToken = await state.octokit.auth({ type: "installation" }) as GitHubToken;
         await beforePush?.();
         const pushResult = await pushBranch(state.worktreeInfo.worktreePath, state.worktreeInfo.branchName, {
             repoUrl,
-            authToken: githubToken.token,
+            tokenRefreshFn: installationTokenProvider(state.octokit),
             rebaseOnNonFastForward: !beforePush,
         });
         if (pushResult.rebased && pushResult.commitHash) {

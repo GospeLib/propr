@@ -36,7 +36,9 @@ const stateManager = {
 const request = async (route: string) => ({ data: route.startsWith('GET')
   ? { head: { ref: 'feature', sha: head }, body: '', labels: [{ name: 'propr' }], user: { login: 'owner' }, title: 'Change' }
   : { id: 1, html_url: 'https://example.test/comment/1', body: 'completed' } });
-const octokit = { request, auth: async () => ({ token: 'fixture' }) };
+let agentFinishedForTokenTest: boolean | undefined;
+const publishedTokens: string[] = [];
+const octokit = { request, auth: async () => ({ token: agentFinishedForTokenTest === undefined ? 'fixture' : agentFinishedForTokenTest ? 'fresh' : 'expired' }) };
 const previewSettings = { enabled: true, types: ['image'] };
 const preparePreview = mock.fn(async () => ({ evidence: EMPTY_VISUAL_PREVIEW_EVIDENCE }));
 const agent = mock.fn(async (_options: { prompt: string }) => { throw new Error('fixture-agent-boundary'); });
@@ -59,7 +61,12 @@ await mock.module('@propr/core', { namedExports: {
   generateCorrelationId: noop, handleError: noop, cleanupWorktree: noop, formatResetTime: noop,
   getDefaultModel: () => 'fixture', resolveModelAlias: (value: string) => value, getPendingPrCommentsKey: noop,
   describeAgentTermination: noop, resolveAgentTerminationReason: () => undefined,
-  commitChanges: async () => ({ commitHash: head, filesChanged: [outputPath] }), pushBranch: async () => { if (cancelOnPush) tombstone = true; return { rebased: false }; },
+  commitChanges: async () => ({ commitHash: head, filesChanged: [outputPath] }), pushBranch: async (_path: string, _branch: string, options: any) => {
+    if (agentFinishedForTokenTest !== undefined) {
+      const token = options.tokenRefreshFn ? await options.tokenRefreshFn() : options.authToken;
+      assert.equal(token, 'fresh', 'Git rejects the pre-agent token'); publishedTokens.push(token);
+    }
+    if (cancelOnPush) tombstone = true; return { rebased: false }; },
   AI_COMMIT_AUTHOR: { name: 'Fixture', email: 'fixture@example.test' },
   db: () => ({ where: () => ({ update: async () => undefined }) }),
   cleanupPreparedVisualPreviewEvidence: noop, prepareVisualPreviewEvidence: preparePreview,
@@ -218,4 +225,22 @@ for (const afterPush of [false, true]) test(`comment processor settles cancellat
   assert.equal(final.historyMetadata.settlement, result.status);
   if (afterPush) { assert.equal(result.pushedHead, head); assert.equal(final.historyMetadata.pushedHead, head); }
   sourceStep = false; tombstone = false; cancelOnPush = false; lastExecution = undefined;
+});
+
+test('PR-comment worker publishes with a token obtained after the agent expires its original token', async () => {
+  admitted = false; sourceStep = false; tombstone = false; cancelOnPush = false;
+  refuseCompletedHistoryWrite = false; completionDatabase.reset();
+  agentFinishedForTokenTest = false; publishedTokens.length = 0;
+  agent.mock.mockImplementation(async () => {
+    agentFinishedForTokenTest = true;
+    return { claudeResult: { success: true, modifiedFiles: ['src/file.ts'] }, agentType: 'claude' } as never;
+  });
+  try {
+    const result = await processPullRequestCommentJob({ id: 'fresh-token', data: {
+      repoOwner: 'owner', repoName: 'repo', pullRequestNumber: 1, commentId: 1,
+      commentBody: 'Fix', commentAuthor: 'owner', commandMode: 'default',
+    }, updateData: noop } as never);
+    assert.equal(result.status, 'complete');
+    assert.deepEqual(publishedTokens, ['fresh']);
+  } finally { agentFinishedForTokenTest = undefined; }
 });

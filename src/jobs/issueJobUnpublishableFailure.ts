@@ -17,7 +17,7 @@ import type { IssueJobData } from '@propr/core';
 import type { PostProcessingResult } from './issueJobHelpers.js';
 import { handleNoCodeChanges } from './issueJobPostProcessingHelpers.js';
 import { AI_COMMIT_AUTHOR } from './commitAuthor.js';
-import type { GitHubToken } from './githubTypes.js';
+import { installationTokenProvider, type GitHubToken } from './githubTypes.js';
 import { classifyExecutionFailure } from './executionOutcome.js';
 import { markTaskTerminalState } from './terminalTaskState.js';
 import { durableOperationIdentity } from '@propr/core';
@@ -43,7 +43,7 @@ export type Octokit = {
 
 export interface PostProcessOptions {
     execution?: StoryExecutionContract;
-    octokit: Octokit;
+    octokit: Octokit & { auth: (options: { type: "installation" }) => Promise<unknown> };
     issueRef: IssueJobData;
     worktreeInfo: WorktreeInfo;
     currentIssueData: { data: { title: string; labels: Array<{ name: string }> } };
@@ -201,7 +201,7 @@ async function registerRetainedWorktree(taskId: string, worktreeInfo: WorktreeIn
  * leave a pushed checkpoint ref that Ezer has no record of.
  */
 export async function handleStoppedAdmittedExecution(options: PostProcessOptions, execution: StoryExecutionContract): Promise<PostProcessingResult> {
-    const { octokit, issueRef, worktreeInfo, claudeResult, repoUrl, githubToken, AI_PROCESSING_TAG, correlatedLogger, taskId, stateManager } = options;
+    const { octokit, issueRef, worktreeInfo, claudeResult, repoUrl, AI_PROCESSING_TAG, correlatedLogger, taskId, stateManager } = options;
     // Without a task record there is nowhere durable to name a checkpoint; never push an orphan.
     if (!taskId || !stateManager) throw Error('STORY_EXECUTION_TERMINAL_STATE_UNAVAILABLE');
     const executionCheckpoint = await preserveExecutionCheckpoint({
@@ -211,7 +211,7 @@ export async function handleStoppedAdmittedExecution(options: PostProcessOptions
         failureClassification: classifyExecutionFailure(claudeResult),
         author: AI_COMMIT_AUTHOR,
         repoUrl,
-        authToken: githubToken.token,
+        tokenRefreshFn: installationTokenProvider(octokit),
     });
     const log = executionCheckpoint.status === 'failed' ? correlatedLogger.error.bind(correlatedLogger) : correlatedLogger.info.bind(correlatedLogger);
     log({ issueNumber: issueRef.number, executionCheckpoint }, 'Admitted execution stopped before success; partial work checkpoint recorded');

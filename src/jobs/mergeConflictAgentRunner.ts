@@ -27,7 +27,7 @@ import {
     buildMergeConflictCommitMessage,
 } from './mergeConflictHelpers.js';
 import { resolveDefaultAgentAndModel } from './prCommentAgentUtils.js';
-import type { GitHubToken } from './githubTypes.js';
+import { installationTokenProvider, type GitHubToken } from './githubTypes.js';
 
 const MAX_CONFLICT_MARKER_SCAN_BYTES = 1024 * 1024;
 async function buildMergeCompletionHistoryMetadata(options: {
@@ -227,7 +227,7 @@ export async function handleMergeWithAgent(options: {
         const { simpleGit } = await import('simple-git');
         finalCommitHash = commitResult?.commitHash || (await simpleGit({ baseDir: worktreeInfo.worktreePath }).revparse(['HEAD'])).trim();
         await options.beforePublish?.();
-        await pushBranch(worktreeInfo.worktreePath, branchName, { repoUrl, authToken: githubToken.token });
+        await pushBranch(worktreeInfo.worktreePath, branchName, { repoUrl, tokenRefreshFn: installationTokenProvider(octokit) });
     }
     options.onPushed?.(finalCommitHash);
 

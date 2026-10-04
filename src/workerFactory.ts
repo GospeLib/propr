@@ -9,10 +9,11 @@ import type {
     IntegrationJobData,
 } from '@propr/core';
 
-export type MainJobData = import('@propr/core').MilestoneMaintenanceJob | IssueJobData | CommentJobData | TaskImportJobData | SystemTaskJobData | MergeConflictJobData | IntegrationJobData;
+export type MainJobData = import('@propr/core').MilestoneCorrectionJob | import('@propr/core').MilestoneMaintenanceJob | IssueJobData | CommentJobData | TaskImportJobData | SystemTaskJobData | MergeConflictJobData | IntegrationJobData;
 export type MainWorker = Worker<MainJobData, JobResult>;
 
 export interface MainJobProcessors {
+    processMilestoneCorrection?: (job: Job<import('@propr/core').MilestoneCorrectionJob>) => Promise<JobResult>;
     processMilestoneMaintenance?: (job: Job<import('@propr/core').MilestoneMaintenanceJob>) => Promise<JobResult>;
     processIntegrationJob?: (job: Job<IntegrationJobData>) => Promise<JobResult>;
     processGitHubIssueJob: (job: Job<IssueJobData>) => Promise<JobResult>;
@@ -31,6 +32,9 @@ export type MainWorkerFactory = (
 export function createMainJobProcessor(processors: MainJobProcessors) {
     return async (job: Job<MainJobData>): Promise<JobResult> => {
         switch (job.name) {
+            case 'processMilestoneCorrection':
+                if (!processors.processMilestoneCorrection) throw Error('Milestone correction processor unavailable');
+                return processors.processMilestoneCorrection(job as Job<import('@propr/core').MilestoneCorrectionJob>);
             case 'processMilestoneMaintenance':
                 if (!processors.processMilestoneMaintenance) throw Error('Milestone processor unavailable');
                 return processors.processMilestoneMaintenance(job as Job<import('@propr/core').MilestoneMaintenanceJob>);

@@ -297,12 +297,15 @@ export async function handleMergeWithAgent(options: {
 /** Same merge-conflict agent, with milestone authority and no fabricated story/PR task. */
 export async function runMilestoneConflictAgent(options: {
     worktreePath: string;
-    conflicts: string[];
-    request: import('@propr/core').MilestoneMaintenanceRequest;
+    conflicts?: string[];
+    request: import('@propr/core').MilestoneMaintenanceRequest | import('@propr/core').MilestoneCorrectionRequest;
     logger: Logger;
     fence: () => Promise<void>;
 }): Promise<void> {
     const { request: p } = options;
+    const correction = 'instructions' in p;
+    const number = correction ? p.prNumber : p.issueNumber;
+    const taskId = `milestone-${correction ? 'correction-' : ''}${p.requestId}`;
     const registry = AgentRegistry.getInstance();
     await registry.ensureInitialized();
     const { resolvedAlias, resolvedModel } = await resolveDefaultAgentAndModel(registry, options.logger);
@@ -312,15 +315,17 @@ export async function runMilestoneConflictAgent(options: {
     const [repoOwner, repoName] = p.repository.split('/');
     const result = await agent.executeTask({
         worktreePath: options.worktreePath,
-        issueRef: { number: p.issueNumber, repoOwner, repoName },
-        prompt: `Resolve the merge of ${p.sourceSha} into ${p.fromHead} for milestone ${p.epicId}/${p.milestoneId}. Conflicts: ${JSON.stringify(options.conflicts)}. You may edit only ${JSON.stringify(p.scope)}. Leave the result uncommitted. Do not push, change HEAD, switch branches, or change remotes.`,
+        issueRef: { number, repoOwner, repoName },
+        prompt: correction
+            ? `Correct milestone ${p.epicId}/${p.milestoneId} at ${p.fromHead} according to the owner's feedback below. You may edit only ${JSON.stringify(p.scope)}. Leave the result uncommitted. Do not push, change HEAD, switch branches, or change remotes.\n\n${p.instructions}`
+            : `Resolve the merge of ${p.sourceSha} into ${p.fromHead} for milestone ${p.epicId}/${p.milestoneId}. Conflicts: ${JSON.stringify(options.conflicts)}. You may edit only ${JSON.stringify(p.scope)}. Leave the result uncommitted. Do not push, change HEAD, switch branches, or change remotes.`,
         model: resolvedModel,
         timeoutMs: Math.max(1, Date.parse(p.expiresAt) - Date.now()),
         branchName: p.branch,
-        taskId: `milestone-${p.requestId}`,
+        taskId,
         githubToken: '',
-        environment: buildAdmittedWorkerEnvironment({ repoOwner, repoName, number: p.issueNumber,
-            baseBranch: p.branch }, `milestone-${p.requestId}`, true),
+        environment: buildAdmittedWorkerEnvironment({ repoOwner, repoName, number,
+            baseBranch: p.branch }, taskId, true),
     });
     if (!result.success) throw Error('milestone-conflict-agent-failed');
     await options.fence();

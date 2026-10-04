@@ -1,3 +1,4 @@
+import { postMilestoneMaintenance, getMilestoneMaintenance } from './routes/ezerMilestoneMaintenance.js';
 import { postEzerAdmissionCancel } from './routes/ezerAdmissionCancel.js';
 /* eslint-disable max-lines -- route registration and coordinated shutdown share startup state */
 import express, { Request, Response } from 'express';
@@ -295,6 +296,7 @@ function setupRoutes(): void {
   });
 
   const operationalRoutes: RouteEntry[] = [
+    ['post', '/api/tasks/milestone-maintenance', postMilestoneMaintenance], ['get', '/api/tasks/milestone-maintenance/:requestId', getMilestoneMaintenance],
     ['post', '/api/tasks/integration', postEzerIntegration], ['get', '/api/tasks/integration/:digest', getEzerIntegration],
     ['get', '/api/status', statusRoutes.getStatus], ['get', '/api/tasks', taskRoutes.getTasks], ['get', '/api/tasks/revert-preview', taskRoutes.getRevertPreview], ['post', '/api/tasks/revert', taskRoutes.revertChanges],
     ['post', '/api/ezer/admissions/:admissionId/cancel', postEzerAdmissionCancel],

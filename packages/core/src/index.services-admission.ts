@@ -132,3 +132,4 @@ export { parseMaintenanceBinding, requireExactMaintenance } from './admission/ad
 export type { PRMaintenanceBinding } from './admission/admissionBindings.js';
 export { enqueueAdmittedMaintenance, requireMaintenanceJob, readLiveMaintenance } from './admission/admittedMaintenance.js';
 export * from './admission/milestoneMaintenance.js';
+export * from './admission/milestoneCorrection.js';

@@ -4,7 +4,7 @@ import { Redis, RedisOptions } from 'ioredis';
 import logger from '../utils/logger.js';
 import 'dotenv/config';
 import type { IntegrationJobData } from '../admission/integrationPayload.js';
-type ExecutionQueueData = IssueJobData | CommentJobData | IntegrationJobData | import('../admission/milestoneMaintenance.js').MilestoneMaintenanceJob;
+type ExecutionQueueData = IssueJobData | CommentJobData | IntegrationJobData | import('../admission/milestoneCorrection.js').MilestoneCorrectionJob | import('../admission/milestoneMaintenance.js').MilestoneMaintenanceJob;
 
 // Re-export types for backward compatibility
 export type {

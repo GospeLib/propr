@@ -16,6 +16,7 @@ import { initSocketService, closeSocketService, getSocketService } from './servi
 import { createEzerControlRoutes } from './routes/ep-ezer-follow-ups-s03.js';
 import { corsRejectionHandler, createCorsOriginValidator } from './corsValidation.js';
 import {
+  postMilestoneCorrection, getMilestoneCorrection,
   createStatusRoutes, createTaskRoutes,
   createTaskHistoryRoutes, createLiveDetailsRoutes,
   createFileChangesRoutes, createConfigRoutes,
@@ -296,6 +297,7 @@ function setupRoutes(): void {
   });
 
   const operationalRoutes: RouteEntry[] = [
+    ['post', '/api/tasks/milestone-correction', postMilestoneCorrection], ['get', '/api/tasks/milestone-correction/:requestId', getMilestoneCorrection],
     ['post', '/api/tasks/milestone-maintenance', postMilestoneMaintenance], ['get', '/api/tasks/milestone-maintenance/:requestId', getMilestoneMaintenance],
     ['post', '/api/tasks/integration', postEzerIntegration], ['get', '/api/tasks/integration/:digest', getEzerIntegration],
     ['get', '/api/status', statusRoutes.getStatus], ['get', '/api/tasks', taskRoutes.getTasks], ['get', '/api/tasks/revert-preview', taskRoutes.getRevertPreview], ['post', '/api/tasks/revert', taskRoutes.revertChanges],

@@ -14,6 +14,7 @@ import { configureDemoMode, createDemoRedisClient, demoModeReadOnlyMiddleware } 
 import { resolveGithubAuthMode, resolveGithubEventIntakeMode, validateIntakeModePrerequisites } from '@propr/shared';
 import { initSocketService, closeSocketService, getSocketService } from './services/socketService.js';
 import { createEzerControlRoutes } from './routes/ep-ezer-follow-ups-s03.js';
+import { createEzerRecoveryRoutes } from './routes/ep-ezer-follow-ups-s04.js';
 import { corsRejectionHandler, createCorsOriginValidator } from './corsValidation.js';
 import {
   postMilestoneCorrection, getMilestoneCorrection,
@@ -201,6 +202,9 @@ let notificationProjection: NotificationProjectionService | undefined;
 let webPushDispatcher: WebPushDispatcher | undefined;
 let webPushDispatcherConfigured = false;
 let visualPreviewOAuthRefreshScheduler: VisualPreviewOAuthRefreshScheduler | undefined;
+// EP-ezer-follow-ups-S04: held beyond setupRoutes() so the silence watch can be
+// started once the socket projection exists.
+let ezerRecoveryRoutes: ReturnType<typeof createEzerRecoveryRoutes> | undefined;
 
 function createDemoTaskQueue(): Queue {
   return {
@@ -295,6 +299,12 @@ function setupRoutes(): void {
     redisClient,
     getStreaming: () => getSocketService()?.getEzerStreaming() ?? null,
   });
+  // EP-ezer-follow-ups-S04: structured failures, the bounded recovery budget and
+  // the timeout fence, over the same projection the control plane targets.
+  ezerRecoveryRoutes = createEzerRecoveryRoutes({
+    redisClient,
+    getStreaming: () => getSocketService()?.getEzerStreaming() ?? null,
+  });
 
   const operationalRoutes: RouteEntry[] = [
     ['post', '/api/tasks/milestone-correction', postMilestoneCorrection], ['get', '/api/tasks/milestone-correction/:requestId', getMilestoneCorrection],
@@ -324,6 +334,7 @@ function setupRoutes(): void {
     ['post', '/api/user/repo-preferences', userRepoPreferencesRoutes.updateRepoPreferences], ['get', '/api/notifications', notificationRoutes.getNotifications], ['get', '/api/notifications/unread-count', notificationRoutes.getUnreadCount], ['get', '/api/notifications/config', notificationRoutes.getConfiguration], ['get', '/api/notifications/capabilities', notificationRoutes.getCapabilities],
     ['get', '/api/notifications/preferences', notificationRoutes.getPreferences], ['patch', '/api/notifications/preferences', notificationRoutes.updatePreferences], ['get', '/api/notifications/push-subscriptions', notificationRoutes.listPushSubscriptions], ['post', '/api/notifications/push-subscriptions', notificationRoutes.createPushSubscription], ['delete', '/api/notifications/push-subscriptions', notificationRoutes.revokePushSubscription], ['delete', '/api/notifications/push-subscriptions/:subscriptionId', notificationRoutes.revokePushSubscriptionById], ['post', '/api/notifications/dismiss-all', notificationRoutes.dismissAll], ['post', '/api/notifications/:id/read', notificationRoutes.markRead], ['post', '/api/notifications/:id/dismiss', notificationRoutes.dismiss],
     ['post', '/api/ezer/operations/:operationId/control', ezerControlRoutes.postControl], ['get', '/api/ezer/operations/:operationId/control', ezerControlRoutes.getControlState],
+    ['post', '/api/ezer/operations/:operationId/failures', ezerRecoveryRoutes.postFailure], ['post', '/api/ezer/operations/:operationId/recovery', ezerRecoveryRoutes.postRecovery], ['get', '/api/ezer/operations/:operationId/recovery', ezerRecoveryRoutes.getRecovery],
   ];
   const routes = [
     ...operationalRoutes,
@@ -475,6 +486,12 @@ async function start(): Promise<void> {
         authenticate: authenticateSocketRequest,
       });
       console.log('[WebSocket] Socket.IO server initialized');
+      // EP-ezer-follow-ups-S04: the projection now exists, so start watching it
+      // for silence. A long silence is escalated from a heartbeat to a
+      // structured error even if no client ever calls the recovery routes.
+      if (ezerRecoveryRoutes?.watchSilence()) {
+        console.log('[ezer-recovery] Watching the Ezer stream projection for long provider silence');
+      }
       socketService.initQueueFeatures({ taskQueue, redisClient, db, notificationProjection });
       console.log('[WebSocket] Queue features initialized for real-time updates');
       await initializeUltrafix(getIoRedisClient());

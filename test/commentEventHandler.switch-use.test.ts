@@ -1308,7 +1308,13 @@ describe('commentEventHandler — comment revision cancellation', () => {
         assert.strictEqual(config.redisClient.del.mock.calls[0].arguments[0], 'pr-comment-processed:testowner:testrepo:42:123');
     });
 
-    test('an identical edited delivery for the exact active signed Ezer review is a no-op', async () => {
+    test('an identical edited delivery for the exact active signed Ezer review is a no-op', async (t) => {
+        const previousAuthor = process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID;
+        process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID = '322838413';
+        t.after(() => {
+            if (previousAuthor === undefined) delete process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID;
+            else process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID = previousAuthor;
+        });
         const admissionId = '91aa9fda-a9d7-4830-8702-ddb9d5da09b3';
         const body = `/ezer review ${admissionId}\nModel: gpt-5.6-sol\nReview the exact artifact.`;
         const commentId = 123;
@@ -1328,7 +1334,7 @@ describe('commentEventHandler — comment revision cancellation', () => {
                 repoName: 'testrepo',
                 branchName: 'feature-branch',
                 commandMode: 'review',
-                comments: [{ id: commentId, body, author: 'integry', type: 'issue' }],
+                comments: [{ id: commentId, body, author: 'gospelib-ezer[bot]', type: 'issue' }],
                 executionAdmissionReceipt: { admissionId },
                 executionAdmissionComment: binding,
             },
@@ -1343,7 +1349,7 @@ describe('commentEventHandler — comment revision cancellation', () => {
                     body,
                     issue_url: 'https://api.github.com/repos/testowner/testrepo/issues/42',
                     created_at: '2026-09-15T23:16:51Z',
-                    user: { login: 'integry' },
+                    user: { id: 322838413, login: 'gospelib-ezer[bot]', type: 'Bot' },
                 },
             };
             return {
@@ -1357,6 +1363,7 @@ describe('commentEventHandler — comment revision cancellation', () => {
         });
         const event = createPRCommentEvent(body);
         event.comment.id = commentId;
+        event.comment.user = { ...event.comment.user, id: 322838413, login: 'gospelib-ezer[bot]', type: 'Bot' };
         const reprocess = mock.fn(async () => {});
         const config = createTestConfig({ processCommentEvent: reprocess });
 
@@ -1369,7 +1376,13 @@ describe('commentEventHandler — comment revision cancellation', () => {
         assert.strictEqual(mockQueueAdd.mock.callCount(), 0);
     });
 
-    test('a changed head cannot use the signed Ezer duplicate-delivery exception', async () => {
+    test('a changed head cannot use the signed Ezer duplicate-delivery exception', async (t) => {
+        const previousAuthor = process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID;
+        process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID = '322838413';
+        t.after(() => {
+            if (previousAuthor === undefined) delete process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID;
+            else process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID = previousAuthor;
+        });
         const admissionId = '91aa9fda-a9d7-4830-8702-ddb9d5da09b3';
         const body = `/ezer review ${admissionId}\nModel: gpt-5.6-sol\nReview the exact artifact.`;
         const commentId = 123;
@@ -1382,7 +1395,7 @@ describe('commentEventHandler — comment revision cancellation', () => {
                 repoOwner: 'testowner',
                 repoName: 'testrepo',
                 commandMode: 'review',
-                comments: [{ id: commentId, body, author: 'integry', type: 'issue' }],
+                comments: [{ id: commentId, body, author: 'gospelib-ezer[bot]', type: 'issue' }],
                 executionAdmissionReceipt: { admissionId },
                 executionAdmissionComment: {
                     commentId,
@@ -1402,7 +1415,7 @@ describe('commentEventHandler — comment revision cancellation', () => {
                     body,
                     issue_url: 'https://api.github.com/repos/testowner/testrepo/issues/42',
                     created_at: '2026-09-15T23:16:51Z',
-                    user: { login: 'integry' },
+                    user: { id: 322838413, login: 'gospelib-ezer[bot]', type: 'Bot' },
                 },
             };
             return {
@@ -1416,6 +1429,7 @@ describe('commentEventHandler — comment revision cancellation', () => {
         });
         const event = createPRCommentEvent(body);
         event.comment.id = commentId;
+        event.comment.user = { ...event.comment.user, id: 322838413, login: 'gospelib-ezer[bot]', type: 'Bot' };
         const reprocess = mock.fn(async () => {});
         const config = createTestConfig({ processCommentEvent: reprocess });
 

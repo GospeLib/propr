@@ -1,4 +1,5 @@
 /** The `/ezer` authorization chokepoint: who may address Ezer, and how that address resolves. */
+import {EZER_REVIEW_REQUEST} from '../admission/reviewRequest.js';
 import {filterCommentByAuthor} from '../utils/commentFilters.js';
 import type {DeliveryDisposition} from './routingWebSocketProtocol.js';
 /** Any comment addressed to Ezer, whatever follows the address. */
@@ -59,32 +60,35 @@ export {EZER_NOT_OWNER_DISPOSITION,EZER_COMMAND_NOT_ADMITTED_DISPOSITION};
  * instead of guarding them one at a time.
  *
  * Fail closed, on the STABLE NUMERIC GitHub user id only — a login or display name is spoofable and
- * is never the identity gate. With no configured owner id, nothing addressed to Ezer is admitted.
+ * is never the identity gate. The only non-owner exception is a configured review author posting an exact signed-review
+ * request on a PR issue comment; execution still requires cryptographic admission downstream.
  *
- * @returns `null` when the comment may continue down the ordinary path — either it is not addressed
- * to Ezer at all, or it is and the configured owner wrote it (authorization passed; the Ezer-specific
- * handling downstream, including the cryptographically bound signed-review admission, is unchanged).
+ * @returns `null` when the comment may continue: an ordinary comment, an owner address, or
+ * an exact PR issue-comment review from the configured review author. The latter must go only
+ * through cryptographically bound signed-review admission, never ordinary command resolution.
  * Otherwise the terminal {@link EZER_NOT_OWNER_DISPOSITION}: ACKed `ignored`, no seat consumed, no
  * fall-through to the dispatcher, and no withheld ACK an outsider could use to force redelivery.
  */
-export function claimEzerAddressedComment(comment:unknown):DeliveryDisposition|null{
- const claim=classifyEzerAddressedComment(comment,process.env.EZER_OWNER_GITHUB_USER_ID??'');
+export function claimEzerAddressedComment(comment:unknown,eventType?:string):DeliveryDisposition|null{
+ const claim=classifyEzerAddressedComment(comment,eventType);
  if(!claim.addressed)return null;
- return claim.ownerAuthored?null:EZER_NOT_OWNER_DISPOSITION;
+ return claim.ownerAuthored||claim.reviewAuthored?null:EZER_NOT_OWNER_DISPOSITION;
 }
-/**
- * Shared classification behind BOTH the refusal and the resolution, so the two can never drift.
- * PRIVATE — not exported. The `ownerUserId` parameter is a test-only dependency-injection seam;
- * both exported entry points ({@link claimEzerAddressedComment},
- * {@link resolveOwnerEzerCommandBody}) always read the configured owner from
- * `process.env.EZER_OWNER_GITHUB_USER_ID` themselves and never forward a caller-supplied value,
- * so no importer of this module can redefine who the owner is.
+/** Shared by webhook dispatch and PR polling. Callers establish PR scope before admission.
+ * Identity always comes from environment configuration, never caller-supplied policy.
  */
-function classifyEzerAddressedComment(comment:unknown,ownerUserId:string):{addressed:false}|{addressed:true;ownerAuthored:boolean;body:string}{
+export function classifyEzerAddressedComment(comment:unknown,eventType?:string):{addressed:false}|{addressed:true;ownerAuthored:boolean;reviewAuthored:boolean;body:string}{
  const candidate=object(comment);
  if(typeof candidate.body!=='string')return{addressed:false};
  if(!EZER_ADDRESS_PREFIX.test(candidate.body.trim()))return{addressed:false};
- return{addressed:true,ownerAuthored:ownerAuthored(candidate,ownerUserId),body:candidate.body};
+ return{addressed:true,ownerAuthored:ownerAuthored(candidate,process.env.EZER_OWNER_GITHUB_USER_ID??''),
+  reviewAuthored:eventType==='issue_comment'&&EZER_REVIEW_REQUEST.test(candidate.body)&&isEzerReviewTriggerAuthor(candidate.user),body:candidate.body};
+}
+/** Numeric identity only; bots are expected here. Unset or malformed configuration fails closed. */
+export function isEzerReviewTriggerAuthor(user:unknown):boolean{
+ const configured=process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID??'';
+ const actor=object(user);
+ return /^[1-9][0-9]*$/.test(configured)&&Number.isSafeInteger(actor.id)&&String(actor.id)===configured;
 }
 /**
  * The command line exactly as the slash parser must see it, with the leading `/ezer` token
@@ -105,8 +109,8 @@ function classifyEzerAddressedComment(comment:unknown,ownerUserId:string):{addre
  * @returns the rewritten body when the configured owner addressed Ezer, otherwise `null`.
  */
 export function resolveOwnerEzerCommandBody(comment:unknown):string|null{
- const claim=classifyEzerAddressedComment(comment,process.env.EZER_OWNER_GITHUB_USER_ID??'');
- if(!claim.addressed||!claim.ownerAuthored)return null;
+ const claim=classifyEzerAddressedComment(comment);
+ if(!claim.addressed||!claim.ownerAuthored||EZER_REVIEW_REQUEST.test(claim.body))return null;
  const firstNewline=claim.body.indexOf('\n');
  const firstLine=firstNewline===-1?claim.body:claim.body.slice(0,firstNewline);
  if(!EZER_COMMAND_TOKEN.test(firstLine))return null;

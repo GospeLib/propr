@@ -674,14 +674,15 @@ export async function processCommentEvent(payload: IssueCommentEvent | PullReque
     // found three times through three different reachable call sites.
     //
     // Identity is the configured owner's stable numeric GitHub user id (EZER_OWNER_GITHUB_USER_ID),
-    // never a login. Fail closed: unset owner id admits no `/ezer` comment at all. The refusal is a
+    // never a login. Exact PR issue-comment reviews also allow the configured review author,
+    // subject to signed admission below. The refusal is a
     // terminal `ignored` disposition, so the delivery is ACKed (an outsider cannot force endless
     // redelivery) and consumes no seat.
-    const unauthorizedEzerComment = claimEzerAddressedComment(rawComment);
+    const unauthorizedEzerComment = claimEzerAddressedComment(rawComment, eventType);
     if (unauthorizedEzerComment) {
         correlatedLogger.warn({ repository: repoFullName, pullRequestNumber: prNumber, commentId: rawComment.id,
             commentAuthor: rawComment.user.login, eventType },
-            'Refused an /ezer comment from a user that is not the configured Ezer owner');
+            'Refused an /ezer comment outside the configured owner or signed-review author scope');
         return unauthorizedEzerComment;
     }
 

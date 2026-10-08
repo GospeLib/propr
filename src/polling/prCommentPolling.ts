@@ -1,3 +1,4 @@
+import { classifyEzerAddressedComment, enqueueAdmittedComment, EZER_REVIEW_REQUEST } from '@propr/core';
 import { logger } from '@propr/core';
 import { generateCorrelationId } from '@propr/core';
 import { handleError } from '@propr/core';
@@ -224,6 +225,21 @@ async function collectUnprocessedComments(
     let selectedLlm: string | null = extractModelFromPRLabels(pr, MODEL_LABEL_PATTERN, correlationId);
 
     for (const comment of commentsByTime) {
+        // Ezer comments never enter generic follow-up batching. Reviews use the same
+        // classification and signed admission as webhook intake, including bot authors.
+        const ezer = classifyEzerAddressedComment(comment, comment.pull_request_review_id ? 'pull_request_review_comment' : 'issue_comment');
+        if (ezer.addressed) {
+            if (ezer.reviewAuthored) {
+                const review = EZER_REVIEW_REQUEST.exec(ezer.body)!;
+                try {
+                    await enqueueAdmittedComment({ repository: `${owner}/${repo}`, prNumber: pr.number,
+                        commentId: comment.id, body: ezer.body, admissionId: review[1]!, review: true });
+                } catch (error) {
+                    correlatedLogger.warn({ commentId: comment.id, error }, 'Polled Ezer review refused by signed admission');
+                }
+            }
+            continue;
+        }
         if (comment.user.id !== undefined && comment.user.id === Number(process.env.EZER_OWNER_GITHUB_USER_ID)) continue;
         const commentAuthor = comment.user.login;
         const filterResult = filterCommentByAuthor(commentAuthor, correlationId);

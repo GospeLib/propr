@@ -273,3 +273,31 @@ test('Ezer review authority refuses the owner, other authors, other modes and ki
     delete process.env.EZER_PROPR_REVIEW_AUTHOR_USER_ID;
     message.user = { id: 42, login: 'owner' };
 });
+
+for (const triggerAuthor of [undefined, '322838413', 'malformed']) {
+    test(`typed-source review identity is independent of trigger setting ${triggerAuthor}`, async (t) => {
+        const previousTrigger = process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID;
+        const previousSource = process.env.EZER_PROPR_REVIEW_AUTHOR_USER_ID;
+        t.after(() => {
+            if (previousTrigger === undefined) delete process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID;
+            else process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID = previousTrigger;
+            if (previousSource === undefined) delete process.env.EZER_PROPR_REVIEW_AUTHOR_USER_ID;
+            else process.env.EZER_PROPR_REVIEW_AUTHOR_USER_ID = previousSource;
+        });
+        if (triggerAuthor === undefined) delete process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID;
+        else process.env.EZER_REVIEW_TRIGGER_AUTHOR_USER_ID = triggerAuthor;
+        process.env.EZER_PROPR_REVIEW_AUTHOR_USER_ID = '77';
+        message.user = { id: 77, login: 'propr-dev[bot]' };
+        await pending({ source: source({ authorId: 77, authority: 'ezer-review' }) });
+        const result = await enqueue();
+        assert.equal(result.mode, 'fix');
+        assert.equal((await queue.getJob(result.jobId))!.data.executionAdmissionReceipt.source.authorId, 77);
+        await redis.flushdb();
+        message.user = { id: 322838413, login: 'gospelib-ezer[bot]' };
+        await pending({ source: source({ authorId: 322838413, authority: 'ezer-review' }) });
+        await assert.rejects(() => enqueue(), /source-github-scope-changed/);
+        assert.equal(await queue.getJob('pr-comments-batch-ezer-typed-1'), undefined);
+        delete process.env.EZER_PROPR_REVIEW_AUTHOR_USER_ID;
+        await assert.rejects(() => enqueue(), /source-github-scope-changed/);
+    });
+}

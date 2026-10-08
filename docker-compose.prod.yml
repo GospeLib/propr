@@ -31,6 +31,9 @@ services:
       - "80:80"
       - "4000:4000"
     environment:
+      # Independent identities for typed-source corrections and signed review triggers.
+      EZER_PROPR_REVIEW_AUTHOR_USER_ID: ${EZER_PROPR_REVIEW_AUTHOR_USER_ID:-}
+      EZER_REVIEW_TRIGGER_AUTHOR_USER_ID: ${EZER_REVIEW_TRIGGER_AUTHOR_USER_ID:-}
       NODE_ENV: production
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -97,6 +100,9 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
+      # Independent identities for typed-source corrections and signed review triggers.
+      EZER_PROPR_REVIEW_AUTHOR_USER_ID: ${EZER_PROPR_REVIEW_AUTHOR_USER_ID:-}
+      EZER_REVIEW_TRIGGER_AUTHOR_USER_ID: ${EZER_REVIEW_TRIGGER_AUTHOR_USER_ID:-}
       NODE_ENV: production
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -124,6 +130,9 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
+      # Independent identities for typed-source corrections and signed review triggers.
+      EZER_PROPR_REVIEW_AUTHOR_USER_ID: ${EZER_PROPR_REVIEW_AUTHOR_USER_ID:-}
+      EZER_REVIEW_TRIGGER_AUTHOR_USER_ID: ${EZER_REVIEW_TRIGGER_AUTHOR_USER_ID:-}
       NODE_ENV: production
       REDIS_HOST: redis
       REDIS_PORT: 6379

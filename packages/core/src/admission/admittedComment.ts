@@ -5,6 +5,7 @@ import { consumeExecutionAdmission, createRedisAdmissionStore, pendingExecutionA
 
 const COMMENT_PREFIX = '/ezer ';
 const RESERVED_OWNER_CONTROL = /^\s*\/ezer\s+(?:stop|accept-review-stop|approve|retry|pause|resume|use)(?:\s|$)/i;
+import { isEzerReviewTriggerAuthor } from '../intake/routingOwnerEvent.js';
 import { EZER_REVIEW_REQUEST } from './reviewRequest.js';
 
 const COMMENT_JOB_PREFIX = 'pr-comments-batch-ezer-';
@@ -27,7 +28,7 @@ export async function enqueueAdmittedComment(input: {
     octokit.request('GET /repos/{owner}/{repo}/issues/comments/{comment_id}', { owner, repo, comment_id: input.commentId }),
     octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', { owner, repo, pull_number: input.prNumber }),
   ]);
-  if (!comment.user || comment.issue_url !== `https://api.github.com/repos/${input.repository}/issues/${input.prNumber}` ||
+  if (!comment.user || (review && !isEzerReviewTriggerAuthor(comment.user)) || comment.id !== input.commentId || comment.issue_url !== `https://api.github.com/repos/${input.repository}/issues/${input.prNumber}` ||
       comment.body !== input.body || !input.body.startsWith(COMMENT_PREFIX) || pr.state !== 'open' ||
       pr.head.repo?.full_name !== input.repository || pr.base.repo.full_name !== input.repository) {
     throw new Error('ezer-comment-refused:github-identity-or-content-changed');
